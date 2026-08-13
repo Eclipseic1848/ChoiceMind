@@ -1,0 +1,27 @@
+{
+  "name": "choicemind",
+  "version": "0.0.0",
+  "private": true,
+  "packageManager": "pnpm@11.21.0",
+  "engines": {
+    "node": "22.22.1",
+    "pnpm": "11.21.0"
+  },
+  "scripts": {
+    "build": "pnpm --recursive --if-present build",
+    "check:utf8": "node scripts/check-utf8.mjs",
+    "dev": "concurrently --kill-others-on-fail --names web,api,orchestrator,data-worker \"pnpm --filter @choicemind/web dev\" \"pnpm --filter @choicemind/api dev\" \"pnpm --filter @choicemind/orchestrator dev\" \"uv run --project services/data-worker uvicorn data_worker.app:app --app-dir services/data-worker/src --host 127.0.0.1 --port 3300\"",
+    "lint": "biome lint apps/api/src apps/orchestrator/src apps/web/src apps/web/tests apps/web/playwright.config.ts && uv run --project services/data-worker ruff check services/data-worker/src services/data-worker/tests",
+    "test": "pnpm --recursive --if-present test && uv run --project services/data-worker pytest -c services/data-worker/pyproject.toml services/data-worker/tests",
+    "typecheck": "pnpm --recursive --if-present typecheck",
+    "verify": "pnpm lint && pnpm typecheck && pnpm test && pnpm check:utf8 && pnpm build"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.8",
+    "@types/node": "22.20.1",
+    "concurrently": "10.0.4",
+    "tsx": "4.23.12",
+    "typescript": "7.0.2",
+    "vitest": "4.1.10"
+  }
+}
