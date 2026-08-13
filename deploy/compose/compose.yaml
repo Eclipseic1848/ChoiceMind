@@ -1,0 +1,63 @@
+x-node-runtime: &node-runtime
+  image: choicemind-node:p0
+  build:
+    context: ../..
+    dockerfile: deploy/compose/Dockerfile.node
+
+services:
+  web:
+    <<: *node-runtime
+    command: ["corepack", "pnpm", "--filter", "@choicemind/web", "start"]
+    environment:
+      CHOICEMIND_API_URL: http://api:3100
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health/live').then(response => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  api:
+    <<: *node-runtime
+    command: ["corepack", "pnpm", "--filter", "@choicemind/api", "start"]
+    environment:
+      DATA_WORKER_HEALTH_URL: http://data-worker:3300/health/live
+      HOST: 0.0.0.0
+      ORCHESTRATOR_HEALTH_URL: http://orchestrator:3200/health/live
+      PORT: "3100"
+      WEB_HEALTH_URL: http://web:3000/health/live
+    ports:
+      - "3100:3100"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3100/health/live').then(response => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  orchestrator:
+    <<: *node-runtime
+    command: ["corepack", "pnpm", "--filter", "@choicemind/orchestrator", "start"]
+    environment:
+      HOST: 0.0.0.0
+      PORT: "3200"
+    ports:
+      - "3200:3200"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3200/health/live').then(response => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  data-worker:
+    image: choicemind-data-worker:p0
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile.data-worker
+    ports:
+      - "3300:3300"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:3300/health/live', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5

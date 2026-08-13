@@ -1,0 +1,15 @@
+FROM ghcr.io/astral-sh/uv:0.11.19 AS uv
+FROM python:3.14.6-slim-bookworm
+
+COPY --from=uv /uv /uvx /bin/
+
+WORKDIR /workspace/services/data-worker
+
+COPY services/data-worker/pyproject.toml services/data-worker/uv.lock ./
+RUN uv sync --frozen --no-dev
+
+COPY services/data-worker/src ./src
+
+ENV PATH=/workspace/services/data-worker/.venv/bin:$PATH
+
+CMD ["uvicorn", "data_worker.app:app", "--app-dir", "src", "--host", "0.0.0.0", "--port", "3300"]

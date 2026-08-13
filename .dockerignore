@@ -1,0 +1,8 @@
+.git
+**/.next
+**/.pytest_cache
+**/.venv
+**/__pycache__
+**/dist
+**/node_modules
+**/test-results
