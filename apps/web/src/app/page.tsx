@@ -24,7 +24,8 @@ export default async function HomePage() {
   return (
     <main>
       <p>ChoiceMind 星枢智购</p>
-      <h1>系统健康</h1>
+      <DecisionFlow />
+      <h2>系统健康</h2>
       {health === null ? (
         <p>健康状态不可用</p>
       ) : (
@@ -56,3 +57,4 @@ async function loadSystemHealth(): Promise<SystemHealth | null> {
     return null;
   }
 }
+import { DecisionFlow } from "./decision-flow";
