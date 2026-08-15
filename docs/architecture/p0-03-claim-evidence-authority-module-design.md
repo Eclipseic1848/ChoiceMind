@@ -5,7 +5,7 @@
 - 状态：`accepted`，产品负责人于 2026-08-14 确认；同日已完成本设计范围内的受控 TDD 实施与工程验证。四轮独立双轴 `code-review` 的全部 finding 均已修复，第四轮结论为双轴 PASS；**P0-03 产品验收已于 2026-08-14 由产品负责人确认通过。** 提交、推送、Issue 更新与进入 P0-07A 仍需分别授权。
 - 日期：2026-08-14。
 - 对应 Issue：<https://github.com/Eclipseic1848/ChoiceMind/issues/3>。
-- 代码基线：分支 `p0-03-first-decision`，HEAD `53a972b042bb48473c0f697de51186ca85fc1651` 上的未提交 P0-03 WIP。
+- 代码基线：分支 `p0-03-first-decision`；设计形成时为 `53a972b042bb48473c0f697de51186ca85fc1651` 上的未提交 P0-03 WIP，实现与验收已随提交 `1cf3ad7` 落地。
 - 领域权威：根目录 V1.2 产品与研发规格、`CONTEXT.md`、[ADR-0006](../adr/0006-decision-basis-owns-evidence-state.md)。
 
 本设计只决定未发布 v1 的 Claim、Evidence、Claim-Evidence Link、Claim Assessment、Decision Basis 深 Module、结果生产/解码 Interface、严格迁移面和测试表面。

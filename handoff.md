@@ -1,11 +1,11 @@
 # ChoiceMind 星枢智购：零上下文开发交接
 
-> 最后更新：2026-08-14  
-> 当前仓库：`F:\new branch\ChoiceMind`  
-> 当前分支：`p0-03-first-decision`  
-> 固定基线/当前 HEAD：`53a972b042bb48473c0f697de51186ca85fc1651`  
-> 当前 Issue：[#3 P0-03 — 用 Fake AgentRuntime 跑通首个 Decision](https://github.com/Eclipseic1848/ChoiceMind/issues/3)  
-> 当前结论：**P0-03 产品验收已于 2026-08-14 由产品负责人确认通过。四轮独立双轴审查全部闭环，全部 finding 已修复并通过最终状态根级 `pnpm verify` 与 Windows 四进程纵向验证。Git 提交、推送、Issue #3 更新和进入 P0-07A 仍需分别授权。**
+> 最后更新：2026-08-14
+> 当前仓库：`F:\new branch\ChoiceMind`
+> 当前分支：`p0-03-first-decision`
+> 当前 HEAD：`1cf3ad7`（P0-03 实现提交，已推送 origin；历史基线 `53a972b` 为 P0-02 合并提交）
+> 当前 Issue：[#3 P0-03 — 用 Fake AgentRuntime 跑通首个 Decision](https://github.com/Eclipseic1848/ChoiceMind/issues/3)，**已验收并关闭**（2026-08-14）
+> 当前结论：**P0-03 已通过四轮独立双轴审查与产品验收，代码已提交（`1cf3ad7`）并推送、Issue #3 已关闭。PR 创建与进入 P0-07A 仍需分别授权。**
 
 ## 1. 新会话先做什么
 
@@ -49,20 +49,22 @@ ChoiceMind 星枢智购是一个面向小范围测试消费者的 Web 智能消�
 
 ## 3. 当前正在做的任务
 
-当前任务是 P0-03：用确定性 `FakeAgentRuntimeAdapter` 跑通第一条合成消费决策纵向链路：
+P0-03 已完成并验收（2026-08-14，提交 `1cf3ad7`、Issue #3 已关闭）：用确定性 `FakeAgentRuntimeAdapter` 跑通了第一条合成消费决策纵向链路：
 
 ```text
 Web → API → Orchestrator → AgentRuntimePort → Fake Runtime
     → Claim/Evidence/Link → Decision Basis → Decision Result → Web 展示
 ```
 
-P0-03 的目的不是实现真实模型、自然语言解析、真实爬虫或生产 Runtime，而是冻结并验证以下最难改变的语义：
+P0-03 冻结并验证了以下最难改变的语义：
 
 - Requirement、Candidate、Claim、Evidence、Decision、RunEvent、错误和任务状态的版本化合同；
 - 失败不能生成 Decision 或 `ok=true`；
 - Hard Constraint、选择、淘汰、Risk 和下一步必须由结构化证据闭包支撑；
 - 每个跨进程边界独立校验版本、结构和 HTTP/Result 一致性；
 - 同一执行重放可确定，不因进程、数组顺序或平台差异改变结果。
+
+下一任务按第 6.2 节依赖顺序为 P0-07A（CoreMind 最小 run Adapter），仍需单独授权后才开始。
 
 ## 4. 已经完成了什么
 
@@ -191,7 +193,7 @@ P0-03 的目的不是实现真实模型、自然语言解析、真实爬虫或�
 
 ### 5.3 当前真正的阻塞
 
-P0-03 本身已无阻塞：四轮独立双轴 `code-review` 全部闭环、产品验收已于 2026-08-14 由产品负责人确认通过。当前处于阶段门禁之间：Git 提交与推送、Issue #3 更新、进入 P0-07A 仍需分别授权；在取得对应授权前只能报告和交接。
+P0-03 本身已无阻塞：四轮独立双轴 `code-review` 全部闭环、产品验收已通过、代码已提交推送、Issue #3 已关闭。当前处于阶段门禁之间：PR 创建（如需）与进入 P0-07A 仍需分别授权；在取得对应授权前只能报告和交接。
 
 ## 6. 下一步计划
 
@@ -251,7 +253,7 @@ GitHub Issue 状态：
 
 - #1 P0-01：开放，框架研究暂缓；最终 ADR/认证尚未完成；
 - #2 P0-02：已关闭；
-- #3 P0-03：开放，当前任务；
+- #3 P0-03：已验收并关闭（2026-08-14，提交 `1cf3ad7`）；
 - #4（P0-04）至 #12（P0-12）：开放，均未因规划而自动开始。
 
 ### P1：可用智能体 Alpha
@@ -382,16 +384,16 @@ ID 存在、数组非空、类型正确都不足以证明 Decision 合法。必�
 
 GitHub/npm/PyPI 有成熟组件时优先研究和复用，但必须用真实样本和合同验证。下载慢、网络失败或构建卡住不授权更换版本、镜像、URL、来源、框架或实现路径。`fast-check` 目前未安装；若要加入仍需单独依赖授权。
 
-### 10.11 不要破坏当前未提交工作树
+### 10.11 不要破坏工作树或越过提交门禁
 
-P0-03 仍是大量未提交 WIP，包含已跟踪修改和未跟踪代码/文档。不要使用：
+P0-03 实现已提交（`1cf3ad7`）并推送 origin；工作树正常时只有交接文档的收尾增量。无论工作树状态如何，都不要使用：
 
 - `git reset --hard`、`git checkout --`；
 - `git clean`；
 - `git add .`；
-- 删除或覆盖看似“未跟踪”的 `packages/`、`docs/`、`CONTEXT.md`、`handoff.md`。
+- 删除或覆盖 `packages/`、`docs/`、`CONTEXT.md`、`handoff.md` 等仓库内容。
 
-提交前必须显式列出 allowlist，并再次确认提交、推送、PR、Issue、Tag 和部署授权。Git 远程是 `origin = https://github.com/Eclipseic1848/ChoiceMind.git`。
+每次提交前必须显式列出 allowlist，并再次确认提交、推送、PR、Issue、Tag 和部署授权。Git 远程是 `origin = https://github.com/Eclipseic1848/ChoiceMind.git`。
 
 ### 10.12 不要忽略 Windows/UTF-8 细节
 
@@ -418,18 +420,19 @@ pnpm dev
 
 ## 12. 权限和阶段门禁
 
-当前已授权并完成：Claim/Evidence Codebase Design、受控 TDD 实施、首轮独立双轴 `code-review`（结论 FAIL）、按第 6.1 节的最小 TDD 修复、第二轮独立双轴 `code-review`（Standards PASS / Spec FAIL 2 项）及其修复、第三轮独立双轴 `code-review`（双轴 FAIL 均收敛为文档门禁表述残留）及其修复、第四轮独立双轴 `code-review`（双轴 PASS，唯一轻级 finding 为状态节时点滞后，已随结论落定同步）（均为 2026-08-14 授权）、P0-03 产品验收（2026-08-14 产品负责人确认**通过**）、本次 `handoff.md` 更新。
+当前已授权并完成：Claim/Evidence Codebase Design、受控 TDD 实施、首轮独立双轴 `code-review`（结论 FAIL）、按第 6.1 节的最小 TDD 修复、第二轮独立双轴 `code-review`（Standards PASS / Spec FAIL 2 项）及其修复、第三轮独立双轴 `code-review`（双轴 FAIL 均收敛为文档门禁表述残留）及其修复、第四轮独立双轴 `code-review`（双轴 PASS）（均为 2026-08-14 授权）、P0-03 产品验收（2026-08-14 确认**通过**）、Git 提交（`1cf3ad7`）+ 推送 origin、Issue #3 验收评论并关闭、本次 `handoff.md` 更新。
 
 当前未授权：
+
+- 创建 PR / merge（当前 `p0-03-first-decision` 已推送但未开 PR）；
 - 安装 `fast-check` 或其他新依赖；
 - 进入 P0-07A/P0-07B；
 - 调用带费用或凭据的真实 Provider；
-- 修改/关闭 GitHub Issue；
-- Git commit、push、PR、merge、Tag；
+- Git Tag；
 - Linux 或生产部署。
 
 新会话的第一步不是直接改代码，而是向产品负责人说明：
 
-> 当前 P0-03 已通过四轮独立双轴审查与产品验收（2026-08-14 确认通过）。下一步依次等待分别授权：Git 提交与推送、Issue #3 更新、进入 P0-07A；每个动作都要单独授权，不自动执行。
+> 当前 P0-03 已验收（2026-08-14）、已提交 `1cf3ad7` 并推送、Issue #3 已关闭。下一步等待分别授权：是否创建 PR 合并到 main、是否进入 P0-07A；每个动作都要单独授权，不自动执行。
 
 一次只问这一个问题，并带上这个例子。得到明确同意后再开始。

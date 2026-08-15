@@ -88,7 +88,7 @@
 
 P0-03 只接受明确列入支持清单的精确版本。缺少版本或收到非 `1.0` 版本时必须拒绝，不得猜测、降级或静默转换。
 
-P0-03 尚未发布或验收，因此继续直接修订 `1.0`：删除旧 `Claim.status`、`Claim.evidenceIds`、`Evidence.claimId` 与 `Evidence.direction`，增加独立 Link 和派生 Assessment；既有 `nextSteps` 判别联合保持。所有旧字段和旧字符串数组均被 strict Schema 拒绝，不建立兼容层。
+P0-03 已验收（2026-08-14）但合同未对外发布，因此继续直接修订 `1.0`：删除旧 `Claim.status`、`Claim.evidenceIds`、`Evidence.claimId` 与 `Evidence.direction`，增加独立 Link 和派生 Assessment；既有 `nextSteps` 判别联合保持。所有旧字段和旧字符串数组均被 strict Schema 拒绝，不建立兼容层。
 
 当一个结果文档嵌套 Task Status、Decision 或 Error 时，被嵌套文档仍保留自己的合同头并独立校验；外层版本不能替代内层版本。
 
