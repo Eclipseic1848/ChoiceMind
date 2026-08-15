@@ -1,0 +1,21 @@
+{
+  "name": "@choicemind/contracts",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./decision/v1": {
+      "types": "./src/decision/v1/index.ts",
+      "default": "./dist/decision/v1/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc --project tsconfig.build.json",
+    "dev": "tsc --project tsconfig.build.json --watch --preserveWatchOutput",
+    "test": "vitest run",
+    "typecheck": "tsc --project tsconfig.json"
+  },
+  "dependencies": {
+    "zod": "4.4.3"
+  }
+}

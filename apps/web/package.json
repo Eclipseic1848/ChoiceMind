@@ -10,6 +10,7 @@
     "typecheck": "next typegen && tsc --project tsconfig.json"
   },
   "dependencies": {
+    "@choicemind/contracts": "workspace:*",
     "next": "16.3.0",
     "react": "19.2.8",
     "react-dom": "19.2.8"

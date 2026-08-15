@@ -25,6 +25,7 @@ services:
       DATA_WORKER_HEALTH_URL: http://data-worker:3300/health/live
       HOST: 0.0.0.0
       ORCHESTRATOR_HEALTH_URL: http://orchestrator:3200/health/live
+      ORCHESTRATOR_URL: http://orchestrator:3200
       PORT: "3100"
       WEB_HEALTH_URL: http://web:3000/health/live
     ports:
