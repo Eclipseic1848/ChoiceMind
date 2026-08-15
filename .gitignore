@@ -14,3 +14,11 @@ __pycache__/
 .env
 .env.*
 !.env.example
+
+# 仅本地保留的内部文档(不发布到 GitHub)
+handoff.md
+ChoiceMind_CoreMind_智能消费决策顾问_研发需求与实施规格书_v1.1.md
+ChoiceMind_星枢智购_V1.0_智能体构建解决方案.md
+docs/
+apps/web/AGENTS.md
+ChoiceMind_星枢智购_产品与研发规格书_v1.2.md
