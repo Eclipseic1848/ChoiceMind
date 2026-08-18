@@ -184,7 +184,7 @@ function createRuntimeFailedResult(
       contractType: "choice-mind-error",
       contractVersion: "1.0",
       errorId,
-      code: "FAKE_RUNTIME_FAILED",
+      code: "AGENT_RUNTIME_FAILED",
       category: "RUNTIME",
       message: "决策任务失败",
       retryMode: "NEW_EXECUTION_ALLOWED",

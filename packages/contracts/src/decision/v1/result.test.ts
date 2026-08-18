@@ -686,7 +686,7 @@ describe("decodeDecisionTaskResultV1", () => {
 
   it("rejects a runtime failure without the failed task status and run events", () => {
     const input = buildRejectedDecisionResult();
-    input.error.code = "FAKE_RUNTIME_FAILED";
+    input.error.code = "AGENT_RUNTIME_FAILED";
     input.error.category = "RUNTIME";
     input.error.retryMode = "NEW_EXECUTION_ALLOWED";
 
@@ -697,7 +697,7 @@ describe("decodeDecisionTaskResultV1", () => {
       issues: expect.arrayContaining([
         {
           path: "error.code",
-          message: "FAKE_RUNTIME_FAILED 必须属于已创建任务的失败结果"
+          message: "AGENT_RUNTIME_FAILED 必须属于已创建任务的失败结果"
         }
       ]),
       ok: false
@@ -856,7 +856,7 @@ describe("decodeDecisionTaskResultV1", () => {
     });
   });
 
-  it("rejects a completed task that skips required run stages", () => {
+  it("accepts a completed task that skips unperformed run stages", () => {
     const input = buildClosedDecisionResult();
     const createdEvent = requiredFirst(input.runEvents, "RunEvent");
     const understandingEvent = input.runEvents[1];
@@ -877,11 +877,146 @@ describe("decodeDecisionTaskResultV1", () => {
     const result = decodeDecisionTaskResultV1(input);
 
     expect(result).toMatchObject({
+      ok: true,
+      value: {
+        taskStatus: { latestEventSequence: 3 },
+        runEvents: [
+          { sequence: 1, taskState: "CREATED" },
+          { sequence: 2, taskState: "UNDERSTANDING" },
+          { sequence: 3, taskState: "COMPLETED" }
+        ]
+      }
+    });
+  });
+
+  it("accepts a completed task that performs gap research", () => {
+    const input = buildClosedDecisionResult();
+    const createdEvent = requiredFirst(input.runEvents, "RunEvent");
+    const verifyingEvent = input.runEvents[4];
+    const comparingEvent = input.runEvents[5];
+    const completedEvent = requiredLast(input.runEvents, "RunEvent");
+
+    if (verifyingEvent === undefined || comparingEvent === undefined) {
+      throw new Error("测试 fixture 缺少核验或比较 RunEvent");
+    }
+
+    input.runEvents = [
+      createdEvent,
+      verifyingEvent,
+      {
+        ...verifyingEvent,
+        taskState: "GAP_RESEARCH" as const,
+        summary: "合成阶段 GAP_RESEARCH"
+      },
+      comparingEvent,
+      completedEvent
+    ].map((event, index) => ({
+      ...event,
+      eventId: `event-contract-gap-research-${index + 1}`,
+      sequence: index + 1
+    }));
+    input.taskStatus.latestEventSequence = 5;
+    input.taskStatus.updatedAt = completedEvent.occurredAt;
+
+    const result = decodeDecisionTaskResultV1(input);
+
+    expect(result).toMatchObject({
+      ok: true,
+      value: {
+        taskStatus: { latestEventSequence: 5 },
+        runEvents: [
+          { sequence: 1, taskState: "CREATED" },
+          { sequence: 2, taskState: "VERIFYING" },
+          { sequence: 3, taskState: "GAP_RESEARCH" },
+          { sequence: 4, taskState: "COMPARING" },
+          { sequence: 5, taskState: "COMPLETED" }
+        ]
+      }
+    });
+  });
+
+  it("rejects a completed task that does not start with CREATED", () => {
+    const input = buildClosedDecisionResult();
+    requiredFirst(input.runEvents, "RunEvent").taskState = "UNDERSTANDING";
+
+    const result = decodeDecisionTaskResultV1(input);
+
+    expect(result).toMatchObject({
+      code: "CONTRACT_INVALID",
+      issues: expect.arrayContaining([
+        expect.objectContaining({
+          path: "runEvents.0.taskState",
+          message: "成功结果的 RunEvent 必须从 CREATED 开始"
+        })
+      ]),
+      ok: false
+    });
+  });
+
+  it("rejects a completed task whose RunEvents go backwards", () => {
+    const input = buildClosedDecisionResult();
+    const planningEvent = input.runEvents[2];
+    const understandingEvent = input.runEvents[1];
+
+    if (planningEvent === undefined || understandingEvent === undefined) {
+      throw new Error("测试 fixture 缺少规划或理解 RunEvent");
+    }
+
+    input.runEvents[1] = {
+      ...planningEvent,
+      eventId: "event-contract-backwards-planning",
+      sequence: 2
+    };
+    input.runEvents[2] = {
+      ...understandingEvent,
+      eventId: "event-contract-backwards-understanding",
+      sequence: 3
+    };
+
+    const result = decodeDecisionTaskResultV1(input);
+
+    expect(result).toMatchObject({
       code: "CONTRACT_INVALID",
       issues: expect.arrayContaining([
         expect.objectContaining({
           path: "runEvents.2.taskState",
-          message: "成功结果的 RunEvent 必须按固定阶段顺序迁移"
+          message: "成功结果的 RunEvent 必须按权威阶段顺序单调向前"
+        })
+      ]),
+      ok: false
+    });
+  });
+
+  it("rejects a completed task with duplicate COMPLETED events", () => {
+    const input = buildClosedDecisionResult();
+    const createdEvent = requiredFirst(input.runEvents, "RunEvent");
+    const completedEvent = requiredLast(input.runEvents, "RunEvent");
+
+    input.runEvents = [
+      createdEvent,
+      {
+        ...completedEvent,
+        eventId: "event-contract-first-completed",
+        eventType: "TASK_STATE_CHANGED" as const,
+        sequence: 2
+      },
+      {
+        ...completedEvent,
+        eventId: "event-contract-duplicate-completed",
+        sequence: 3
+      }
+    ];
+    input.taskStatus.latestEventSequence = 3;
+    input.taskStatus.updatedAt = completedEvent.occurredAt;
+
+    const result = decodeDecisionTaskResultV1(input);
+
+    expect(result).toMatchObject({
+      code: "CONTRACT_INVALID",
+      issues: expect.arrayContaining([
+        expect.objectContaining({
+          path: "runEvents.2.taskState",
+          message: "成功结果的 RunEvent 必须按权威阶段顺序单调向前"
         })
       ]),
       ok: false
@@ -3536,7 +3671,7 @@ function buildFailedDecisionResult() {
       contractType: "choice-mind-error",
       contractVersion: "1.0",
       errorId: "error-contract-failed",
-      code: "FAKE_RUNTIME_FAILED",
+      code: "AGENT_RUNTIME_FAILED",
       category: "RUNTIME",
       message: "决策任务失败",
       retryMode: "NEW_EXECUTION_ALLOWED",

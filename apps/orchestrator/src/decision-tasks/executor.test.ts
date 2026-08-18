@@ -101,6 +101,77 @@ describe("DecisionTaskExecutor.execute", () => {
     });
   });
 
+  it("accepts a completed run that skips unperformed stages while preserving order", async () => {
+    const sourceRuntime = createFakeAgentRuntimeAdapter();
+    const executor = createDecisionTaskExecutor({
+      runtime: {
+        async run(command) {
+          const output = await sourceRuntime.run(command);
+          const created = output.runEvents[0];
+          const planning = output.runEvents[2];
+          const completed = output.runEvents.at(-1);
+
+          if (created === undefined || planning === undefined || completed === undefined) {
+            throw new Error("测试 fixture 必须包含首个、规划和完成事件");
+          }
+
+          const sparseOutput = {
+            ...output,
+            runEvents: [created, planning, completed].map((event, index) => ({
+              ...event,
+              eventId: `${event.eventId}-sparse`,
+              sequence: index + 1,
+              eventType:
+                index === 2
+                  ? ("RUNTIME_SUCCEEDED" as const)
+                  : ("TASK_STATE_CHANGED" as const)
+            }))
+          };
+
+          return sparseOutput;
+        }
+      }
+    });
+
+    const baseCommand = buildRuntimeBoundaryCommand("sparse-success");
+    const command = {
+      ...baseCommand,
+      requirementRevision: {
+        ...baseCommand.requirementRevision,
+        budget: {
+          confirmed: true,
+          currency: "CNY" as const,
+          hard: true,
+          maxAmountMinor: 800000
+        },
+        mustHaves: [
+          {
+            key: "memory.capacity",
+            operator: "AT_LEAST" as const,
+            value: { amount: 32, unit: "GiB" }
+          },
+          {
+            key: "storage.capacity",
+            operator: "AT_LEAST" as const,
+            value: { amount: 1, unit: "TiB" }
+          }
+        ]
+      }
+    };
+
+    const result = await executor.execute(command);
+
+    expect(result).toMatchObject({
+      ok: true,
+      taskStatus: { state: "COMPLETED", latestEventSequence: 3 },
+      runEvents: [
+        { sequence: 1, taskState: "CREATED" },
+        { sequence: 2, taskState: "PLANNING" },
+        { sequence: 3, taskState: "COMPLETED", eventType: "RUNTIME_SUCCEEDED" }
+      ]
+    });
+  });
+
   it("asks for a preference when multiple Candidates satisfy every hard constraint", async () => {
     const executor = createDecisionTaskExecutor({
       runtime: createFakeAgentRuntimeAdapter()
@@ -278,7 +349,7 @@ describe("DecisionTaskExecutor.execute", () => {
     expect(result).toMatchObject({
       ok: false,
       taskStatus: { state: "FAILED" },
-      error: { code: "FAKE_RUNTIME_FAILED" }
+      error: { code: "AGENT_RUNTIME_FAILED" }
     });
     expect(result).not.toHaveProperty("bundle");
   });
@@ -341,7 +412,7 @@ describe("DecisionTaskExecutor.execute", () => {
     expect(result).toMatchObject({
       ok: false,
       taskStatus: { state: "FAILED" },
-      error: { code: "FAKE_RUNTIME_FAILED" }
+      error: { code: "AGENT_RUNTIME_FAILED" }
     });
     expect(result).not.toHaveProperty("bundle");
   });
@@ -422,7 +493,7 @@ describe("DecisionTaskExecutor.execute", () => {
     expect(result).toMatchObject({
       ok: false,
       taskStatus: { state: "FAILED" },
-      error: { code: "FAKE_RUNTIME_FAILED" }
+      error: { code: "AGENT_RUNTIME_FAILED" }
     });
     expect(result).not.toHaveProperty("bundle");
   });
@@ -478,7 +549,7 @@ describe("DecisionTaskExecutor.execute", () => {
     expect(result).toMatchObject({
       ok: false,
       taskStatus: { state: "FAILED" },
-      error: { code: "FAKE_RUNTIME_FAILED" }
+      error: { code: "AGENT_RUNTIME_FAILED" }
     });
     expect(result).not.toHaveProperty("bundle");
   });
@@ -523,7 +594,7 @@ describe("DecisionTaskExecutor.execute", () => {
     expect(result).toMatchObject({
       ok: false,
       taskStatus: { state: "FAILED" },
-      error: { code: "FAKE_RUNTIME_FAILED" }
+      error: { code: "AGENT_RUNTIME_FAILED" }
     });
     expect(result).not.toHaveProperty("bundle");
   });
@@ -566,7 +637,7 @@ describe("DecisionTaskExecutor.execute", () => {
         errorId: "error-synth-runtime-failure"
       },
       error: {
-        code: "FAKE_RUNTIME_FAILED",
+        code: "AGENT_RUNTIME_FAILED",
         category: "RUNTIME",
         retryMode: "NEW_EXECUTION_ALLOWED"
       },
@@ -776,7 +847,7 @@ describe("DecisionTaskExecutor.execute", () => {
       ok: false,
       taskStatus: { state: "FAILED" },
       error: {
-        code: "FAKE_RUNTIME_FAILED",
+        code: "AGENT_RUNTIME_FAILED",
         category: "RUNTIME"
       }
     });
@@ -822,7 +893,7 @@ describe("DecisionTaskExecutor.execute", () => {
       ok: false,
       taskStatus: { state: "FAILED" },
       error: {
-        code: "FAKE_RUNTIME_FAILED",
+        code: "AGENT_RUNTIME_FAILED",
         category: "RUNTIME",
         retryMode: "NEW_EXECUTION_ALLOWED"
       }
@@ -872,7 +943,7 @@ describe("DecisionTaskExecutor.execute", () => {
       ok: false,
       taskStatus: { state: "FAILED" },
       error: {
-        code: "FAKE_RUNTIME_FAILED",
+        code: "AGENT_RUNTIME_FAILED",
         category: "RUNTIME",
         retryMode: "NEW_EXECUTION_ALLOWED"
       }
@@ -911,7 +982,7 @@ describe("DecisionTaskExecutor.execute", () => {
     expect(result).toMatchObject({
       ok: false,
       taskStatus: { state: "FAILED" },
-      error: { code: "FAKE_RUNTIME_FAILED", category: "RUNTIME" }
+      error: { code: "AGENT_RUNTIME_FAILED", category: "RUNTIME" }
     });
     expect(result).not.toHaveProperty("bundle");
   });
@@ -947,7 +1018,7 @@ describe("DecisionTaskExecutor.execute", () => {
     expect(result).toMatchObject({
       ok: false,
       taskStatus: { state: "FAILED" },
-      error: { code: "FAKE_RUNTIME_FAILED", category: "RUNTIME" }
+      error: { code: "AGENT_RUNTIME_FAILED", category: "RUNTIME" }
     });
     expect(result).not.toHaveProperty("bundle");
   });
@@ -988,7 +1059,7 @@ describe("DecisionTaskExecutor.execute", () => {
       ok: false,
       taskStatus: { state: "FAILED" },
       error: {
-        code: "FAKE_RUNTIME_FAILED",
+        code: "AGENT_RUNTIME_FAILED",
         category: "RUNTIME",
         retryMode: "NEW_EXECUTION_ALLOWED"
       }
@@ -1029,7 +1100,7 @@ describe("DecisionTaskExecutor.execute", () => {
       ok: false,
       taskStatus: { state: "FAILED" },
       error: {
-        code: "FAKE_RUNTIME_FAILED",
+        code: "AGENT_RUNTIME_FAILED",
         category: "RUNTIME",
         retryMode: "NEW_EXECUTION_ALLOWED"
       }
@@ -1153,7 +1224,7 @@ describe("DecisionTaskExecutor.execute", () => {
       ok: false,
       taskStatus: { state: "FAILED" },
       error: {
-        code: "FAKE_RUNTIME_FAILED",
+        code: "AGENT_RUNTIME_FAILED",
         category: "RUNTIME",
         retryMode: "NEW_EXECUTION_ALLOWED"
       }
@@ -1195,7 +1266,7 @@ describe("DecisionTaskExecutor.execute", () => {
     expect(result).toMatchObject({
       ok: false,
       taskStatus: { state: "FAILED" },
-      error: { code: "FAKE_RUNTIME_FAILED", category: "RUNTIME" }
+      error: { code: "AGENT_RUNTIME_FAILED", category: "RUNTIME" }
     });
     expect(result).not.toHaveProperty("bundle");
   });

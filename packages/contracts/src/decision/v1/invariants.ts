@@ -1,12 +1,13 @@
 import { checkDecisionBasisV1 } from "./decision-basis.js";
 import type { ContractIssueV1, DecisionTaskResultV1 } from "./index.js";
 
-const completedRunStates = [
+const authoritativeRunStates = [
   "CREATED",
   "UNDERSTANDING",
   "PLANNING",
   "RESEARCHING",
   "VERIFYING",
+  "GAP_RESEARCH",
   "COMPARING",
   "CRITIQUING",
   "GENERATING",
@@ -16,7 +17,7 @@ const completedRunStates = [
 const errorSemanticsByCode = {
   CONTRACT_INVALID: { category: "VALIDATION", retryMode: "NONE" },
   CONTRACT_VERSION_UNSUPPORTED: { category: "VERSION", retryMode: "NONE" },
-  FAKE_RUNTIME_FAILED: { category: "RUNTIME", retryMode: "NEW_EXECUTION_ALLOWED" },
+  AGENT_RUNTIME_FAILED: { category: "RUNTIME", retryMode: "NEW_EXECUTION_ALLOWED" },
   DECISION_EXECUTION_STATUS_UNKNOWN: {
     category: "TRANSPORT",
     retryMode: "SAME_EXECUTION_ONLY"
@@ -96,7 +97,7 @@ export function checkDecisionTaskResultInvariants(
     if ("taskStatus" in result) {
       const finalEvent = result.runEvents.at(-1);
 
-      if (result.error.code !== "FAKE_RUNTIME_FAILED") {
+      if (result.error.code !== "AGENT_RUNTIME_FAILED") {
         issues.push({
           path: "error.code",
           message: "已创建任务的失败结果必须使用 Runtime 失败错误码"
@@ -123,10 +124,10 @@ export function checkDecisionTaskResultInvariants(
           message: "失败结果的最后事件必须是 RUNTIME_FAILED"
         });
       }
-    } else if (result.error.code === "FAKE_RUNTIME_FAILED") {
+    } else if (result.error.code === "AGENT_RUNTIME_FAILED") {
       issues.push({
         path: "error.code",
-        message: "FAKE_RUNTIME_FAILED 必须属于已创建任务的失败结果"
+        message: "AGENT_RUNTIME_FAILED 必须属于已创建任务的失败结果"
       });
     }
 
@@ -149,21 +150,29 @@ export function checkDecisionTaskResultInvariants(
     });
   }
 
-  const firstRunStateMismatch = result.runEvents.findIndex(
-    (event, index) => event.taskState !== completedRunStates[index]
-  );
-
-  if (
-    result.runEvents.length !== completedRunStates.length ||
-    firstRunStateMismatch !== -1
-  ) {
-    const mismatchIndex =
-      firstRunStateMismatch === -1 ? result.runEvents.length : firstRunStateMismatch;
+  if (result.runEvents[0]?.taskState !== "CREATED") {
     issues.push({
-      path: `runEvents.${mismatchIndex}.taskState`,
-      message: "成功结果的 RunEvent 必须按固定阶段顺序迁移"
+      path: "runEvents.0.taskState",
+      message: "成功结果的 RunEvent 必须从 CREATED 开始"
     });
   }
+
+  let previousStateIndex = -1;
+
+  result.runEvents.forEach((event, index) => {
+    const currentStateIndex = (authoritativeRunStates as readonly string[]).indexOf(
+      event.taskState
+    );
+
+    if (currentStateIndex === -1 || currentStateIndex <= previousStateIndex) {
+      issues.push({
+        path: `runEvents.${index}.taskState`,
+        message: "成功结果的 RunEvent 必须按权威阶段顺序单调向前"
+      });
+    }
+
+    previousStateIndex = currentStateIndex;
+  });
 
   result.runEvents.slice(0, -1).forEach((event, index) => {
     if (event.eventType !== "TASK_STATE_CHANGED") {
