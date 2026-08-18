@@ -314,7 +314,7 @@ const choiceMindErrorSchema = z.strictObject({
   code: z.enum([
     "CONTRACT_INVALID",
     "CONTRACT_VERSION_UNSUPPORTED",
-    "FAKE_RUNTIME_FAILED",
+    "AGENT_RUNTIME_FAILED",
     "DECISION_EXECUTION_STATUS_UNKNOWN"
   ]),
   category: z.enum(["VALIDATION", "VERSION", "RUNTIME", "TRANSPORT"]),

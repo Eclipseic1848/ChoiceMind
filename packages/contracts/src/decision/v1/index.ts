@@ -300,7 +300,7 @@ export type ChoiceMindErrorV1 = Readonly<{
   code:
     | "CONTRACT_INVALID"
     | "CONTRACT_VERSION_UNSUPPORTED"
-    | "FAKE_RUNTIME_FAILED"
+    | "AGENT_RUNTIME_FAILED"
     | "DECISION_EXECUTION_STATUS_UNKNOWN";
   category: "VALIDATION" | "VERSION" | "RUNTIME" | "TRANSPORT";
   message: string;
