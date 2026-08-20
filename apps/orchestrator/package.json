@@ -6,9 +6,10 @@
   "scripts": {
     "build": "tsc --project tsconfig.build.json",
     "dev": "tsx watch src/server.ts",
+    "smoke:coremind:qwen": "tsx scripts/smoke-coremind-qwen.ts",
     "start": "node dist/server.js",
     "test": "vitest run",
-    "typecheck": "tsc --project tsconfig.json"
+    "typecheck": "tsc --project tsconfig.json && tsc --project tsconfig.scripts.json"
   },
   "dependencies": {
     "@choicemind/contracts": "workspace:*",

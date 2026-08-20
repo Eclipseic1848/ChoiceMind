@@ -6,6 +6,7 @@ dist/
 coverage/
 playwright-report/
 test-results/
+apps/orchestrator/.artifacts/
 .venv/
 __pycache__/
 .pytest_cache/
