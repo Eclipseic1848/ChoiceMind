@@ -1,10 +1,10 @@
 import { buildOrchestratorApp } from "./app.js";
 import { createDecisionTaskExecutor } from "./decision-tasks/executor.js";
-import { createFakeAgentRuntimeAdapter } from "./runtime/fake-agent-runtime-adapter.js";
+import { createAgentRuntimeAdapter } from "./runtime/agent-runtime-factory.js";
 
 const app = buildOrchestratorApp({
   decisionTaskExecutor: createDecisionTaskExecutor({
-    runtime: createFakeAgentRuntimeAdapter()
+    runtime: createAgentRuntimeAdapter()
   })
 });
 const port = Number(process.env.PORT ?? 3200);
