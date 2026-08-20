@@ -20,6 +20,20 @@ type OfflineProvider = Readonly<{
   close: () => Promise<void>;
 }>;
 
+type OfflineProviderScenario =
+  | "success"
+  | "duplicate-tool"
+  | "no-tool"
+  | "free-text"
+  | "malformed-tool-arguments"
+  | "forbidden-claim-assessments"
+  | "forbidden-run-events"
+  | "forbidden-success-marker"
+  | "provider-error"
+  | "provider-timeout"
+  | "contradictory-domain-draft"
+  | "invalid-decision-draft";
+
 const openProviders: Array<OfflineProvider> = [];
 const openApps: Array<ReturnType<typeof buildOrchestratorApp>> = [];
 const temporaryDirectories: string[] = [];
@@ -149,12 +163,64 @@ describe("CoreMind AgentRuntimeRunPort", () => {
     expect(provider.requests).toHaveLength(4);
   });
 
+  it("fails closed when the Provider submits the Decision draft Tool more than once", async () => {
+    const provider = await startOfflineProvider("duplicate-tool");
+    const configDir = await createTemporaryDirectory();
+    const executor = createDecisionTaskExecutor({
+      runtime: createCoreMindAgentRuntimeAdapter({
+        providerBaseUrl: provider.baseUrl,
+        model: "offline-model",
+        configDir
+      })
+    });
+
+    const result = await executor.execute(buildCoreMindCommand("coremind-duplicate-tool"));
+
+    expectRuntimeFailure(result);
+  });
+
+  it.each([
+    ["no-tool", "缺失 Tool"],
+    ["free-text", "仅自由文本"],
+    ["malformed-tool-arguments", "畸形 Tool 参数"],
+    ["forbidden-claim-assessments", "越权 Claim Assessment"],
+    ["forbidden-run-events", "越权 RunEvent"],
+    ["forbidden-success-marker", "越权任务成功标记"],
+    ["provider-error", "Provider 非成功响应"],
+    ["provider-timeout", "Provider 超时"],
+    ["contradictory-domain-draft", "相互矛盾的领域草稿"],
+    ["invalid-decision-draft", "违反 ChoiceMind 合同的 Decision 草稿"]
+  ] as const)("fails closed for %s（%s）", async (scenario, _description) => {
+    const provider = await startOfflineProvider(scenario);
+    const configDir = await createTemporaryDirectory();
+    const executor = createDecisionTaskExecutor({
+      runtime: createCoreMindAgentRuntimeAdapter({
+        providerBaseUrl: provider.baseUrl,
+        model: "offline-model",
+        configDir,
+        runTimeoutMs: scenario === "provider-timeout" ? 20 : 10_000
+      })
+    });
+
+    const result = await executor.execute(buildCoreMindCommand(`coremind-${scenario}`));
+
+    // CoreMind 0.3.0 的超时结果会早于后台 RunState 写入返回，保留临时目录直到写入收尾。
+    if (scenario === "provider-timeout") {
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    }
+
+    expectRuntimeFailure(result);
+    expect(JSON.stringify(result)).not.toContain("provider-private-sentinel");
+  });
+
   it("passes only the dedicated ChoiceMind Provider credential into CoreMind", async () => {
     let createOptions: Parameters<typeof CoreMindRuntime.create>[0] | undefined;
     vi.spyOn(CoreMindRuntime, "create").mockImplementation(async (options) => {
       createOptions = options;
       return {
-        run: async () => ({ outcome: { status: "failed" } })
+        run: async () => ({
+          outcome: { status: "failed", reason: "coremind-private-sentinel" }
+        })
       } as unknown as Awaited<ReturnType<typeof CoreMindRuntime.create>>;
     });
     const executor = createDecisionTaskExecutor({
@@ -167,7 +233,8 @@ describe("CoreMind AgentRuntimeRunPort", () => {
 
     const result = await executor.execute(buildCoreMindCommand("coremind-provider-env"));
 
-    expect(result.ok).toBe(false);
+    expectRuntimeFailure(result);
+    expect(JSON.stringify(result)).not.toContain("coremind-private-sentinel");
     expect(Object.keys(createOptions?.env ?? {})).toHaveLength(1);
     expect(createOptions?.env?.CHOICEMIND_COREMIND_PROVIDER_API_KEY).toBe("choice-key");
   });
@@ -228,6 +295,32 @@ describe("CoreMind AgentRuntimeRunPort", () => {
       }
     });
   });
+
+  it("returns a framework-neutral Runtime failure through the Orchestrator HTTP seam", async () => {
+    const provider = await startOfflineProvider("provider-error");
+    const configDir = await createTemporaryDirectory();
+    const app = buildOrchestratorApp({
+      decisionTaskExecutor: createDecisionTaskExecutor({
+        runtime: createCoreMindAgentRuntimeAdapter({
+          providerBaseUrl: provider.baseUrl,
+          model: "offline-model",
+          configDir
+        })
+      })
+    });
+    openApps.push(app);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/internal/v1/decision-tasks:execute",
+      payload: buildCoreMindCommand("coremind-http-runtime-failure")
+    });
+    const body = response.json();
+
+    expect(response.statusCode).toBe(502);
+    expectRuntimeFailure(body);
+    expect(response.body).not.toContain("provider-private-sentinel");
+  });
 });
 
 function createWebDecisionRequest(command: ExecuteDecisionTaskCommandV1): Request {
@@ -238,7 +331,9 @@ function createWebDecisionRequest(command: ExecuteDecisionTaskCommandV1): Reques
   });
 }
 
-async function startOfflineProvider(): Promise<OfflineProvider> {
+async function startOfflineProvider(
+  scenario: OfflineProviderScenario = "success"
+): Promise<OfflineProvider> {
   const requests: Record<string, unknown>[] = [];
   const server = createServer(async (request, response) => {
     const body = await readJsonBody(request);
@@ -246,6 +341,21 @@ async function startOfflineProvider(): Promise<OfflineProvider> {
 
     if (request.method !== "POST" || request.url !== "/v1/chat/completions") {
       response.writeHead(404).end();
+      return;
+    }
+
+    if (scenario === "provider-error") {
+      response.writeHead(500, { "content-type": "application/json" });
+      response.end(JSON.stringify({ error: { message: "provider-private-sentinel" } }));
+      return;
+    }
+
+    if (scenario === "provider-timeout") {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      if (!response.destroyed) {
+        response.writeHead(504, { "content-type": "text/plain" });
+        response.end("provider-private-sentinel");
+      }
       return;
     }
 
@@ -273,6 +383,28 @@ async function startOfflineProvider(): Promise<OfflineProvider> {
       ]);
     }
 
+    if (scenario === "no-tool" || scenario === "free-text") {
+      return sendSse(response, [
+        {
+          id: `offline-${scenario}`,
+          object: "chat.completion.chunk",
+          created: 1,
+          model: "offline-model",
+          choices: [
+            {
+              index: 0,
+              delta: {
+                role: "assistant",
+                content: scenario === "free-text" ? "我建议选择合成候选 A。" : ""
+              },
+              finish_reason: "stop"
+            }
+          ]
+        },
+        "[DONE]"
+      ]);
+    }
+
     const prompt = messages.find(
       (message) => isRecord(message) && message.role === "user"
     );
@@ -286,13 +418,66 @@ async function startOfflineProvider(): Promise<OfflineProvider> {
       typeof buildSyntheticLaptopRunOutput
     >[0];
     const output = buildSyntheticLaptopRunOutput(command);
-    const draft = {
+    const draft: Record<string, unknown> = {
       candidates: output.candidates,
       claims: output.claims,
       evidence: output.evidence,
       claimEvidenceLinks: output.claimEvidenceLinks,
       decision: output.decision
     };
+
+    if (scenario === "forbidden-claim-assessments") {
+      draft.claimAssessments = [];
+    }
+    if (scenario === "forbidden-run-events") {
+      draft.runEvents = [];
+    }
+    if (scenario === "forbidden-success-marker") {
+      draft.ok = true;
+    }
+    if (scenario === "contradictory-domain-draft") {
+      const links = [...output.claimEvidenceLinks];
+      const firstLink = links[0];
+      if (firstLink === undefined) {
+        throw new Error("合成领域草稿必须包含 Claim-Evidence Link");
+      }
+      links.push({
+        ...firstLink,
+        linkId: `${firstLink.linkId}-refutes`,
+        direction: "REFUTES"
+      });
+      draft.claimEvidenceLinks = links;
+    }
+    if (scenario === "invalid-decision-draft") {
+      draft.decision = {
+        ...output.decision,
+        selectedCandidateId: "candidate-does-not-exist"
+      };
+    }
+
+    const toolCalls = [
+      {
+        index: 0,
+        id: "call-submit-decision-draft",
+        type: "function",
+        function: {
+          name: "submit_decision_draft",
+          arguments:
+            scenario === "malformed-tool-arguments" ? "{not-json" : JSON.stringify(draft)
+        }
+      }
+    ];
+    if (scenario === "duplicate-tool") {
+      toolCalls.push({
+        index: 1,
+        id: "call-submit-decision-draft-again",
+        type: "function",
+        function: {
+          name: "submit_decision_draft",
+          arguments: JSON.stringify(draft)
+        }
+      });
+    }
 
     return sendSse(response, [
       {
@@ -305,17 +490,7 @@ async function startOfflineProvider(): Promise<OfflineProvider> {
             index: 0,
             delta: {
               role: "assistant",
-              tool_calls: [
-                {
-                  index: 0,
-                  id: "call-submit-decision-draft",
-                  type: "function",
-                  function: {
-                    name: "submit_decision_draft",
-                    arguments: JSON.stringify(draft)
-                  }
-                }
-              ]
+              tool_calls: toolCalls
             },
             finish_reason: "tool_calls"
           }
@@ -343,6 +518,24 @@ async function startOfflineProvider(): Promise<OfflineProvider> {
   };
   openProviders.push(provider);
   return provider;
+}
+
+function expectRuntimeFailure(result: Awaited<ReturnType<ReturnType<typeof createDecisionTaskExecutor>["execute"]>>): void {
+  expect(result).toMatchObject({
+    ok: false,
+    taskStatus: { state: "FAILED", terminal: true },
+    runEvents: [
+      { sequence: 1, taskState: "CREATED" },
+      { sequence: 2, taskState: "FAILED", eventType: "RUNTIME_FAILED" }
+    ],
+    error: {
+      code: "AGENT_RUNTIME_FAILED",
+      category: "RUNTIME",
+      message: "决策任务失败",
+      retryMode: "NEW_EXECUTION_ALLOWED"
+    }
+  });
+  expect(result).not.toHaveProperty("bundle");
 }
 
 async function sendSse(response: ServerResponse, chunks: readonly unknown[]) {
