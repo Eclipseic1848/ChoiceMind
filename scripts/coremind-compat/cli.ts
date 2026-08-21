@@ -4,14 +4,14 @@ import { fileURLToPath } from "node:url";
 
 import {
   CoreMindCompatibilityError,
-  runCoreMindCandidateAssembly,
+  runCoreMindCompatibility,
   type CoreMindCompatibilityReport
 } from "./index.js";
-import type { CoreMindArtifactSource } from "./internal-types.js";
-import { createSystemArtifactSource } from "./system.js";
+import type { CoreMindCompatibilitySystem } from "./internal-types.js";
+import { createSystemCompatibilitySystem } from "./system.js";
 
 export interface CoreMindCompatCliDependencies {
-  createArtifactSource(runDirectory: string): CoreMindArtifactSource;
+  createCompatibilitySystem(runDirectory: string): CoreMindCompatibilitySystem;
   outputRoot: string;
 }
 
@@ -23,7 +23,7 @@ export class CoreMindCompatCliFailure extends Error {
   readonly reportPath: string;
 
   constructor(reportPath: string) {
-    super("CoreMind 候选装配失败");
+    super("CoreMind 候选兼容验证失败");
     this.name = "CoreMindCompatCliFailure";
     this.reportPath = reportPath;
   }
@@ -40,11 +40,29 @@ export async function runCoreMindCompatCli(
 
   try {
     const candidate = await readCandidate(candidatePath);
-    const artifactSource = dependencies.createArtifactSource(stagingDirectory);
-    const report = await runCoreMindCandidateAssembly(candidate, artifactSource);
-    await writeReportAtomically(path.join(stagingDirectory, "report.json"), report);
+    const compatibilitySystem = dependencies.createCompatibilitySystem(stagingDirectory);
+    const report = await runCoreMindCompatibility(candidate, compatibilitySystem);
+    try {
+      await writeReportAtomically(path.join(stagingDirectory, "report.json"), report);
+    } catch {
+      throw new CoreMindCompatibilityError(
+        "F",
+        "REPORT_WRITE_FAILED",
+        "成功报告原子写入失败",
+        "REPORT_WRITE"
+      );
+    }
     const candidateDirectory = path.join(dependencies.outputRoot, `candidate-${runId}`);
-    await rename(stagingDirectory, candidateDirectory);
+    try {
+      await rename(stagingDirectory, candidateDirectory);
+    } catch {
+      throw new CoreMindCompatibilityError(
+        "F",
+        "ARTIFACT_PROMOTION_FAILED",
+        "成功证据原子提升失败",
+        "ARTIFACT_PROMOTION"
+      );
+    }
     return { reportPath: path.join(candidateDirectory, "report.json") };
   } catch (error) {
     await rm(stagingDirectory, {
@@ -66,16 +84,7 @@ export async function runCoreMindCompatCli(
           );
     const report = {
       schemaVersion: 1,
-      gates: {
-        A: compatibilityError.gate === "A" ? "FAILED" : "PASSED",
-        B: compatibilityError.gate === "B" ? "FAILED" : "NOT_RUN",
-        C: "NOT_RUN",
-        D: "NOT_RUN",
-        E: "NOT_RUN",
-        F: "NOT_RUN",
-        G: "NOT_RUN",
-        H: "NOT_RUN"
-      },
+      gates: failureGateStates(compatibilityError.gate),
       failure: {
         code: compatibilityError.code,
         ...(compatibilityError.stage === undefined
@@ -89,6 +98,23 @@ export async function runCoreMindCompatCli(
     await writeReportAtomically(reportPath, report);
     throw new CoreMindCompatCliFailure(reportPath);
   }
+}
+
+function failureGateStates(
+  failedGate: CoreMindCompatibilityError["gate"]
+): CoreMindCompatibilityReport["gates"] {
+  const orderedGates = ["A", "B", "C", "D", "E", "F"] as const;
+  const failedIndex = orderedGates.indexOf(failedGate);
+  return {
+    A: failedIndex > 0 ? "PASSED" : "FAILED",
+    B: failedIndex > 1 ? "PASSED" : failedGate === "B" ? "FAILED" : "NOT_RUN",
+    C: failedIndex > 2 ? "PASSED" : failedGate === "C" ? "FAILED" : "NOT_RUN",
+    D: failedIndex > 3 ? "PASSED" : failedGate === "D" ? "FAILED" : "NOT_RUN",
+    E: failedIndex > 4 ? "PASSED" : failedGate === "E" ? "FAILED" : "NOT_RUN",
+    F: failedGate === "F" ? "FAILED" : "NOT_RUN",
+    G: "NOT_RUN",
+    H: "NOT_RUN"
+  };
 }
 
 function parseCandidatePath(args: string[]): string {
@@ -120,18 +146,18 @@ if (path.resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) {
   process.once("SIGINT", cancel);
   try {
     const result = await runCoreMindCompatCli(process.argv.slice(2), {
-      createArtifactSource: (runDirectory) =>
-        createSystemArtifactSource({
+      createCompatibilitySystem: (runDirectory) =>
+        createSystemCompatibilitySystem({
           artifactDirectory: runDirectory,
           choiceMindRoot,
           signal: cancellation.signal
         }),
       outputRoot: path.join(choiceMindRoot, ".artifacts", "coremind-compat")
     });
-    console.log(`CoreMind 候选 Gate A/B 通过：${result.reportPath}`);
+    console.log(`CoreMind 候选 Gate A-F 离线兼容通过：${result.reportPath}`);
   } catch (error) {
     if (error instanceof CoreMindCompatCliFailure) {
-      console.error(`CoreMind 候选 Gate A/B 失败；安全报告：${error.reportPath}`);
+      console.error(`CoreMind 候选兼容验证失败；安全报告：${error.reportPath}`);
     } else {
       console.error(error instanceof Error ? error.message : "CoreMind 候选命令失败");
     }

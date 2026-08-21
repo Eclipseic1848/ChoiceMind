@@ -4,27 +4,27 @@ import { describe, expect, test } from "vitest";
 
 import {
   CORE_MIND_PACKAGE_NAMES,
-  runCoreMindCandidateAssembly
+  runCoreMindCompatibility
 } from "./index.js";
 import type {
-  CoreMindArtifactSource,
+  CoreMindCompatibilitySystem,
   MaterializedCoreMindCandidate
 } from "./internal-types.js";
-import { createArtifactSource, createMaterializedCandidate } from "./test-fixtures.js";
+import { createCompatibilitySystem, createMaterializedCandidate } from "./test-fixtures.js";
 
 const commit = "57e5765471cf6fe7f7da14d9ed4882e0c53ec322";
 const candidateVersion = "0.0.0-rc.1";
 
-describe("CoreMind 候选身份与原子制品装配", () => {
-  test("精确 Git commit 的同源八包形成 Gate A/B 通过报告", async () => {
-    const report = await runCoreMindCandidateAssembly(
+describe("CoreMind 候选兼容验证", () => {
+  test("精确 Git commit 通过同一 Module 形成 Gate A-F 离线兼容报告", async () => {
+    const report = await runCoreMindCompatibility(
       {
         schemaVersion: 1,
         kind: "git-commit",
         repository: "https://github.com/Eclipseic1848/CoreMind.git",
         commit
       },
-      createArtifactSource(createMaterializedCandidate())
+      createCompatibilitySystem(createMaterializedCandidate())
     );
 
     expect(report).toMatchObject({
@@ -37,10 +37,10 @@ describe("CoreMind 候选身份与原子制品装配", () => {
       gates: {
         A: "PASSED",
         B: "PASSED",
-        C: "NOT_RUN",
-        D: "NOT_RUN",
-        E: "NOT_RUN",
-        F: "NOT_RUN",
+        C: "PASSED",
+        D: "PASSED",
+        E: "PASSED",
+        F: "PASSED",
         G: "NOT_RUN",
         H: "NOT_RUN"
       },
@@ -55,7 +55,7 @@ describe("CoreMind 候选身份与原子制品装配", () => {
   });
 
   test("浮动 Git 身份在读取外部制品前失败", async () => {
-    const source: CoreMindArtifactSource = {
+    const source: CoreMindCompatibilitySystem = {
       materializeGitCommit: async () => {
         throw new Error("不应读取外部制品");
       },
@@ -67,11 +67,14 @@ describe("CoreMind 候选身份与原子制品装配", () => {
         nodeVersion: "22.22.1",
         workspacePackageManager: "pnpm@11.21.0",
         artifactPackageManager: "npm@10.9.4"
-      })
+      }),
+      verifyCandidateCompatibility: async () => {
+        throw new Error("不应运行候选验证");
+      }
     };
 
     await expect(
-      runCoreMindCandidateAssembly(
+      runCoreMindCompatibility(
         {
           schemaVersion: 1,
           kind: "git-commit",
@@ -84,7 +87,7 @@ describe("CoreMind 候选身份与原子制品装配", () => {
   });
 
   test("环境身份读取失败在获取候选制品前失败并具有独立错误码", async () => {
-    const source = createArtifactSource(createMaterializedCandidate());
+    const source = createCompatibilitySystem(createMaterializedCandidate());
     let materialized = false;
     source.materializeGitCommit = async () => {
       materialized = true;
@@ -95,7 +98,7 @@ describe("CoreMind 候选身份与原子制品装配", () => {
     };
 
     await expect(
-      runCoreMindCandidateAssembly(
+      runCoreMindCompatibility(
         {
           schemaVersion: 1,
           kind: "git-commit",
@@ -120,7 +123,7 @@ describe("CoreMind 候选身份与原子制品装配", () => {
     ]
   ])("拒绝%s", async (_caseName, input) => {
     await expect(
-      runCoreMindCandidateAssembly(input, createArtifactSource())
+      runCoreMindCompatibility(input, createCompatibilitySystem())
     ).rejects.toMatchObject({ gate: "A", code: "CANDIDATE_INVALID" });
   });
 
@@ -133,9 +136,9 @@ describe("CoreMind 候选身份与原子制品装配", () => {
     );
 
     await expect(
-      runCoreMindCandidateAssembly(
+      runCoreMindCompatibility(
         { schemaVersion: 1, kind: "npm-release", version: "0.3.1-rc.1", packages },
-        createArtifactSource(materialized)
+        createCompatibilitySystem(materialized)
       )
     ).rejects.toMatchObject({ gate: "A", code: "CANDIDATE_INVALID" });
   });
@@ -147,7 +150,7 @@ describe("CoreMind 候选身份与原子制品装配", () => {
     ["额外字段", { dirty: true }, "额外 [dirty]"]
   ])("拒绝%s候选", async (_caseName, override, expectedMessage) => {
     await expect(
-      runCoreMindCandidateAssembly(
+      runCoreMindCompatibility(
         {
           schemaVersion: 1,
           kind: "git-commit",
@@ -155,16 +158,16 @@ describe("CoreMind 候选身份与原子制品装配", () => {
           commit,
           ...override
         },
-        createArtifactSource(createMaterializedCandidate())
+        createCompatibilitySystem(createMaterializedCandidate())
       )
     ).rejects.toThrow(expectedMessage);
   });
 
   test("拒绝 next 等非精确 npm 版本", async () => {
     await expect(
-      runCoreMindCandidateAssembly(
+      runCoreMindCompatibility(
         { schemaVersion: 1, kind: "npm-release", version: "next", packages: {} },
-        createArtifactSource(createMaterializedCandidate())
+        createCompatibilitySystem(createMaterializedCandidate())
       )
     ).rejects.toThrow("精确 RC 或正式版本");
   });
@@ -178,14 +181,14 @@ describe("CoreMind 候选身份与原子制品装配", () => {
       ])
     );
 
-    const report = await runCoreMindCandidateAssembly(
+    const report = await runCoreMindCompatibility(
       {
         schemaVersion: 1,
         kind: "npm-release",
         version: "0.3.1-rc.1",
         packages
       },
-      createArtifactSource(materialized)
+      createCompatibilitySystem(materialized)
     );
 
     expect(report.candidate).toEqual({
@@ -212,14 +215,14 @@ describe("CoreMind 候选身份与原子制品装配", () => {
     );
 
     await expect(
-      runCoreMindCandidateAssembly(
+      runCoreMindCompatibility(
         {
           schemaVersion: 1,
           kind: "npm-release",
           version: "0.3.1-rc.1",
           packages
         },
-        createArtifactSource(materialized)
+        createCompatibilitySystem(materialized)
       )
     ).rejects.toThrow("coremind-runtime integrity 与候选描述不一致");
   });
@@ -232,14 +235,14 @@ describe("CoreMind 候选身份与原子制品装配", () => {
     );
 
     await expect(
-      runCoreMindCandidateAssembly(
+      runCoreMindCompatibility(
         {
           schemaVersion: 1,
           kind: "npm-release",
           version: "0.3.1-rc.1",
           packages
         },
-        createArtifactSource(materialized)
+        createCompatibilitySystem(materialized)
       )
     ).rejects.toMatchObject({ gate: "A", code: "CANDIDATE_INVALID" });
   });
@@ -257,14 +260,14 @@ describe("CoreMind 候选身份与原子制品装配", () => {
     const materialized = createMaterializedCandidate();
     corrupt(materialized);
     await expect(
-      runCoreMindCandidateAssembly(
+      runCoreMindCompatibility(
         {
           schemaVersion: 1,
           kind: "git-commit",
           repository: "https://github.com/Eclipseic1848/CoreMind.git",
           commit
         },
-        createArtifactSource(materialized)
+        createCompatibilitySystem(materialized)
       )
     ).rejects.toMatchObject({ gate: "A", code: "ARTIFACT_IDENTITY_INVALID" });
   });
@@ -273,14 +276,14 @@ describe("CoreMind 候选身份与原子制品装配", () => {
     const materialized = createMaterializedCandidate();
     materialized.packages = materialized.packages.filter((item) => item.name === "coremind-ai");
     await expect(
-      runCoreMindCandidateAssembly(
+      runCoreMindCompatibility(
         {
           schemaVersion: 1,
           kind: "git-commit",
           repository: "https://github.com/Eclipseic1848/CoreMind.git",
           commit
         },
-        createArtifactSource(materialized)
+        createCompatibilitySystem(materialized)
       )
     ).rejects.toMatchObject({ gate: "B", code: "ATOMIC_ASSEMBLY_INVALID" });
   });
@@ -292,14 +295,14 @@ describe("CoreMind 候选身份与原子制品装配", () => {
     entry.optionalDependencies = { "coremind-runtime": "0.3.0" };
 
     await expect(
-      runCoreMindCandidateAssembly(
+      runCoreMindCompatibility(
         {
           schemaVersion: 1,
           kind: "git-commit",
           repository: "https://github.com/Eclipseic1848/CoreMind.git",
           commit
         },
-        createArtifactSource(materialized)
+        createCompatibilitySystem(materialized)
       )
     ).rejects.toMatchObject({ gate: "B", code: "ATOMIC_ASSEMBLY_INVALID" });
   });

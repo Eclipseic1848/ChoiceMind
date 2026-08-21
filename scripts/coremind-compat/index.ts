@@ -1,6 +1,10 @@
-import { CoreMindArtifactMaterializationError } from "./internal-types.js";
+import {
+  CoreMindArtifactMaterializationError,
+  CoreMindCandidateVerificationError
+} from "./internal-types.js";
 import type {
-  CoreMindArtifactSource,
+  CoreMindCompatibilitySystem,
+  CoreMindCandidateVerification,
   CoreMindCompatibilityEnvironment,
   CoreMindMaterializationFailureReason,
   MaterializedCoreMindCandidate,
@@ -20,7 +24,7 @@ export const CORE_MIND_PACKAGE_NAMES = [
   "coremind-cli"
 ] as const;
 
-const CORE_MIND_RUNTIME_DEPENDENCIES = [
+export const CORE_MIND_RUNTIME_DEPENDENCIES = [
   "coremind-ai",
   "coremind-config",
   "coremind-protocol",
@@ -36,22 +40,27 @@ const CORE_MIND_AI_DEPENDENCIES = CORE_MIND_RUNTIME_DEPENDENCIES.filter(
 type CoreMindPackageName = (typeof CORE_MIND_PACKAGE_NAMES)[number];
 type GateState = "PASSED" | "FAILED" | "NOT_RUN";
 
+export type CoreMindVerificationGate = "C" | "D" | "E" | "F";
+
 export class CoreMindCompatibilityError extends Error {
-  readonly gate: "A" | "B";
+  readonly gate: "A" | "B" | "C" | "D" | "E" | "F";
   readonly code:
     | "CANDIDATE_INVALID"
     | "ENVIRONMENT_IDENTITY_FAILED"
     | "ARTIFACT_MATERIALIZATION_FAILED"
     | "ARTIFACT_IDENTITY_INVALID"
-    | "ATOMIC_ASSEMBLY_INVALID";
-  readonly stage: CoreMindMaterializationStage | undefined;
+    | "ATOMIC_ASSEMBLY_INVALID"
+    | "COMPATIBILITY_VERIFICATION_FAILED"
+    | "REPORT_WRITE_FAILED"
+    | "ARTIFACT_PROMOTION_FAILED";
+  readonly stage: CoreMindCompatibilityStage | undefined;
   readonly reason: CoreMindMaterializationFailureReason | undefined;
 
   constructor(
-    gate: "A" | "B",
+    gate: "A" | "B" | "C" | "D" | "E" | "F",
     code: CoreMindCompatibilityError["code"],
     message: string,
-    stage?: CoreMindMaterializationStage,
+    stage?: CoreMindCompatibilityStage,
     reason?: CoreMindMaterializationFailureReason
   ) {
     super(message);
@@ -94,32 +103,47 @@ export type CoreMindMaterializationStage =
   | "TARBALL_VALIDATE"
   | "CLEANUP";
 
-export interface CoreMindCandidateAssemblyReport {
+export type CoreMindCompatibilityStage =
+  | CoreMindMaterializationStage
+  | "CHOICEMIND_COPY"
+  | "CANDIDATE_INSTALL"
+  | "DEPENDENCY_RESOLUTION"
+  | "INTERFACE_TYPECHECK"
+  | "INTERFACE_BUILD"
+  | "CONTRACT_TEST"
+  | "VERTICAL_TEST"
+  | "ROOT_VERIFY"
+  | "RESOURCE_CLEANUP"
+  | "REPORT_WRITE"
+  | "ARTIFACT_PROMOTION";
+
+export interface CoreMindCompatibilitySuccessReport {
   schemaVersion: 1;
   candidate: CoreMindCandidate;
   environment: CoreMindCompatibilityEnvironment;
   gates: Record<"A" | "B" | "C" | "D" | "E" | "F" | "G" | "H", GateState>;
   artifacts: MaterializedCoreMindCandidate;
+  verification: CoreMindCandidateVerification;
 }
 
-export interface CoreMindCandidateAssemblyFailureReport {
+export interface CoreMindCompatibilityFailureReport {
   schemaVersion: 1;
   gates: Record<"A" | "B" | "C" | "D" | "E" | "F" | "G" | "H", GateState>;
   failure: {
     code: CoreMindCompatibilityError["code"];
-    stage?: CoreMindMaterializationStage;
+    stage?: CoreMindCompatibilityStage;
     reason?: CoreMindMaterializationFailureReason;
   };
 }
 
 export type CoreMindCompatibilityReport =
-  | CoreMindCandidateAssemblyReport
-  | CoreMindCandidateAssemblyFailureReport;
+  | CoreMindCompatibilitySuccessReport
+  | CoreMindCompatibilityFailureReport;
 
-export async function runCoreMindCandidateAssembly(
+export async function runCoreMindCompatibility(
   input: unknown,
-  artifactSource: CoreMindArtifactSource
-): Promise<CoreMindCandidateAssemblyReport> {
+  compatibilitySystem: CoreMindCompatibilitySystem
+): Promise<CoreMindCompatibilitySuccessReport> {
   let candidate: CoreMindCandidate;
   try {
     candidate = parseCandidate(input);
@@ -128,7 +152,7 @@ export async function runCoreMindCandidateAssembly(
   }
   let environment: CoreMindCompatibilityEnvironment;
   try {
-    environment = await artifactSource.describeEnvironment();
+    environment = await compatibilitySystem.describeEnvironment();
   } catch (error) {
     throw compatibilityError("A", "ENVIRONMENT_IDENTITY_FAILED", error);
   }
@@ -136,8 +160,8 @@ export async function runCoreMindCandidateAssembly(
   try {
     artifacts =
       candidate.kind === "git-commit"
-        ? await artifactSource.materializeGitCommit(candidate)
-        : await artifactSource.materializeNpmRelease(candidate);
+        ? await compatibilitySystem.materializeGitCommit(candidate)
+        : await compatibilitySystem.materializeNpmRelease(candidate);
   } catch (error) {
     throw compatibilityError(
       "A",
@@ -155,6 +179,18 @@ export async function runCoreMindCandidateAssembly(
   if (candidate.kind === "npm-release") {
     validateNpmReleaseArtifacts(candidate, artifacts);
   }
+  let verification: CoreMindCandidateVerification;
+  try {
+    verification = await compatibilitySystem.verifyCandidateCompatibility(artifacts, environment);
+  } catch (error) {
+    throw compatibilityError(
+      error instanceof CoreMindCandidateVerificationError ? error.gate : "C",
+      "COMPATIBILITY_VERIFICATION_FAILED",
+      error,
+      error instanceof CoreMindCandidateVerificationError ? error.stage : undefined,
+      error instanceof CoreMindCandidateVerificationError ? error.reason : undefined
+    );
+  }
 
   return {
     schemaVersion: 1,
@@ -163,14 +199,15 @@ export async function runCoreMindCandidateAssembly(
     gates: {
       A: "PASSED",
       B: "PASSED",
-      C: "NOT_RUN",
-      D: "NOT_RUN",
-      E: "NOT_RUN",
-      F: "NOT_RUN",
+      C: "PASSED",
+      D: "PASSED",
+      E: "PASSED",
+      F: "PASSED",
       G: "NOT_RUN",
       H: "NOT_RUN"
     },
-    artifacts
+    artifacts,
+    verification
   };
 }
 
@@ -356,10 +393,10 @@ function assemblyError(message: string): CoreMindCompatibilityError {
 }
 
 function compatibilityError(
-  gate: "A" | "B",
+  gate: "A" | "B" | "C" | "D" | "E" | "F",
   code: CoreMindCompatibilityError["code"],
   error: unknown,
-  stage?: CoreMindMaterializationStage,
+  stage?: CoreMindCompatibilityStage,
   reason?: CoreMindMaterializationFailureReason
 ): CoreMindCompatibilityError {
   if (error instanceof CoreMindCompatibilityError) return error;

@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -7,16 +7,22 @@ import { promisify } from "node:util";
 import { gunzip } from "node:zlib";
 
 const gunzipAsync = promisify(gunzip);
+const execFileAsync = promisify(execFile);
 
 import {
   CORE_MIND_PACKAGE_NAMES,
+  CORE_MIND_RUNTIME_DEPENDENCIES,
+  type CoreMindCompatibilityStage,
   type CoreMindMaterializationStage,
+  type CoreMindVerificationGate,
   type GitCommitCandidate,
   type NpmReleaseCandidate
 } from "./index.js";
 import {
   CoreMindArtifactMaterializationError,
-  type CoreMindArtifactSource,
+  CoreMindCandidateVerificationError,
+  type CoreMindCompatibilitySystem,
+  type CoreMindCandidateVerification,
   type CoreMindCompatibilityEnvironment,
   type CoreMindMaterializationFailureReason,
   type MaterializedCoreMindCandidate,
@@ -24,7 +30,7 @@ import {
 } from "./internal-types.js";
 
 export interface CommandRequest {
-  command: "git" | "node" | "npm";
+  command: "git" | "node" | "npm" | "pnpm";
   args: string[];
   cwd?: string;
   environment?: Record<string, string>;
@@ -33,7 +39,7 @@ export interface CommandRequest {
 
 export type CommandExecutor = (request: CommandRequest) => Promise<Buffer>;
 
-export interface SystemArtifactSourceOptions {
+export interface SystemCompatibilityOptions {
   artifactDirectory: string;
   choiceMindRoot: string;
   commandTimeoutMs?: number;
@@ -41,9 +47,9 @@ export interface SystemArtifactSourceOptions {
   signal?: AbortSignal;
 }
 
-export function createSystemArtifactSource(
-  options: SystemArtifactSourceOptions
-): CoreMindArtifactSource {
+export function createSystemCompatibilitySystem(
+  options: SystemCompatibilityOptions
+): CoreMindCompatibilitySystem {
   const baseExecutor = options.execute ?? executeSystemCommand;
   const execute: CommandExecutor = (request) =>
     executeWithControl(
@@ -63,8 +69,405 @@ export function createSystemArtifactSource(
       withNpmSandbox(options.artifactDirectory, execute, (isolatedExecute) =>
         materializeNpmRelease(candidate, packageDirectory, isolatedExecute)
       ),
-    describeEnvironment: async () => describeEnvironment(options.choiceMindRoot, execute)
+    describeEnvironment: async () => describeEnvironment(options.choiceMindRoot, execute),
+    verifyCandidateCompatibility: async (candidate, environment) =>
+      verifyCandidateCompatibility(options, candidate, environment, execute)
   };
+}
+
+async function verifyCandidateCompatibility(
+  options: SystemCompatibilityOptions,
+  candidate: MaterializedCoreMindCandidate,
+  environment: CoreMindCompatibilityEnvironment,
+  execute: CommandExecutor
+): Promise<CoreMindCandidateVerification> {
+  const temporaryRoot = await atVerificationStage("C", "CHOICEMIND_COPY", () =>
+    mkdtemp(path.join(os.tmpdir(), "choicemind-coremind-runner-"))
+  );
+  const choiceMindRoot = path.join(temporaryRoot, "workspace");
+  const sandboxDirectory = path.join(options.artifactDirectory, ".pnpm-runner-sandbox");
+  let failure: CoreMindCandidateVerificationError | undefined;
+  let verification: CoreMindCandidateVerification | undefined;
+
+  try {
+    await atVerificationStage("C", "CHOICEMIND_COPY", async () => {
+      await execute({
+        command: "git",
+        args: ["clone", "--no-hardlinks", "--no-checkout", options.choiceMindRoot, choiceMindRoot]
+      });
+      await execute({
+        command: "git",
+        args: ["-C", choiceMindRoot, "checkout", "--detach", environment.choiceMindCommit]
+      });
+      const actualCommit = (
+        await execute({
+          command: "git",
+          args: ["-C", choiceMindRoot, "rev-parse", "HEAD"]
+        })
+      )
+        .toString("utf8")
+        .trim()
+        .toLowerCase();
+      if (actualCommit !== environment.choiceMindCommit) {
+        throw new Error("临时 ChoiceMind 副本 commit 身份不一致");
+      }
+    });
+
+    const isolatedEnvironment = await atVerificationStage(
+      "C",
+      "CANDIDATE_INSTALL",
+      async () => {
+        const storeDirectory = path.join(sandboxDirectory, "store");
+        const cacheDirectory = path.join(sandboxDirectory, "cache");
+        const corepackDirectory = path.join(sandboxDirectory, "corepack");
+        const globalConfigPath = path.join(sandboxDirectory, "globalconfig");
+        const userConfigPath = path.join(sandboxDirectory, "userconfig");
+        await mkdir(storeDirectory, { recursive: true });
+        await mkdir(cacheDirectory, { recursive: true });
+        await mkdir(corepackDirectory, { recursive: true });
+        await writeFile(globalConfigPath, "", "utf8");
+        await writeFile(userConfigPath, "", "utf8");
+        await injectCandidateOverrides(choiceMindRoot, options.artifactDirectory, candidate);
+        const environment = {
+          COREPACK_HOME: corepackDirectory,
+          npm_config_cache: cacheDirectory,
+          npm_config_cache_dir: cacheDirectory,
+          npm_config_globalconfig: globalConfigPath,
+          npm_config_userconfig: userConfigPath
+        };
+        await execute({
+          command: "pnpm",
+          args: [
+            "install",
+            "--ignore-scripts",
+            "--no-frozen-lockfile",
+            "--store-dir",
+            storeDirectory
+          ],
+          cwd: choiceMindRoot,
+          environment
+        });
+        return environment;
+      }
+    );
+
+    const resolvedRuntimePackages = await atVerificationStage(
+      "C",
+      "DEPENDENCY_RESOLUTION",
+      async () => {
+        const probePath = path.join(
+          choiceMindRoot,
+          "apps",
+          "orchestrator",
+          ".coremind-compat-probe.mjs"
+        );
+        await writeFile(probePath, dependencyProbeSource(), "utf8");
+        const output = await execute({
+          command: "node",
+          args: [probePath],
+          cwd: path.dirname(probePath),
+          environment: isolatedEnvironment
+        });
+        return parseResolvedRuntimePackages(output, candidate.version);
+      }
+    );
+
+    await atVerificationStage("C", "INTERFACE_TYPECHECK", () =>
+      execute({
+        command: "pnpm",
+        args: ["--filter", "@choicemind/orchestrator", "typecheck"],
+        cwd: choiceMindRoot,
+        environment: isolatedEnvironment
+      })
+    );
+    await atVerificationStage("C", "INTERFACE_BUILD", () =>
+      execute({
+        command: "pnpm",
+        args: ["--filter", "@choicemind/orchestrator", "build"],
+        cwd: choiceMindRoot,
+        environment: isolatedEnvironment
+      })
+    );
+    const contractTestCount = await atVerificationStage("D", "CONTRACT_TEST", async () => {
+      const adapterTestCount = await executeVitestAndRequireTests(execute, {
+        command: "pnpm",
+        args: [
+          "--filter",
+          "@choicemind/orchestrator",
+          "exec",
+          "vitest",
+          "run",
+          "src/runtime/coremind-agent-runtime-adapter.test.ts",
+          "--testNamePattern",
+          "Gate D:",
+          "--reporter=json"
+        ],
+        cwd: choiceMindRoot,
+        environment: isolatedEnvironment
+      });
+      const contractTestCount = await executeVitestAndRequireTests(execute, {
+        command: "pnpm",
+        args: [
+          "--filter",
+          "@choicemind/orchestrator",
+          "exec",
+          "vitest",
+          "run",
+          "src/runtime/agent-runtime-factory.test.ts",
+          "src/decision-tasks/executor.test.ts",
+          "--reporter=json"
+        ],
+        cwd: choiceMindRoot,
+        environment: isolatedEnvironment
+      });
+      return adapterTestCount + contractTestCount;
+    });
+    const verticalTestCount = await atVerificationStage("E", "VERTICAL_TEST", () =>
+      executeVitestAndRequireTests(
+        execute,
+        {
+          command: "pnpm",
+          args: [
+            "--filter",
+            "@choicemind/orchestrator",
+            "exec",
+            "vitest",
+            "run",
+            "src/runtime/coremind-agent-runtime-adapter.test.ts",
+            "--testNamePattern",
+            "Gate E:",
+            "--reporter=json"
+          ],
+          cwd: choiceMindRoot,
+          environment: isolatedEnvironment
+        },
+        2
+      )
+    );
+    await atVerificationStage("F", "ROOT_VERIFY", async () => {
+      const nodeVersion = (
+        await execute({
+          command: "node",
+          args: ["--version"],
+          cwd: choiceMindRoot,
+          environment: isolatedEnvironment
+        })
+      )
+        .toString("utf8")
+        .trim();
+      if (nodeVersion !== "v22.22.1") {
+        throw new Error("Gate F 必须使用 Node 22.22.1");
+      }
+      const pnpmVersion = (
+        await execute({
+          command: "pnpm",
+          args: ["--version"],
+          cwd: choiceMindRoot,
+          environment: isolatedEnvironment
+        })
+      )
+        .toString("utf8")
+        .trim();
+      if (pnpmVersion !== "11.21.0") {
+        throw new Error("Gate F 必须使用 pnpm 11.21.0");
+      }
+      await execute({
+        command: "pnpm",
+        args: ["verify"],
+        cwd: choiceMindRoot,
+        environment: isolatedEnvironment
+      });
+    });
+    await atVerificationStage("F", "RESOURCE_CLEANUP", () =>
+      execute({
+        command: "node",
+        args: ["-e", portAvailabilityProbeSource()],
+        cwd: choiceMindRoot,
+        environment: isolatedEnvironment
+      })
+    );
+    verification = {
+      resolvedRuntimePackages,
+      testCounts: { D: contractTestCount, E: verticalTestCount }
+    };
+  } catch (error) {
+    failure =
+      error instanceof CoreMindCandidateVerificationError
+        ? error
+        : new CoreMindCandidateVerificationError("C", "CHOICEMIND_COPY", error);
+  }
+
+  const cleanupResults = await Promise.allSettled([
+    rm(temporaryRoot, {
+      force: true,
+      maxRetries: 5,
+      recursive: true,
+      retryDelay: 100
+    }),
+    rm(sandboxDirectory, {
+      force: true,
+      maxRetries: 5,
+      recursive: true,
+      retryDelay: 100
+    })
+  ]);
+  const cleanupFailure = cleanupResults.find(
+    (result): result is PromiseRejectedResult => result.status === "rejected"
+  );
+  if (cleanupFailure) {
+    throw new CoreMindCandidateVerificationError(
+      failure?.gate ?? "F",
+      "CLEANUP",
+      cleanupFailure.reason,
+      failure?.reason
+    );
+  }
+  if (failure) throw failure;
+  if (!verification) {
+    throw new CoreMindCandidateVerificationError("F", "ROOT_VERIFY");
+  }
+  return verification;
+}
+
+async function injectCandidateOverrides(
+  choiceMindRoot: string,
+  artifactDirectory: string,
+  candidate: MaterializedCoreMindCandidate
+): Promise<void> {
+  const manifestPath = path.join(choiceMindRoot, "package.json");
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+    pnpm?: { overrides?: Record<string, string> };
+  };
+  const overrides = { ...(manifest.pnpm?.overrides ?? {}) };
+  const packages = new Map(candidate.packages.map((artifact) => [artifact.name, artifact]));
+  for (const name of CORE_MIND_RUNTIME_DEPENDENCIES) {
+    const artifact = packages.get(name);
+    if (!artifact || path.basename(artifact.fileName) !== artifact.fileName) {
+      throw new Error(`候选运行依赖 ${name} 制品路径无效`);
+    }
+    const tarballPath = path.join(artifactDirectory, "packages", artifact.fileName);
+    const bytes = await readFile(tarballPath);
+    if (sha256(bytes) !== artifact.sha256) {
+      throw new Error(`${name} 候选制品 SHA-256 在安装前发生变化`);
+    }
+    assertPackedIntegrity(bytes, artifact.integrity, name);
+    overrides[name] = `file:${path.resolve(tarballPath).replaceAll("\\", "/")}`;
+  }
+  manifest.pnpm = { ...(manifest.pnpm ?? {}), overrides };
+  await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+}
+
+function dependencyProbeSource(): string {
+  return [
+    'import { existsSync, readFileSync } from "node:fs";',
+    'import path from "node:path";',
+    'import { fileURLToPath } from "node:url";',
+    `const names = ${JSON.stringify(CORE_MIND_RUNTIME_DEPENDENCIES)};`,
+    "const result = names.map((name) => {",
+    "  let directory = path.dirname(fileURLToPath(import.meta.resolve(name)));",
+    "  const root = path.parse(directory).root;",
+    "  while (directory !== root) {",
+    '    const manifestPath = path.join(directory, "package.json");',
+    "    if (existsSync(manifestPath)) {",
+    '      const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));',
+    "      if (manifest.name === name && typeof manifest.version === \"string\") {",
+    "        return { name, version: manifest.version };",
+    "      }",
+    "    }",
+    "    directory = path.dirname(directory);",
+    "  }",
+    '  throw new Error("无法解析 " + name + " 的 package.json");',
+    "});",
+    "process.stdout.write(JSON.stringify(result));"
+  ].join("\n");
+}
+
+function portAvailabilityProbeSource(): string {
+  return [
+    'const { createServer } = require("node:net");',
+    "const ports = [3000, 3100, 3200, 3300];",
+    "(async () => {",
+    "  for (const port of ports) {",
+    "    await new Promise((resolve, reject) => {",
+    "      const server = createServer();",
+    '      server.once("error", reject);',
+    '      server.listen(port, "127.0.0.1", () => server.close(resolve));',
+    "    });",
+    "  }",
+    "})().catch(() => { process.exitCode = 1; });"
+  ].join("\n");
+}
+
+function parseResolvedRuntimePackages(
+  output: Buffer,
+  expectedVersion: string
+): CoreMindCandidateVerification["resolvedRuntimePackages"] {
+  const value = JSON.parse(output.toString("utf8")) as unknown;
+  if (!Array.isArray(value)) throw new Error("候选运行依赖解析结果不是数组");
+  const resolved = new Map<string, string>();
+  for (const item of value) {
+    if (typeof item !== "object" || item === null || Array.isArray(item)) {
+      throw new Error("候选运行依赖解析项无效");
+    }
+    const { name, version } = item as { name?: unknown; version?: unknown };
+    if (typeof name !== "string" || typeof version !== "string" || resolved.has(name)) {
+      throw new Error("候选运行依赖解析项身份无效");
+    }
+    if (!(CORE_MIND_RUNTIME_DEPENDENCIES as readonly string[]).includes(name)) {
+      throw new Error(`候选环境解析到未知 CoreMind 运行包 ${name}`);
+    }
+    if (version !== expectedVersion) {
+      throw new Error(`${name}=${version} 未解析到候选版本 ${expectedVersion}`);
+    }
+    resolved.set(name, version);
+  }
+  for (const name of CORE_MIND_RUNTIME_DEPENDENCIES) {
+    if (!resolved.has(name)) throw new Error(`候选环境缺少运行依赖 ${name}`);
+  }
+  return CORE_MIND_RUNTIME_DEPENDENCIES.map((name) => ({
+    name,
+    version: resolved.get(name) ?? expectedVersion
+  }));
+}
+
+async function executeVitestAndRequireTests(
+  execute: CommandExecutor,
+  request: CommandRequest,
+  minimumPassedTests = 1
+): Promise<number> {
+  const output = await execute(request);
+  const value = JSON.parse(output.toString("utf8")) as {
+    numPassedTests?: unknown;
+    numFailedTests?: unknown;
+    success?: unknown;
+  };
+  if (
+    value.success !== true ||
+    !Number.isSafeInteger(value.numPassedTests) ||
+    (value.numPassedTests as number) < minimumPassedTests ||
+    value.numFailedTests !== 0
+  ) {
+    throw new Error("Vitest 未产生足够的通过测试证据");
+  }
+  return value.numPassedTests as number;
+}
+
+async function atVerificationStage<T>(
+  gate: CoreMindVerificationGate,
+  stage: CoreMindCompatibilityStage,
+  operation: () => Promise<T>
+): Promise<T> {
+  try {
+    return await operation();
+  } catch (error) {
+    if (error instanceof CoreMindCandidateVerificationError) throw error;
+    throw new CoreMindCandidateVerificationError(
+      gate,
+      stage,
+      error,
+      error instanceof CoreMindCommandExecutionError ? error.reason : undefined
+    );
+  }
 }
 
 async function withNpmSandbox<T>(
@@ -72,14 +475,16 @@ async function withNpmSandbox<T>(
   execute: CommandExecutor,
   operation: (isolatedExecute: CommandExecutor) => Promise<T>
 ): Promise<T> {
-  const { sandboxDirectory, cacheDirectory, userConfigPath } =
+  const { sandboxDirectory, cacheDirectory, globalConfigPath, userConfigPath } =
     await atMaterializationStage("NPM_SANDBOX", async () => {
       const sandboxDirectory = path.join(artifactDirectory, ".npm-sandbox");
       const cacheDirectory = path.join(sandboxDirectory, "cache");
+      const globalConfigPath = path.join(sandboxDirectory, "globalconfig");
       const userConfigPath = path.join(sandboxDirectory, "userconfig");
       await mkdir(cacheDirectory, { recursive: true });
+      await writeFile(globalConfigPath, "", "utf8");
       await writeFile(userConfigPath, "", "utf8");
-      return { sandboxDirectory, cacheDirectory, userConfigPath };
+      return { sandboxDirectory, cacheDirectory, globalConfigPath, userConfigPath };
     });
   const isolatedExecute: CommandExecutor = (request) =>
     execute(
@@ -89,6 +494,7 @@ async function withNpmSandbox<T>(
             environment: {
               ...request.environment,
               npm_config_cache: cacheDirectory,
+              npm_config_globalconfig: globalConfigPath,
               npm_config_userconfig: userConfigPath
             }
           }
@@ -577,6 +983,9 @@ export async function executeSystemCommand(request: CommandRequest): Promise<Buf
       if (settling) return;
       settling = true;
       request.signal?.removeEventListener("abort", abort);
+      if (!interrupted && !launchFailed) {
+        termination ??= terminateRemainingProcessTree(child.pid);
+      }
       void (async () => {
         try {
           await termination;
@@ -596,6 +1005,64 @@ export async function executeSystemCommand(request: CommandRequest): Promise<Buf
     child.stderr.resume();
     child.once("error", () => settle(null, true));
     child.once("close", (code) => settle(code, false));
+  });
+}
+
+async function terminateRemainingProcessTree(pid: number | undefined): Promise<void> {
+  if (pid === undefined) return;
+  if (process.platform !== "win32") {
+    await terminateProcessTree(pid);
+    return;
+  }
+  const descendants = await listWindowsDescendantPids(pid);
+  for (const descendantPid of descendants.reverse()) {
+    if (!(await runTaskkill(descendantPid)) && isProcessAlive(descendantPid)) {
+      throw new Error(`无法终止遗留子进程（PID ${descendantPid}）`);
+    }
+  }
+  if (!(await waitForExit(() => descendants.some(isProcessAlive), 2000))) {
+    throw new Error(`无法确认遗留子进程已退出（根 PID ${pid}）`);
+  }
+}
+
+async function listWindowsDescendantPids(rootPid: number): Promise<number[]> {
+  const script = [
+    "$ErrorActionPreference = 'Stop'",
+    `$rootPid = [uint32]${rootPid}`,
+    "$processes = @(Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId)",
+    "$pending = @($rootPid)",
+    "$descendants = @()",
+    "while ($pending.Count -gt 0) {",
+    "  $parents = @($pending)",
+    "  $pending = @()",
+    "  foreach ($item in $processes) {",
+    "    $processId = [uint32]$item.ProcessId",
+    "    if (($parents -contains [uint32]$item.ParentProcessId) -and ($descendants -notcontains $processId)) {",
+    "      $descendants += $processId",
+    "      $pending += $processId",
+    "    }",
+    "  }",
+    "}",
+    "[Console]::Out.Write(($descendants -join ','))"
+  ].join("; ");
+  const { stdout } = await execFileAsync(
+    "powershell.exe",
+    ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+    {
+      encoding: "utf8",
+      env: minimalEnvironment(),
+      timeout: 5000,
+      windowsHide: true
+    }
+  );
+  const output = stdout.trim();
+  if (output === "") return [];
+  return output.split(",").map((value) => {
+    const pid = Number(value);
+    if (!Number.isSafeInteger(pid) || pid <= 0) {
+      throw new Error("无法解析 Windows 子进程树");
+    }
+    return pid;
   });
 }
 
@@ -721,6 +1188,16 @@ function resolveCommandInvocation(request: CommandRequest): {
   if (request.command === "npm" && process.platform === "win32") {
     const npmCli = path.join(path.dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js");
     return { command: process.execPath, args: [npmCli, ...request.args] };
+  }
+  if (request.command === "pnpm") {
+    const pnpmCli = path.join(
+      path.dirname(process.execPath),
+      "node_modules",
+      "corepack",
+      "dist",
+      "pnpm.js"
+    );
+    return { command: process.execPath, args: [pnpmCli, ...request.args] };
   }
   return { command: request.command, args: request.args };
 }

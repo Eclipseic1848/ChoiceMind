@@ -1,5 +1,7 @@
 import type {
+  CoreMindCompatibilityStage,
   CoreMindMaterializationStage,
+  CoreMindVerificationGate,
   GitCommitCandidate,
   NpmReleaseCandidate
 } from "./index.js";
@@ -52,8 +54,41 @@ export interface CoreMindCompatibilityEnvironment {
   artifactPackageManager: string;
 }
 
-export interface CoreMindArtifactSource {
+export class CoreMindCandidateVerificationError extends Error {
+  readonly gate: CoreMindVerificationGate;
+  readonly stage: CoreMindCompatibilityStage;
+  readonly reason: CoreMindMaterializationFailureReason | undefined;
+
+  constructor(
+    gate: CoreMindVerificationGate,
+    stage: CoreMindCompatibilityStage,
+    cause?: unknown,
+    reason?: CoreMindMaterializationFailureReason
+  ) {
+    super(`CoreMind 候选兼容验证失败：Gate ${gate} / ${stage}`, { cause });
+    this.name = "CoreMindCandidateVerificationError";
+    this.gate = gate;
+    this.stage = stage;
+    this.reason = reason;
+  }
+}
+
+export interface CoreMindResolvedRuntimePackage {
+  name: string;
+  version: string;
+}
+
+export interface CoreMindCandidateVerification {
+  resolvedRuntimePackages: CoreMindResolvedRuntimePackage[];
+  testCounts: Record<"D" | "E", number>;
+}
+
+export interface CoreMindCompatibilitySystem {
   materializeGitCommit(candidate: GitCommitCandidate): Promise<MaterializedCoreMindCandidate>;
   materializeNpmRelease(candidate: NpmReleaseCandidate): Promise<MaterializedCoreMindCandidate>;
   describeEnvironment(): Promise<CoreMindCompatibilityEnvironment>;
+  verifyCandidateCompatibility(
+    candidate: MaterializedCoreMindCandidate,
+    environment: CoreMindCompatibilityEnvironment
+  ): Promise<CoreMindCandidateVerification>;
 }
