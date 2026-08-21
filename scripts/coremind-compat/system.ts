@@ -510,13 +510,13 @@ export async function executeSystemCommand(request: CommandRequest): Promise<Buf
   if (request.signal?.aborted) {
     throw commandInterruptionError(request.signal.reason);
   }
-  const command = resolveExecutable(request.command);
+  const invocation = resolveCommandInvocation(request);
   return new Promise((resolve, reject) => {
-    const child = spawn(command, request.args, {
+    const child = spawn(invocation.command, invocation.args, {
       cwd: request.cwd,
       env: { ...minimalEnvironment(), ...request.environment },
       detached: process.platform !== "win32",
-      shell: process.platform === "win32" && request.command === "npm",
+      shell: false,
       windowsHide: true
     });
     const stdout: Buffer[] = [];
@@ -660,10 +660,18 @@ function isProcessGroupAlive(pid: number): boolean {
   }
 }
 
-function resolveExecutable(command: CommandRequest["command"]): string {
-  if (command === "node") return process.execPath;
-  if (command === "npm" && process.platform === "win32") return "npm.cmd";
-  return command;
+function resolveCommandInvocation(request: CommandRequest): {
+  command: string;
+  args: string[];
+} {
+  if (request.command === "node") {
+    return { command: process.execPath, args: request.args };
+  }
+  if (request.command === "npm" && process.platform === "win32") {
+    const npmCli = path.join(path.dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js");
+    return { command: process.execPath, args: [npmCli, ...request.args] };
+  }
+  return { command: request.command, args: request.args };
 }
 
 function minimalEnvironment(): NodeJS.ProcessEnv {

@@ -49,6 +49,19 @@ test("真实命令取消后父子进程均已退出", async () => {
   await expect(waitUntilProcessesExit(pids)).resolves.toBeUndefined();
 });
 
+test.runIf(process.platform === "win32")("Windows npm 参数中的空格保持完整", async () => {
+  const root = await createTemporaryDirectory();
+  const prefix = path.join(root, "prefix with space");
+  await mkdir(prefix, { recursive: true });
+
+  const output = await executeSystemCommand({
+    command: "npm",
+    args: ["prefix", "--prefix", prefix]
+  });
+
+  expect(path.normalize(output.toString("utf8").trim())).toBe(path.normalize(prefix));
+});
+
 test("环境报告同时记录工作区 pnpm 声明与实际 npm 版本", async () => {
   const root = await createTemporaryDirectory();
   await writeFile(
