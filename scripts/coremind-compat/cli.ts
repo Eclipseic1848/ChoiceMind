@@ -76,7 +76,12 @@ export async function runCoreMindCompatCli(
         G: "NOT_RUN",
         H: "NOT_RUN"
       },
-      failure: { code: compatibilityError.code }
+      failure: {
+        code: compatibilityError.code,
+        ...(compatibilityError.stage === undefined
+          ? {}
+          : { stage: compatibilityError.stage })
+      }
     } satisfies CoreMindCompatibilityReport;
     await writeReportAtomically(reportPath, report);
     throw new CoreMindCompatCliFailure(reportPath);

@@ -10,14 +10,16 @@ const gunzipAsync = promisify(gunzip);
 
 import {
   CORE_MIND_PACKAGE_NAMES,
+  type CoreMindMaterializationStage,
   type GitCommitCandidate,
   type NpmReleaseCandidate
 } from "./index.js";
-import type {
-  CoreMindArtifactSource,
-  CoreMindCompatibilityEnvironment,
-  MaterializedCoreMindCandidate,
-  MaterializedCoreMindPackage
+import {
+  CoreMindArtifactMaterializationError,
+  type CoreMindArtifactSource,
+  type CoreMindCompatibilityEnvironment,
+  type MaterializedCoreMindCandidate,
+  type MaterializedCoreMindPackage
 } from "./internal-types.js";
 
 export interface CommandRequest {
@@ -69,11 +71,15 @@ async function withNpmSandbox<T>(
   execute: CommandExecutor,
   operation: (isolatedExecute: CommandExecutor) => Promise<T>
 ): Promise<T> {
-  const sandboxDirectory = path.join(artifactDirectory, ".npm-sandbox");
-  const cacheDirectory = path.join(sandboxDirectory, "cache");
-  const userConfigPath = path.join(sandboxDirectory, "userconfig");
-  await mkdir(cacheDirectory, { recursive: true });
-  await writeFile(userConfigPath, "", "utf8");
+  const { sandboxDirectory, cacheDirectory, userConfigPath } =
+    await atMaterializationStage("NPM_SANDBOX", async () => {
+      const sandboxDirectory = path.join(artifactDirectory, ".npm-sandbox");
+      const cacheDirectory = path.join(sandboxDirectory, "cache");
+      const userConfigPath = path.join(sandboxDirectory, "userconfig");
+      await mkdir(cacheDirectory, { recursive: true });
+      await writeFile(userConfigPath, "", "utf8");
+      return { sandboxDirectory, cacheDirectory, userConfigPath };
+    });
   const isolatedExecute: CommandExecutor = (request) =>
     execute(
       request.command === "npm"
@@ -90,12 +96,14 @@ async function withNpmSandbox<T>(
   try {
     return await operation(isolatedExecute);
   } finally {
-    await rm(sandboxDirectory, {
-      force: true,
-      maxRetries: 5,
-      recursive: true,
-      retryDelay: 100
-    });
+    await atMaterializationStage("CLEANUP", () =>
+      rm(sandboxDirectory, {
+        force: true,
+        maxRetries: 5,
+        recursive: true,
+        retryDelay: 100
+      })
+    );
   }
 }
 
@@ -104,54 +112,64 @@ async function materializeGitCommit(
   packageDirectory: string,
   execute: CommandExecutor
 ): Promise<MaterializedCoreMindCandidate> {
-  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "choicemind-coremind-candidate-"));
+  const temporaryRoot = await atMaterializationStage("GIT_FETCH", () =>
+    mkdtemp(path.join(os.tmpdir(), "choicemind-coremind-candidate-"))
+  );
   const sourceDirectory = path.join(temporaryRoot, "source");
   const candidateVersion = commitCandidateVersion(candidate.commit);
 
   try {
-    await execute({ command: "git", args: ["init", sourceDirectory] });
-    await execute({
-      command: "git",
-      args: ["-C", sourceDirectory, "remote", "add", "origin", candidate.repository]
-    });
-    await execute({
-      command: "git",
-      args: ["-C", sourceDirectory, "fetch", "--depth=1", "origin", candidate.commit]
-    });
-    await execute({
-      command: "git",
-      args: ["-C", sourceDirectory, "checkout", "--detach", "FETCH_HEAD"]
-    });
-    const actualCommit = (
+    const sourceArchive = await atMaterializationStage("GIT_FETCH", async () => {
+      await execute({ command: "git", args: ["init", sourceDirectory] });
       await execute({
         command: "git",
-        args: ["-C", sourceDirectory, "rev-parse", "HEAD"]
-      })
-    )
-      .toString("utf8")
-      .trim()
-      .toLowerCase();
-    if (actualCommit !== candidate.commit) {
-      throw new Error("Git checkout 身份与候选 commit 不一致");
-    }
-    const sourceArchive = await execute({
-      command: "git",
-      args: ["-C", sourceDirectory, "archive", "--format=tar", "HEAD"]
+        args: ["-C", sourceDirectory, "remote", "add", "origin", candidate.repository]
+      });
+      await execute({
+        command: "git",
+        args: ["-C", sourceDirectory, "fetch", "--depth=1", "origin", candidate.commit]
+      });
+      await execute({
+        command: "git",
+        args: ["-C", sourceDirectory, "checkout", "--detach", "FETCH_HEAD"]
+      });
+      const actualCommit = (
+        await execute({
+          command: "git",
+          args: ["-C", sourceDirectory, "rev-parse", "HEAD"]
+        })
+      )
+        .toString("utf8")
+        .trim()
+        .toLowerCase();
+      if (actualCommit !== candidate.commit) {
+        throw new Error("Git checkout 身份与候选 commit 不一致");
+      }
+      return execute({
+        command: "git",
+        args: ["-C", sourceDirectory, "archive", "--format=tar", "HEAD"]
+      });
     });
     const sourceSha256 = sha256(sourceArchive);
 
-    await execute({
-      command: "npm",
-      args: ["ci", "--ignore-scripts", "--no-audit", "--no-fund"],
-      cwd: sourceDirectory
-    });
-    await execute({
-      command: "node",
-      args: ["scripts/release-version.mjs", candidateVersion, "--no-lock"],
-      cwd: sourceDirectory
-    });
-    await execute({ command: "npm", args: ["run", "build"], cwd: sourceDirectory });
-    await mkdir(packageDirectory, { recursive: true });
+    await atMaterializationStage("NPM_CI", () =>
+      execute({
+        command: "npm",
+        args: ["ci", "--ignore-scripts", "--no-audit", "--no-fund"],
+        cwd: sourceDirectory
+      })
+    );
+    await atMaterializationStage("VERSION_SYNC", () =>
+      execute({
+        command: "node",
+        args: ["scripts/release-version.mjs", candidateVersion, "--no-lock"],
+        cwd: sourceDirectory
+      })
+    );
+    await atMaterializationStage("BUILD", () =>
+      execute({ command: "npm", args: ["run", "build"], cwd: sourceDirectory })
+    );
+    await atMaterializationStage("PACK", () => mkdir(packageDirectory, { recursive: true }));
     const packages = await packGitPackages(
       sourceDirectory,
       packageDirectory,
@@ -164,12 +182,14 @@ async function materializeGitCommit(
       packages
     };
   } finally {
-    await rm(temporaryRoot, {
-      force: true,
-      maxRetries: 5,
-      recursive: true,
-      retryDelay: 100
-    });
+    await atMaterializationStage("CLEANUP", () =>
+      rm(temporaryRoot, {
+        force: true,
+        maxRetries: 5,
+        recursive: true,
+        retryDelay: 100
+      })
+    );
   }
 }
 
@@ -181,32 +201,42 @@ async function packGitPackages(
 ): Promise<MaterializedCoreMindPackage[]> {
   const packages: MaterializedCoreMindPackage[] = [];
   for (const name of CORE_MIND_PACKAGE_NAMES) {
-    const manifest = await readPackageManifest(sourceDirectory, name);
-    if (manifest.version !== expectedVersion) {
-      throw new Error(`${name} 未同步到临时候选版本`);
-    }
-    const packed = parsePackedPackage(
-      await execute({
-        command: "npm",
-        args: [
-          "pack",
-          "--workspace",
-          name,
-          "--pack-destination",
-          packageDirectory,
-          "--json"
-        ],
-        cwd: sourceDirectory
-      }),
-      name
+    await atMaterializationStage("VERSION_SYNC", async () => {
+      const value = await readPackageManifest(sourceDirectory, name);
+      if (value.version !== expectedVersion) {
+        throw new Error(`${name} 未同步到临时候选版本`);
+      }
+    });
+    const packed = await atMaterializationStage("PACK", async () =>
+      parsePackedPackage(
+        await execute({
+          command: "npm",
+          args: [
+            "pack",
+            "--workspace",
+            name,
+            "--pack-destination",
+            packageDirectory,
+            "--json"
+          ],
+          cwd: sourceDirectory
+        }),
+        name
+      )
     );
     const tarballPath = path.join(packageDirectory, packed.filename);
-    const packedManifest = await readPackedPackageManifest(tarballPath, name);
-    if (packedManifest.version !== expectedVersion) {
-      throw new Error(`${name} tgz 版本与候选不一致`);
-    }
-    const tarball = await readFile(tarballPath);
-    assertPackedIntegrity(tarball, packed.integrity, name);
+    const { packedManifest, tarball } = await atMaterializationStage(
+      "TARBALL_VALIDATE",
+      async () => {
+        const manifest = await readPackedPackageManifest(tarballPath, name);
+        if (manifest.version !== expectedVersion) {
+          throw new Error(`${name} tgz 版本与候选不一致`);
+        }
+        const bytes = await readFile(tarballPath);
+        assertPackedIntegrity(bytes, packed.integrity, name);
+        return { packedManifest: manifest, tarball: bytes };
+      }
+    );
     packages.push({
       name,
       version: packedManifest.version,
@@ -224,46 +254,57 @@ async function materializeNpmRelease(
   packageDirectory: string,
   execute: CommandExecutor
 ): Promise<MaterializedCoreMindCandidate> {
-  await mkdir(packageDirectory, { recursive: true });
+  await atMaterializationStage("PACK", () => mkdir(packageDirectory, { recursive: true }));
   const packages: MaterializedCoreMindPackage[] = [];
   for (const name of CORE_MIND_PACKAGE_NAMES) {
-    const metadata = parseNpmMetadata(
-      await execute({
-        command: "npm",
-        args: ["view", `${name}@${candidate.version}`, "--json"]
-      }),
-      name
+    const metadata = await atMaterializationStage("NPM_VIEW", async () => {
+      const value = parseNpmMetadata(
+        await execute({
+          command: "npm",
+          args: ["view", `${name}@${candidate.version}`, "--json"]
+        }),
+        name
+      );
+      if (value.version !== candidate.version) {
+        throw new Error(`${name} registry 版本与候选不一致`);
+      }
+      if (value.integrity !== candidate.packages[name].integrity) {
+        throw new Error(`${name} registry integrity 与候选描述不一致`);
+      }
+      return value;
+    });
+    const packed = await atMaterializationStage("PACK", async () =>
+      parsePackedPackage(
+        await execute({
+          command: "npm",
+          args: [
+            "pack",
+            `${name}@${candidate.version}`,
+            "--pack-destination",
+            packageDirectory,
+            "--json",
+            "--ignore-scripts"
+          ]
+        }),
+        name
+      )
     );
-    if (metadata.version !== candidate.version) {
-      throw new Error(`${name} registry 版本与候选不一致`);
-    }
-    if (metadata.integrity !== candidate.packages[name].integrity) {
-      throw new Error(`${name} registry integrity 与候选描述不一致`);
-    }
-    const packed = parsePackedPackage(
-      await execute({
-        command: "npm",
-        args: [
-          "pack",
-          `${name}@${candidate.version}`,
-          "--pack-destination",
-          packageDirectory,
-          "--json",
-          "--ignore-scripts"
-        ]
-      }),
-      name
-    );
-    if (packed.integrity !== metadata.integrity) {
-      throw new Error(`${name} 下载制品 integrity 与 registry 元数据不一致`);
-    }
     const tarballPath = path.join(packageDirectory, packed.filename);
-    const packedManifest = await readPackedPackageManifest(tarballPath, name);
-    if (packedManifest.version !== candidate.version) {
-      throw new Error(`${name} tgz 版本与候选不一致`);
-    }
-    const tarball = await readFile(tarballPath);
-    assertPackedIntegrity(tarball, packed.integrity, name);
+    const { packedManifest, tarball } = await atMaterializationStage(
+      "TARBALL_VALIDATE",
+      async () => {
+        if (packed.integrity !== metadata.integrity) {
+          throw new Error(`${name} 下载制品 integrity 与 registry 元数据不一致`);
+        }
+        const manifest = await readPackedPackageManifest(tarballPath, name);
+        if (manifest.version !== candidate.version) {
+          throw new Error(`${name} tgz 版本与候选不一致`);
+        }
+        const bytes = await readFile(tarballPath);
+        assertPackedIntegrity(bytes, packed.integrity, name);
+        return { packedManifest: manifest, tarball: bytes };
+      }
+    );
     packages.push({
       name,
       version: packedManifest.version,
@@ -451,6 +492,18 @@ function commitCandidateVersion(commit: string): string {
 
 function sha256(value: Buffer): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+async function atMaterializationStage<T>(
+  stage: CoreMindMaterializationStage,
+  operation: () => Promise<T>
+): Promise<T> {
+  try {
+    return await operation();
+  } catch (error) {
+    if (error instanceof CoreMindArtifactMaterializationError) throw error;
+    throw new CoreMindArtifactMaterializationError(stage, error);
+  }
 }
 
 export async function executeSystemCommand(request: CommandRequest): Promise<Buffer> {

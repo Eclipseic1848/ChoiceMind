@@ -77,6 +77,71 @@ test("环境报告同时记录工作区 pnpm 声明与实际 npm 版本", async 
 });
 
 describe("CoreMind Git 制品边界", () => {
+  test.each([
+    ["GIT_FETCH", (request: CommandRequest) => request.command === "git" && request.args.includes("fetch")],
+    ["NPM_CI", (request: CommandRequest) => request.command === "npm" && request.args[0] === "ci"],
+    [
+      "VERSION_SYNC",
+      (request: CommandRequest) =>
+        request.command === "node" && request.args[0] === "scripts/release-version.mjs"
+    ],
+    [
+      "BUILD",
+      (request: CommandRequest) => request.command === "npm" && request.args[0] === "run"
+    ],
+    [
+      "PACK",
+      (request: CommandRequest) => request.command === "npm" && request.args[0] === "pack"
+    ]
+  ] as const)("外部命令失败报告安全阶段 %s", async (stage, shouldFail) => {
+    const root = await createTemporaryDirectory();
+    const executor = createGitCandidateExecutor();
+    const source = createSystemArtifactSource({
+      artifactDirectory: path.join(root, "artifacts"),
+      choiceMindRoot: root,
+      execute: async (request) => {
+        if (shouldFail(request)) throw new Error("不得进入安全报告的原始失败");
+        return executor.execute(request);
+      }
+    });
+
+    await expect(
+      source.materializeGitCommit({
+        schemaVersion: 1,
+        kind: "git-commit",
+        repository: "https://github.com/Eclipseic1848/CoreMind.git",
+        commit
+      })
+    ).rejects.toMatchObject({ stage });
+  });
+
+  test("版本同步命令成功但版本未更新时报告 VERSION_SYNC", async () => {
+    const root = await createTemporaryDirectory();
+    const executor = createGitCandidateExecutor();
+    const source = createSystemArtifactSource({
+      artifactDirectory: path.join(root, "artifacts"),
+      choiceMindRoot: root,
+      execute: async (request) => {
+        if (
+          request.command === "node" &&
+          request.args[0] === "scripts/release-version.mjs"
+        ) {
+          return Buffer.alloc(0);
+        }
+        return executor.execute(request);
+      }
+    });
+
+    await expect(
+      source.materializeGitCommit({
+        schemaVersion: 1,
+        kind: "git-commit",
+        repository: "https://github.com/Eclipseic1848/CoreMind.git",
+        commit
+      })
+    ).rejects.toMatchObject({ stage: "VERSION_SYNC" });
+  });
+
   test("精确 checkout 后构建并保留同源八包，临时源码被清理", async () => {
     const root = await createTemporaryDirectory();
     const executor = createGitCandidateExecutor();
@@ -134,7 +199,7 @@ describe("CoreMind Git 制品边界", () => {
         repository: "https://github.com/Eclipseic1848/CoreMind.git",
         commit
       })
-    ).rejects.toThrow("合成构建失败");
+    ).rejects.toMatchObject({ stage: "BUILD" });
     await expect(access(executor.sourceDirectory)).rejects.toThrow();
   });
 
@@ -158,7 +223,7 @@ describe("CoreMind Git 制品边界", () => {
     await executor.started;
     controller.abort();
 
-    await expect(running).rejects.toThrow("已取消");
+    await expect(running).rejects.toMatchObject({ stage: "GIT_FETCH" });
     await expect(access(executor.sourceDirectory)).rejects.toThrow();
   });
 
@@ -179,7 +244,7 @@ describe("CoreMind Git 制品边界", () => {
         repository: "https://github.com/Eclipseic1848/CoreMind.git",
         commit
       })
-    ).rejects.toThrow("超时");
+    ).rejects.toMatchObject({ stage: "GIT_FETCH" });
     await expect(access(executor.sourceDirectory)).rejects.toThrow();
   });
 });

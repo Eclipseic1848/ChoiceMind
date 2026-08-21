@@ -1,3 +1,4 @@
+import { CoreMindArtifactMaterializationError } from "./internal-types.js";
 import type {
   CoreMindArtifactSource,
   CoreMindCompatibilityEnvironment,
@@ -42,16 +43,19 @@ export class CoreMindCompatibilityError extends Error {
     | "ARTIFACT_MATERIALIZATION_FAILED"
     | "ARTIFACT_IDENTITY_INVALID"
     | "ATOMIC_ASSEMBLY_INVALID";
+  readonly stage: CoreMindMaterializationStage | undefined;
 
   constructor(
     gate: "A" | "B",
     code: CoreMindCompatibilityError["code"],
-    message: string
+    message: string,
+    stage?: CoreMindMaterializationStage
   ) {
     super(message);
     this.name = "CoreMindCompatibilityError";
     this.gate = gate;
     this.code = code;
+    this.stage = stage;
   }
 }
 
@@ -75,6 +79,17 @@ export interface NpmReleaseCandidate {
 
 export type CoreMindCandidate = GitCommitCandidate | NpmReleaseCandidate;
 
+export type CoreMindMaterializationStage =
+  | "NPM_SANDBOX"
+  | "GIT_FETCH"
+  | "NPM_CI"
+  | "VERSION_SYNC"
+  | "BUILD"
+  | "NPM_VIEW"
+  | "PACK"
+  | "TARBALL_VALIDATE"
+  | "CLEANUP";
+
 export interface CoreMindCandidateAssemblyReport {
   schemaVersion: 1;
   candidate: CoreMindCandidate;
@@ -86,7 +101,10 @@ export interface CoreMindCandidateAssemblyReport {
 export interface CoreMindCandidateAssemblyFailureReport {
   schemaVersion: 1;
   gates: Record<"A" | "B" | "C" | "D" | "E" | "F" | "G" | "H", GateState>;
-  failure: { code: CoreMindCompatibilityError["code"] };
+  failure: {
+    code: CoreMindCompatibilityError["code"];
+    stage?: CoreMindMaterializationStage;
+  };
 }
 
 export type CoreMindCompatibilityReport =
@@ -116,7 +134,12 @@ export async function runCoreMindCandidateAssembly(
         ? await artifactSource.materializeGitCommit(candidate)
         : await artifactSource.materializeNpmRelease(candidate);
   } catch (error) {
-    throw compatibilityError("A", "ARTIFACT_MATERIALIZATION_FAILED", error);
+    throw compatibilityError(
+      "A",
+      "ARTIFACT_MATERIALIZATION_FAILED",
+      error,
+      error instanceof CoreMindArtifactMaterializationError ? error.stage : undefined
+    );
   }
 
   validateMaterializedCandidate(
@@ -323,12 +346,14 @@ function assemblyError(message: string): CoreMindCompatibilityError {
 function compatibilityError(
   gate: "A" | "B",
   code: CoreMindCompatibilityError["code"],
-  error: unknown
+  error: unknown,
+  stage?: CoreMindMaterializationStage
 ): CoreMindCompatibilityError {
   if (error instanceof CoreMindCompatibilityError) return error;
   return new CoreMindCompatibilityError(
     gate,
     code,
-    error instanceof Error ? error.message : "CoreMind 候选验证失败"
+    error instanceof Error ? error.message : "CoreMind 候选验证失败",
+    stage
   );
 }

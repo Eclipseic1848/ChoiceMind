@@ -1,4 +1,18 @@
-import type { GitCommitCandidate, NpmReleaseCandidate } from "./index.js";
+import type {
+  CoreMindMaterializationStage,
+  GitCommitCandidate,
+  NpmReleaseCandidate
+} from "./index.js";
+
+export class CoreMindArtifactMaterializationError extends Error {
+  readonly stage: CoreMindMaterializationStage;
+
+  constructor(stage: CoreMindMaterializationStage, cause?: unknown) {
+    super(`CoreMind 制品物化失败：${stage}`, { cause });
+    this.name = "CoreMindArtifactMaterializationError";
+    this.stage = stage;
+  }
+}
 
 export interface MaterializedCoreMindPackage {
   name: string;

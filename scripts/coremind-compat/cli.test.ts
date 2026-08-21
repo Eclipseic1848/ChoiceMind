@@ -5,6 +5,7 @@ import path from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 
 import { CoreMindCompatCliFailure, runCoreMindCompatCli } from "./cli.js";
+import { CoreMindArtifactMaterializationError } from "./internal-types.js";
 import { createArtifactSource, createMaterializedCandidate } from "./test-fixtures.js";
 
 const temporaryPaths: string[] = [];
@@ -103,6 +104,45 @@ describe("coremind:compat CLI", () => {
     expect(await readdir(path.join(root, "output"))).toEqual([
       path.basename(path.dirname(failure.reportPath))
     ]);
+  });
+
+  test("制品获取失败只报告安全阶段而不保存原始错误", async () => {
+    const root = await createTemporaryDirectory();
+    const candidatePath = path.join(root, "candidate.json");
+    await writeFile(
+      candidatePath,
+      `${JSON.stringify({
+        schemaVersion: 1,
+        kind: "git-commit",
+        repository: "https://github.com/Eclipseic1848/CoreMind.git",
+        commit: "57e5765471cf6fe7f7da14d9ed4882e0c53ec322"
+      })}\n`,
+      "utf8"
+    );
+    const source = createArtifactSource();
+    source.materializeGitCommit = async () => {
+      throw new CoreMindArtifactMaterializationError("NPM_CI");
+    };
+
+    let failure: CoreMindCompatCliFailure | undefined;
+    try {
+      await runCoreMindCompatCli(["--candidate", candidatePath], {
+        createArtifactSource: () => source,
+        outputRoot: path.join(root, "output")
+      });
+    } catch (error) {
+      if (error instanceof CoreMindCompatCliFailure) failure = error;
+      else throw error;
+    }
+
+    expect(failure).toBeDefined();
+    if (!failure) return;
+    const reportText = await readFile(failure.reportPath, "utf8");
+    expect(JSON.parse(reportText)).toMatchObject({
+      gates: { A: "FAILED", B: "NOT_RUN" },
+      failure: { code: "ARTIFACT_MATERIALIZATION_FAILED", stage: "NPM_CI" }
+    });
+    expect(reportText).not.toContain("CoreMind 制品物化失败");
   });
 });
 
