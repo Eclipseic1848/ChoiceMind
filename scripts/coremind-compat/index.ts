@@ -2,6 +2,7 @@ import { CoreMindArtifactMaterializationError } from "./internal-types.js";
 import type {
   CoreMindArtifactSource,
   CoreMindCompatibilityEnvironment,
+  CoreMindMaterializationFailureReason,
   MaterializedCoreMindCandidate,
   MaterializedCoreMindPackage
 } from "./internal-types.js";
@@ -44,18 +45,21 @@ export class CoreMindCompatibilityError extends Error {
     | "ARTIFACT_IDENTITY_INVALID"
     | "ATOMIC_ASSEMBLY_INVALID";
   readonly stage: CoreMindMaterializationStage | undefined;
+  readonly reason: CoreMindMaterializationFailureReason | undefined;
 
   constructor(
     gate: "A" | "B",
     code: CoreMindCompatibilityError["code"],
     message: string,
-    stage?: CoreMindMaterializationStage
+    stage?: CoreMindMaterializationStage,
+    reason?: CoreMindMaterializationFailureReason
   ) {
     super(message);
     this.name = "CoreMindCompatibilityError";
     this.gate = gate;
     this.code = code;
     this.stage = stage;
+    this.reason = reason;
   }
 }
 
@@ -104,6 +108,7 @@ export interface CoreMindCandidateAssemblyFailureReport {
   failure: {
     code: CoreMindCompatibilityError["code"];
     stage?: CoreMindMaterializationStage;
+    reason?: CoreMindMaterializationFailureReason;
   };
 }
 
@@ -138,7 +143,8 @@ export async function runCoreMindCandidateAssembly(
       "A",
       "ARTIFACT_MATERIALIZATION_FAILED",
       error,
-      error instanceof CoreMindArtifactMaterializationError ? error.stage : undefined
+      error instanceof CoreMindArtifactMaterializationError ? error.stage : undefined,
+      error instanceof CoreMindArtifactMaterializationError ? error.reason : undefined
     );
   }
 
@@ -353,13 +359,15 @@ function compatibilityError(
   gate: "A" | "B",
   code: CoreMindCompatibilityError["code"],
   error: unknown,
-  stage?: CoreMindMaterializationStage
+  stage?: CoreMindMaterializationStage,
+  reason?: CoreMindMaterializationFailureReason
 ): CoreMindCompatibilityError {
   if (error instanceof CoreMindCompatibilityError) return error;
   return new CoreMindCompatibilityError(
     gate,
     code,
     error instanceof Error ? error.message : "CoreMind 候选验证失败",
-    stage
+    stage,
+    reason
   );
 }

@@ -18,6 +18,7 @@ import {
   CoreMindArtifactMaterializationError,
   type CoreMindArtifactSource,
   type CoreMindCompatibilityEnvironment,
+  type CoreMindMaterializationFailureReason,
   type MaterializedCoreMindCandidate,
   type MaterializedCoreMindPackage
 } from "./internal-types.js";
@@ -524,7 +525,29 @@ async function atMaterializationStage<T>(
     return await operation();
   } catch (error) {
     if (error instanceof CoreMindArtifactMaterializationError) throw error;
-    throw new CoreMindArtifactMaterializationError(stage, error);
+    throw new CoreMindArtifactMaterializationError(
+      stage,
+      error,
+      error instanceof CoreMindCommandExecutionError ? error.reason : undefined
+    );
+  }
+}
+
+class CoreMindCommandExecutionError extends Error {
+  readonly reason: CoreMindMaterializationFailureReason;
+
+  constructor(reason: CoreMindMaterializationFailureReason, cause?: unknown) {
+    super(
+      {
+        TIMEOUT: "外部命令超时",
+        CANCELLED: "外部命令已取消",
+        COMMAND_FAILED: "外部命令执行失败",
+        LAUNCH_FAILED: "外部命令无法启动"
+      }[reason],
+      { cause }
+    );
+    this.name = "CoreMindCommandExecutionError";
+    this.reason = reason;
   }
 }
 
@@ -562,9 +585,9 @@ export async function executeSystemCommand(request: CommandRequest): Promise<Buf
           return;
         }
         if (interrupted) reject(commandInterruptionError(request.signal?.reason));
-        else if (launchFailed) reject(new Error(`${request.command} 无法启动`));
+        else if (launchFailed) reject(new CoreMindCommandExecutionError("LAUNCH_FAILED"));
         else if (code === 0) resolve(Buffer.concat(stdout));
-        else reject(new Error(`${request.command} 执行失败（退出码 ${code ?? "unknown"}）`));
+        else reject(new CoreMindCommandExecutionError("COMMAND_FAILED"));
       })();
     };
     request.signal?.addEventListener("abort", abort, { once: true });
@@ -595,14 +618,20 @@ async function executeWithControl(
       throw commandInterruptionError(controller.signal.reason);
     }
     return await execute({ ...request, signal: controller.signal });
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw commandInterruptionError(controller.signal.reason);
+    }
+    if (error instanceof CoreMindCommandExecutionError) throw error;
+    throw new CoreMindCommandExecutionError("COMMAND_FAILED", error);
   } finally {
     clearTimeout(timeout);
     outerSignal?.removeEventListener("abort", cancel);
   }
 }
 
-function commandInterruptionError(reason: unknown): Error {
-  return new Error(reason === "timeout" ? "外部命令超时" : "外部命令已取消");
+function commandInterruptionError(reason: unknown): CoreMindCommandExecutionError {
+  return new CoreMindCommandExecutionError(reason === "timeout" ? "TIMEOUT" : "CANCELLED");
 }
 
 async function terminateProcessTree(pid: number | undefined): Promise<void> {

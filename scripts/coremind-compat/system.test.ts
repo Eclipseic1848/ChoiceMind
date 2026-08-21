@@ -125,7 +125,41 @@ describe("CoreMind Git 制品边界", () => {
         repository: "https://github.com/Eclipseic1848/CoreMind.git",
         commit
       })
-    ).rejects.toMatchObject({ stage });
+    ).rejects.toMatchObject({ stage, reason: "COMMAND_FAILED" });
+  });
+
+  test("npm ci 超时报告安全原因并清理临时目录", async () => {
+    const root = await createTemporaryDirectory();
+    const artifactDirectory = path.join(root, "artifacts");
+    const executor = createGitCandidateExecutor();
+    const source = createSystemArtifactSource({
+      artifactDirectory,
+      choiceMindRoot: root,
+      commandTimeoutMs: 10,
+      execute: async (request) => {
+        if (request.command === "npm" && request.args[0] === "ci") {
+          return new Promise<Buffer>((_resolve, reject) => {
+            request.signal?.addEventListener(
+              "abort",
+              () => reject(new Error("不得进入安全报告的原始超时错误")),
+              { once: true }
+            );
+          });
+        }
+        return executor.execute(request);
+      }
+    });
+
+    await expect(
+      source.materializeGitCommit({
+        schemaVersion: 1,
+        kind: "git-commit",
+        repository: "https://github.com/Eclipseic1848/CoreMind.git",
+        commit
+      })
+    ).rejects.toMatchObject({ stage: "NPM_CI", reason: "TIMEOUT" });
+    await expect(access(executor.sourceDirectory)).rejects.toThrow();
+    await expect(access(path.join(artifactDirectory, ".npm-sandbox"))).rejects.toThrow();
   });
 
   test("版本同步命令成功但版本未更新时报告 VERSION_SYNC", async () => {

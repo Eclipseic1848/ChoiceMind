@@ -121,7 +121,11 @@ describe("coremind:compat CLI", () => {
     );
     const source = createArtifactSource();
     source.materializeGitCommit = async () => {
-      throw new CoreMindArtifactMaterializationError("NPM_CI");
+      throw new CoreMindArtifactMaterializationError(
+        "NPM_CI",
+        new Error("不得进入安全报告的原始超时错误"),
+        "TIMEOUT"
+      );
     };
 
     let failure: CoreMindCompatCliFailure | undefined;
@@ -138,11 +142,17 @@ describe("coremind:compat CLI", () => {
     expect(failure).toBeDefined();
     if (!failure) return;
     const reportText = await readFile(failure.reportPath, "utf8");
-    expect(JSON.parse(reportText)).toMatchObject({
-      gates: { A: "FAILED", B: "NOT_RUN" },
-      failure: { code: "ARTIFACT_MATERIALIZATION_FAILED", stage: "NPM_CI" }
+    const report = JSON.parse(reportText) as {
+      gates: Record<string, string>;
+      failure: Record<string, string>;
+    };
+    expect(report.gates).toMatchObject({ A: "FAILED", B: "NOT_RUN" });
+    expect(report.failure).toEqual({
+      code: "ARTIFACT_MATERIALIZATION_FAILED",
+      stage: "NPM_CI",
+      reason: "TIMEOUT"
     });
-    expect(reportText).not.toContain("CoreMind 制品物化失败");
+    expect(reportText).not.toContain("不得进入安全报告的原始超时错误");
   });
 });
 

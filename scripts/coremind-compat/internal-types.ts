@@ -4,13 +4,25 @@ import type {
   NpmReleaseCandidate
 } from "./index.js";
 
+export type CoreMindMaterializationFailureReason =
+  | "TIMEOUT"
+  | "CANCELLED"
+  | "COMMAND_FAILED"
+  | "LAUNCH_FAILED";
+
 export class CoreMindArtifactMaterializationError extends Error {
   readonly stage: CoreMindMaterializationStage;
+  readonly reason: CoreMindMaterializationFailureReason | undefined;
 
-  constructor(stage: CoreMindMaterializationStage, cause?: unknown) {
+  constructor(
+    stage: CoreMindMaterializationStage,
+    cause?: unknown,
+    reason?: CoreMindMaterializationFailureReason
+  ) {
     super(`CoreMind 制品物化失败：${stage}`, { cause });
     this.name = "CoreMindArtifactMaterializationError";
     this.stage = stage;
+    this.reason = reason;
   }
 }
 

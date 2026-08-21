@@ -80,7 +80,10 @@ export async function runCoreMindCompatCli(
         code: compatibilityError.code,
         ...(compatibilityError.stage === undefined
           ? {}
-          : { stage: compatibilityError.stage })
+          : { stage: compatibilityError.stage }),
+        ...(compatibilityError.reason === undefined
+          ? {}
+          : { reason: compatibilityError.reason })
       }
     } satisfies CoreMindCompatibilityReport;
     await writeReportAtomically(reportPath, report);
