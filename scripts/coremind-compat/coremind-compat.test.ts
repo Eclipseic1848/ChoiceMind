@@ -284,4 +284,23 @@ describe("CoreMind 候选身份与原子制品装配", () => {
       )
     ).rejects.toMatchObject({ gate: "B", code: "ATOMIC_ASSEMBLY_INVALID" });
   });
+
+  test("optionalDependencies 中的稳定 CoreMind 包回退失败关闭", async () => {
+    const materialized = createMaterializedCandidate();
+    const entry = materialized.packages.find((artifact) => artifact.name === "coremind-ai");
+    if (!entry) throw new Error("测试候选缺少 coremind-ai");
+    entry.optionalDependencies = { "coremind-runtime": "0.3.0" };
+
+    await expect(
+      runCoreMindCandidateAssembly(
+        {
+          schemaVersion: 1,
+          kind: "git-commit",
+          repository: "https://github.com/Eclipseic1848/CoreMind.git",
+          commit
+        },
+        createArtifactSource(materialized)
+      )
+    ).rejects.toMatchObject({ gate: "B", code: "ATOMIC_ASSEMBLY_INVALID" });
+  });
 });

@@ -286,11 +286,17 @@ function validateMaterializedCandidate(
         `${name} 缺少有效 registry integrity`
       );
     }
-    for (const [dependencyName, version] of Object.entries(artifact.dependencies)) {
-      if (isCoreMindPackageName(dependencyName) && version !== candidate.version) {
-        throw assemblyError(
-          `${name} 的内部依赖 ${dependencyName}=${version} 发生混装或稳定版本回退`
-        );
+    for (const dependencyMap of [
+      artifact.dependencies,
+      artifact.optionalDependencies,
+      artifact.peerDependencies
+    ]) {
+      for (const [dependencyName, version] of Object.entries(dependencyMap)) {
+        if (isCoreMindPackageName(dependencyName) && version !== candidate.version) {
+          throw assemblyError(
+            `${name} 的内部依赖 ${dependencyName}=${version} 发生混装或稳定版本回退`
+          );
+        }
       }
     }
   }

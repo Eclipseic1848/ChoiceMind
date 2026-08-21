@@ -190,6 +190,44 @@ describe("CoreMind Git 制品边界", () => {
     await expect(access(executor.sourceDirectory)).rejects.toThrow();
   });
 
+  test("tgz 字节被篡改时失败关闭并清理临时资源", async () => {
+    const root = await createTemporaryDirectory();
+    const artifactDirectory = path.join(root, "artifacts");
+    const executor = createGitCandidateExecutor();
+    const source = createSystemArtifactSource({
+      artifactDirectory,
+      choiceMindRoot: root,
+      execute: async (request) => {
+        const output = await executor.execute(request);
+        if (
+          request.command === "npm" &&
+          request.args[0] === "pack" &&
+          request.args.includes("coremind-ai")
+        ) {
+          const packed = JSON.parse(output.toString("utf8")) as [{ filename: string }];
+          const destinationIndex = request.args.indexOf("--pack-destination");
+          const destination = request.args[destinationIndex + 1];
+          if (!destination) throw new Error("测试 pack 命令缺少目标目录");
+          const tarballPath = path.join(destination, packed[0].filename);
+          const bytes = await readFile(tarballPath);
+          await writeFile(tarballPath, Buffer.concat([bytes, gzipSync(Buffer.alloc(0))]));
+        }
+        return output;
+      }
+    });
+
+    await expect(
+      source.materializeGitCommit({
+        schemaVersion: 1,
+        kind: "git-commit",
+        repository: "https://github.com/Eclipseic1848/CoreMind.git",
+        commit
+      })
+    ).rejects.toMatchObject({ stage: "TARBALL_VALIDATE" });
+    await expect(access(executor.sourceDirectory)).rejects.toThrow();
+    await expect(access(path.join(artifactDirectory, ".npm-sandbox"))).rejects.toThrow();
+  });
+
   test("构建失败时仍删除临时 CoreMind 源码", async () => {
     const root = await createTemporaryDirectory();
     const executor = createGitCandidateExecutor();
@@ -371,6 +409,39 @@ describe("CoreMind npm 制品边界", () => {
       )
     ).rejects.toMatchObject({ gate: "B", code: "ATOMIC_ASSEMBLY_INVALID" });
   });
+
+  test("tgz peerDependencies 中的稳定 CoreMind 包回退失败关闭", async () => {
+    const root = await createTemporaryDirectory();
+    const version = "0.3.1-rc.1";
+    const options = { packedCoreMindRuntimePeerVersion: "0.3.0" };
+    const packages = Object.fromEntries(
+      CORE_MIND_PACKAGE_NAMES.map((name) => [
+        name,
+        { integrity: npmIntegrity(name, version, options) }
+      ])
+    ) as Record<(typeof CORE_MIND_PACKAGE_NAMES)[number], { integrity: string }>;
+    const systemSource = createSystemArtifactSource({
+      artifactDirectory: path.join(root, "artifacts"),
+      choiceMindRoot: root,
+      execute: createNpmCandidateExecutor(version, options)
+    });
+    const source = {
+      ...systemSource,
+      describeEnvironment: async () => ({
+        choiceMindCommit: "b".repeat(40),
+        nodeVersion: "22.22.1",
+        workspacePackageManager: "pnpm@11.21.0",
+        artifactPackageManager: "npm@10.9.4"
+      })
+    };
+
+    await expect(
+      runCoreMindCandidateAssembly(
+        { schemaVersion: 1, kind: "npm-release", version, packages },
+        source
+      )
+    ).rejects.toMatchObject({ gate: "B", code: "ATOMIC_ASSEMBLY_INVALID" });
+  });
 });
 
 async function createTemporaryDirectory(): Promise<string> {
@@ -491,9 +562,14 @@ async function packFixture(request: CommandRequest, sourceRoot: string): Promise
   );
 }
 
+interface NpmCandidateFixtureOptions {
+  packedCoreMindRuntimeVersion?: string;
+  packedCoreMindRuntimePeerVersion?: string;
+}
+
 function createNpmCandidateExecutor(
   version: string,
-  options: { packedCoreMindRuntimeVersion?: string } = {}
+  options: NpmCandidateFixtureOptions = {}
 ): CommandExecutor {
   return async (request) => {
     if (request.command !== "npm") return Buffer.alloc(0);
@@ -513,6 +589,10 @@ function createNpmCandidateExecutor(
                   "coremind-tools": version,
                   "coremind-templates": version
                 }
+              : {},
+          peerDependencies:
+            name === "coremind-ai" && options.packedCoreMindRuntimePeerVersion
+              ? { "coremind-runtime": options.packedCoreMindRuntimePeerVersion }
               : {}
         })
       );
@@ -535,6 +615,10 @@ function createNpmCandidateExecutor(
                 "coremind-tools": version,
                 "coremind-templates": version
               }
+            : {},
+        peerDependencies:
+          name === "coremind-ai" && options.packedCoreMindRuntimePeerVersion
+            ? { "coremind-runtime": options.packedCoreMindRuntimePeerVersion }
             : {}
       });
       await mkdir(destination, { recursive: true });
@@ -562,7 +646,7 @@ function packageNameFromSpecifier(specifier: string | undefined, version: string
 function npmIntegrity(
   name: string,
   version: string,
-  options: { packedCoreMindRuntimeVersion?: string } = {}
+  options: NpmCandidateFixtureOptions = {}
 ): string {
   const bytes = createPackageTarball({
     name,
@@ -576,6 +660,10 @@ function npmIntegrity(
             "coremind-tools": version,
             "coremind-templates": version
           }
+        : {},
+    peerDependencies:
+      name === "coremind-ai" && options.packedCoreMindRuntimePeerVersion
+        ? { "coremind-runtime": options.packedCoreMindRuntimePeerVersion }
         : {}
   });
   return `sha512-${createHash("sha512").update(bytes).digest("base64")}`;
@@ -585,6 +673,7 @@ function createPackageTarball(manifest: {
   name: string;
   version: string;
   dependencies: Record<string, string>;
+  peerDependencies?: Record<string, string>;
 }): Buffer {
   const content = Buffer.from(`${JSON.stringify(manifest)}\n`);
   const header = Buffer.alloc(512);

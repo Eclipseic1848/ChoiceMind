@@ -62,7 +62,9 @@ export function createMaterializedCandidate(
               "coremind-tools": version,
               "coremind-templates": version
             }
-          : {}
+          : {},
+      optionalDependencies: {},
+      peerDependencies: {}
     }))
   };
 }

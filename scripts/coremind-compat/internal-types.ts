@@ -21,6 +21,8 @@ export interface MaterializedCoreMindPackage {
   integrity: string;
   sha256: string;
   dependencies: Record<string, string>;
+  optionalDependencies: Record<string, string>;
+  peerDependencies: Record<string, string>;
 }
 
 export interface MaterializedCoreMindCandidate {

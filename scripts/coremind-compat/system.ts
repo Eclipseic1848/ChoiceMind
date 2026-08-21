@@ -243,7 +243,9 @@ async function packGitPackages(
       fileName: packed.filename,
       integrity: packed.integrity,
       sha256: sha256(tarball),
-      dependencies: packedManifest.dependencies
+      dependencies: packedManifest.dependencies,
+      optionalDependencies: packedManifest.optionalDependencies,
+      peerDependencies: packedManifest.peerDependencies
     });
   }
   return packages;
@@ -311,7 +313,9 @@ async function materializeNpmRelease(
       fileName: packed.filename,
       integrity: packed.integrity,
       sha256: sha256(tarball),
-      dependencies: packedManifest.dependencies
+      dependencies: packedManifest.dependencies,
+      optionalDependencies: packedManifest.optionalDependencies,
+      peerDependencies: packedManifest.peerDependencies
     });
   }
   const identity = CORE_MIND_PACKAGE_NAMES.map(
@@ -364,19 +368,29 @@ interface PackageManifest {
   name: string;
   version: string;
   dependencies: Record<string, string>;
+  optionalDependencies: Record<string, string>;
+  peerDependencies: Record<string, string>;
 }
 
 async function readPackageManifest(root: string, packageName: string): Promise<PackageManifest> {
   const directory = packageName === "coremind-ai" ? "coremind" : packageName;
   const value = JSON.parse(
     await readFile(path.join(root, "packages", directory, "package.json"), "utf8")
-  ) as { name?: unknown; version?: unknown; dependencies?: unknown };
+  ) as {
+    name?: unknown;
+    version?: unknown;
+    dependencies?: unknown;
+    optionalDependencies?: unknown;
+    peerDependencies?: unknown;
+  };
   if (value.name !== packageName) throw new Error(`${packageName} 包名不一致`);
   if (typeof value.version !== "string") throw new Error(`${packageName} 缺少版本`);
   return {
     name: packageName,
     version: value.version,
-    dependencies: parseDependencies(value.dependencies, packageName)
+    dependencies: parseDependencies(value.dependencies, packageName),
+    optionalDependencies: parseDependencies(value.optionalDependencies, packageName),
+    peerDependencies: parseDependencies(value.peerDependencies, packageName)
   };
 }
 
@@ -404,13 +418,17 @@ async function readPackedPackageManifest(
         name?: unknown;
         version?: unknown;
         dependencies?: unknown;
+        optionalDependencies?: unknown;
+        peerDependencies?: unknown;
       };
       if (value.name !== expectedName) throw new Error(`${expectedName} tgz 包名不一致`);
       if (typeof value.version !== "string") throw new Error(`${expectedName} tgz 缺少版本`);
       return {
         name: expectedName,
         version: value.version,
-        dependencies: parseDependencies(value.dependencies, expectedName)
+        dependencies: parseDependencies(value.dependencies, expectedName),
+        optionalDependencies: parseDependencies(value.optionalDependencies, expectedName),
+        peerDependencies: parseDependencies(value.peerDependencies, expectedName)
       };
     }
     offset = contentOffset + Math.ceil(size / 512) * 512;
@@ -465,7 +483,11 @@ function parsePackedPackage(
 function parseNpmMetadata(
   output: Buffer,
   expectedName: string
-): { version: string; integrity: string; dependencies: Record<string, string> } {
+): {
+  version: string;
+  integrity: string;
+  dependencies: Record<string, string>;
+} {
   const value = JSON.parse(output.toString("utf8")) as {
     name?: unknown;
     version?: unknown;
