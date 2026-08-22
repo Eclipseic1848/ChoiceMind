@@ -1,6 +1,6 @@
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -8,6 +8,9 @@ import { gunzip } from "node:zlib";
 
 const gunzipAsync = promisify(gunzip);
 const execFileAsync = promisify(execFile);
+const REQUIRED_PNPM_VERSION = "11.21.0";
+const REQUIRED_PNPM_COREPACK_HASH =
+  "sha512.521705bce689924eac72f5a3587122f362689ef6571e55ba80076fd637c11132ecffada26fad4ea79c485bfddbfd3d5a2a5b05805a77e893de71ec8a6cca3bb1";
 
 import {
   CORE_MIND_PACKAGE_NAMES,
@@ -28,6 +31,7 @@ import {
   type MaterializedCoreMindCandidate,
   type MaterializedCoreMindPackage
 } from "./internal-types.js";
+import { trustedPnpmContentSha512 } from "./pnpm-trust.js";
 
 export interface CommandRequest {
   command: "git" | "node" | "npm" | "pnpm";
@@ -42,6 +46,7 @@ export type CommandExecutor = (request: CommandRequest) => Promise<Buffer>;
 export interface SystemCompatibilityOptions {
   artifactDirectory: string;
   choiceMindRoot: string;
+  corepackHome?: string;
   commandTimeoutMs?: number;
   execute?: CommandExecutor;
   signal?: AbortSignal;
@@ -81,11 +86,55 @@ async function verifyCandidateCompatibility(
   environment: CoreMindCompatibilityEnvironment,
   execute: CommandExecutor
 ): Promise<CoreMindCandidateVerification> {
+  const packageManagerSetup = await atVerificationStage(
+    "C",
+    "CANDIDATE_INSTALL",
+    async () => {
+      const configuredHome = options.corepackHome ?? defaultCorepackHome();
+      if (!configuredHome.trim()) throw new Error("Corepack 来源目录不能为空");
+      const version = environment.workspacePackageManager.match(/^pnpm@([^+]+)(?:\+.+)?$/u)?.[1];
+      if (!version) throw new Error("工作区 packageManager 必须是精确 pnpm 版本");
+      if (version !== REQUIRED_PNPM_VERSION) {
+        throw new Error(`Gate C 必须使用 pnpm ${REQUIRED_PNPM_VERSION}`);
+      }
+      const sourceCorepackHome = path.resolve(configuredHome);
+      const sourcePackageDirectory = path.join(
+        sourceCorepackHome,
+        "v1",
+        "pnpm",
+        version
+      );
+      const cachedManifest = JSON.parse(
+        await readFile(path.join(sourcePackageDirectory, "package.json"), "utf8")
+      ) as { name?: unknown; version?: unknown };
+      if (cachedManifest.name !== "pnpm" || cachedManifest.version !== version) {
+        throw new Error("Corepack 来源 pnpm 清单身份不匹配");
+      }
+      const corepackMetadata = JSON.parse(
+        await readFile(path.join(sourcePackageDirectory, ".corepack"), "utf8")
+      ) as {
+        hash?: unknown;
+        locator?: { name?: unknown; reference?: unknown };
+      };
+      if (
+        corepackMetadata.locator?.name !== "pnpm" ||
+        corepackMetadata.hash !== REQUIRED_PNPM_COREPACK_HASH ||
+        corepackMetadata.locator.reference !== `${version}+${REQUIRED_PNPM_COREPACK_HASH}`
+      ) {
+        throw new Error("Corepack 来源 pnpm 完整性元数据不匹配");
+      }
+      const trustedContentSha512 = trustedPnpmContentSha512(options);
+      if ((await sha512Directory(sourcePackageDirectory)) !== trustedContentSha512) {
+        throw new Error("Corepack 来源 pnpm 内容摘要不匹配");
+      }
+      return { sourceCorepackHome, trustedContentSha512, version };
+    }
+  );
   const temporaryRoot = await atVerificationStage("C", "CHOICEMIND_COPY", () =>
     mkdtemp(path.join(os.tmpdir(), "choicemind-coremind-runner-"))
   );
   const choiceMindRoot = path.join(temporaryRoot, "workspace");
-  const sandboxDirectory = path.join(options.artifactDirectory, ".pnpm-runner-sandbox");
+  let sandboxDirectory: string | undefined;
   let failure: CoreMindCandidateVerificationError | undefined;
   let verification: CoreMindCandidateVerification | undefined;
 
@@ -117,24 +166,48 @@ async function verifyCandidateCompatibility(
       "C",
       "CANDIDATE_INSTALL",
       async () => {
-        const storeDirectory = path.join(sandboxDirectory, "store");
-        const cacheDirectory = path.join(sandboxDirectory, "cache");
-        const corepackDirectory = path.join(sandboxDirectory, "corepack");
-        const globalConfigPath = path.join(sandboxDirectory, "globalconfig");
-        const userConfigPath = path.join(sandboxDirectory, "userconfig");
+        const currentSandboxDirectory = await mkdtemp(
+          path.join(options.artifactDirectory, ".pnpm-runner-sandbox-")
+        );
+        sandboxDirectory = currentSandboxDirectory;
+        const storeDirectory = path.join(currentSandboxDirectory, "store");
+        const cacheDirectory = path.join(currentSandboxDirectory, "cache");
+        const corepackDirectory = path.join(currentSandboxDirectory, "corepack");
+        const globalConfigPath = path.join(currentSandboxDirectory, "globalconfig");
+        const userConfigPath = path.join(currentSandboxDirectory, "userconfig");
         await mkdir(storeDirectory, { recursive: true });
         await mkdir(cacheDirectory, { recursive: true });
         await mkdir(corepackDirectory, { recursive: true });
+        await seedPnpmCorepackCache(
+          packageManagerSetup.sourceCorepackHome,
+          corepackDirectory,
+          packageManagerSetup.version,
+          packageManagerSetup.trustedContentSha512
+        );
         await writeFile(globalConfigPath, "", "utf8");
         await writeFile(userConfigPath, "", "utf8");
-        await injectCandidateOverrides(choiceMindRoot, options.artifactDirectory, candidate);
-        const environment = {
+        const commandEnvironment = {
+          COREPACK_ENABLE_NETWORK: "0",
           COREPACK_HOME: corepackDirectory,
           npm_config_cache: cacheDirectory,
           npm_config_cache_dir: cacheDirectory,
           npm_config_globalconfig: globalConfigPath,
           npm_config_userconfig: userConfigPath
         };
+        const seededPnpmVersion = (
+          await execute({
+            command: "pnpm",
+            args: ["--version"],
+            cwd: choiceMindRoot,
+            environment: commandEnvironment
+          })
+        )
+          .toString("utf8")
+          .trim();
+        if (seededPnpmVersion !== REQUIRED_PNPM_VERSION) {
+          throw new Error(`Gate C 必须预置 pnpm ${REQUIRED_PNPM_VERSION}`);
+        }
+        await injectCandidateOverrides(choiceMindRoot, options.artifactDirectory, candidate);
         await execute({
           command: "pnpm",
           args: [
@@ -145,9 +218,9 @@ async function verifyCandidateCompatibility(
             storeDirectory
           ],
           cwd: choiceMindRoot,
-          environment
+          environment: commandEnvironment
         });
-        return environment;
+        return commandEnvironment;
       }
     );
 
@@ -268,8 +341,8 @@ async function verifyCandidateCompatibility(
       )
         .toString("utf8")
         .trim();
-      if (pnpmVersion !== "11.21.0") {
-        throw new Error("Gate F 必须使用 pnpm 11.21.0");
+      if (pnpmVersion !== REQUIRED_PNPM_VERSION) {
+        throw new Error(`Gate F 必须使用 pnpm ${REQUIRED_PNPM_VERSION}`);
       }
       await execute({
         command: "pnpm",
@@ -297,20 +370,25 @@ async function verifyCandidateCompatibility(
         : new CoreMindCandidateVerificationError("C", "CHOICEMIND_COPY", error);
   }
 
-  const cleanupResults = await Promise.allSettled([
+  const cleanupTargets = [
     rm(temporaryRoot, {
       force: true,
       maxRetries: 5,
       recursive: true,
       retryDelay: 100
-    }),
-    rm(sandboxDirectory, {
-      force: true,
-      maxRetries: 5,
-      recursive: true,
-      retryDelay: 100
     })
-  ]);
+  ];
+  if (sandboxDirectory !== undefined) {
+    cleanupTargets.push(
+      rm(sandboxDirectory, {
+        force: true,
+        maxRetries: 5,
+        recursive: true,
+        retryDelay: 100
+      })
+    );
+  }
+  const cleanupResults = await Promise.allSettled(cleanupTargets);
   const cleanupFailure = cleanupResults.find(
     (result): result is PromiseRejectedResult => result.status === "rejected"
   );
@@ -327,6 +405,78 @@ async function verifyCandidateCompatibility(
     throw new CoreMindCandidateVerificationError("F", "ROOT_VERIFY");
   }
   return verification;
+}
+
+async function seedPnpmCorepackCache(
+  sourceCorepackHome: string,
+  targetCorepackHome: string,
+  version: string,
+  trustedContentSha512: string
+): Promise<void> {
+  const relativePackagePath = path.join("v1", "pnpm", version);
+  const sourcePackageDirectory = path.join(sourceCorepackHome, relativePackagePath);
+  const targetPackageDirectory = path.join(targetCorepackHome, relativePackagePath);
+  await mkdir(path.dirname(targetPackageDirectory), { recursive: true });
+  await cp(sourcePackageDirectory, targetPackageDirectory, {
+    errorOnExist: true,
+    force: false,
+    recursive: true
+  });
+  if ((await sha512Directory(targetPackageDirectory)) !== trustedContentSha512) {
+    throw new Error("隔离 Corepack pnpm 内容摘要不匹配");
+  }
+}
+
+async function sha512Directory(root: string): Promise<string> {
+  const files: string[] = [];
+  const visit = async (directory: string): Promise<void> => {
+    const entries = await readdir(directory, { withFileTypes: true });
+    entries.sort((left, right) =>
+      left.name < right.name ? -1 : left.name > right.name ? 1 : 0
+    );
+    for (const entry of entries) {
+      const entryPath = path.join(directory, entry.name);
+      if (entry.isDirectory()) {
+        await visit(entryPath);
+      } else if (entry.isFile()) {
+        files.push(entryPath);
+      } else {
+        throw new Error("Corepack pnpm 缓存包含不受支持的文件类型");
+      }
+    }
+  };
+  await visit(root);
+
+  const hash = createHash("sha512");
+  for (const filePath of files) {
+    const relativePath = Buffer.from(path.relative(root, filePath).replaceAll("\\", "/"));
+    const content = await readFile(filePath);
+    hash.update(uint64(relativePath.length));
+    hash.update(relativePath);
+    hash.update(uint64(content.length));
+    hash.update(content);
+  }
+  return `sha512.${hash.digest("hex")}`;
+}
+
+function uint64(value: number): Buffer {
+  const buffer = Buffer.alloc(8);
+  buffer.writeBigUInt64BE(BigInt(value));
+  return buffer;
+}
+
+function defaultCorepackHome(): string {
+  const configuredHome = process.env.COREPACK_HOME;
+  if (configuredHome?.trim()) return configuredHome;
+  const cacheRoot = [process.env.XDG_CACHE_HOME, process.env.LOCALAPPDATA].find((value) =>
+    value?.trim()
+  );
+  return path.join(
+    cacheRoot ??
+      path.join(os.homedir(), process.platform === "win32" ? "AppData/Local" : ".cache"),
+    "node",
+    "corepack"
+  );
 }
 
 async function injectCandidateOverrides(

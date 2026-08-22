@@ -8,6 +8,7 @@ import { gzipSync } from "node:zlib";
 import { afterEach, describe, expect, test } from "vitest";
 
 import { CORE_MIND_PACKAGE_NAMES, runCoreMindCompatibility } from "./index.js";
+import { setTrustedPnpmContentSha512ForTest } from "./pnpm-trust.js";
 import { createMaterializedCandidate } from "./test-fixtures.js";
 import {
   createSystemCompatibilitySystem,
@@ -17,6 +18,10 @@ import {
 } from "./system.js";
 
 const commit = "57e5765471cf6fe7f7da14d9ed4882e0c53ec322";
+const trustedPnpmCorepackHash =
+  "sha512.521705bce689924eac72f5a3587122f362689ef6571e55ba80076fd637c11132ecffada26fad4ea79c485bfddbfd3d5a2a5b05805a77e893de71ec8a6cca3bb1";
+const trustedPnpmFixtureContentSha512 =
+  "sha512.58f03cfe26af8947ea1ab55f0acce648aa210fcb8c8b0d57cecc556b026147b369a5eb7472ddfa7551eda846f54d74e495e5044df9d662f08c81144267ae280f";
 const temporaryPaths: string[] = [];
 
 afterEach(async () => {
@@ -156,6 +161,8 @@ test("候选六包只在临时 ChoiceMind 副本中解析并通过 Gate C-F", as
   const root = await createTemporaryDirectory();
   const artifactDirectory = path.join(root, "artifacts");
   const packageDirectory = path.join(artifactDirectory, "packages");
+  const corepackHome = path.join(root, "corepack-home");
+  await createCorepackPnpmFixture(corepackHome, "11.21.0");
   const candidate = createMaterializedCandidate();
   for (const artifact of candidate.packages) {
     artifact.sha256 = createHash("sha256").update(artifact.name).digest("hex");
@@ -168,9 +175,10 @@ test("候选六包只在临时 ChoiceMind 副本中解析并通过 Gate C-F", as
   );
   let temporaryChoiceMindRoot = "";
   const commands: string[] = [];
-  const source = createSystemCompatibilitySystem({
+  const systemOptions = {
     artifactDirectory,
     choiceMindRoot: path.join(root, "stable-choice-mind"),
+    corepackHome,
     execute: async (request) => {
       commands.push(`${request.command} ${request.args.join(" ")}`);
       if (request.command === "git" && request.args[0] === "clone") {
@@ -223,7 +231,9 @@ test("候选六包只在临时 ChoiceMind 副本中解析并通过 Gate C-F", as
       }
       return Buffer.alloc(0);
     }
-  });
+  } satisfies Parameters<typeof createSystemCompatibilitySystem>[0];
+  setTrustedPnpmContentSha512ForTest(systemOptions, trustedPnpmFixtureContentSha512);
+  const source = createSystemCompatibilitySystem(systemOptions);
 
   const result = await source.verifyCandidateCompatibility(candidate, {
     choiceMindCommit: "b".repeat(40),
@@ -254,11 +264,8 @@ test("候选六包只在临时 ChoiceMind 副本中解析并通过 Gate C-F", as
   await expect(access(path.join(artifactDirectory, ".pnpm-runner-sandbox"))).rejects.toThrow();
 });
 
-test.each([
-  ["Node", { actualNodeVersion: "v22.21.0" }],
-  ["pnpm", { actualPnpmVersion: "11.20.0" }]
-] as const)("Gate F 拒绝非锁定的 %s 工具链版本", async (_tool, options) => {
-  const harness = await createCompatibilityRunnerHarness(options);
+test("Gate F 拒绝非锁定的 Node 版本", async () => {
+  const harness = await createCompatibilityRunnerHarness({ actualNodeVersion: "v22.21.0" });
 
   await expect(
     harness.source.verifyCandidateCompatibility(harness.candidate, harness.environment)
@@ -341,19 +348,326 @@ test("候选安装只注入六包 overrides 和隔离配置", async () => {
     "coremind-templates"
   ]);
   expect(Object.keys(harness.installEnvironment).sort()).toEqual([
+    "COREPACK_ENABLE_NETWORK",
     "COREPACK_HOME",
     "npm_config_cache",
     "npm_config_cache_dir",
     "npm_config_globalconfig",
     "npm_config_userconfig"
   ]);
-  expect(path.resolve(harness.installEnvironment.npm_config_cache_dir ?? "")).toBe(
-    path.resolve(harness.artifactDirectory, ".pnpm-runner-sandbox", "cache")
-  );
-  await expect(
-    access(path.join(harness.artifactDirectory, ".pnpm-runner-sandbox"))
-  ).rejects.toThrow();
+  expect(harness.installEnvironment.COREPACK_ENABLE_NETWORK).toBe("0");
+  const cacheDirectory = path.resolve(harness.installEnvironment.npm_config_cache_dir ?? "");
+  const sandboxDirectory = path.dirname(cacheDirectory);
+  expect(path.dirname(sandboxDirectory)).toBe(path.resolve(harness.artifactDirectory));
+  expect(path.basename(sandboxDirectory)).toMatch(/^\.pnpm-runner-sandbox-/u);
+  await expect(access(sandboxDirectory)).rejects.toThrow();
   expect(await readFile(harness.stableMarkerPath, "utf8")).toBe("stable\n");
+  await expectStableWorkspaceUnchanged(harness);
+});
+
+test("Gate C 在安装前把锁定 pnpm 预置到独立 Corepack 缓存", async () => {
+  const corepackHome = await createTemporaryDirectory();
+  await createCorepackPnpmFixture(corepackHome, "11.21.0");
+  let preparedBeforeInstall = false;
+  const harness = await createCompatibilityRunnerHarness({
+    corepackHome,
+    onInstall: async (request) => {
+      const isolatedCorepackHome = request.environment?.COREPACK_HOME;
+      if (!isolatedCorepackHome) throw new Error("测试缺少隔离 COREPACK_HOME");
+      expect(path.resolve(isolatedCorepackHome)).not.toBe(path.resolve(corepackHome));
+      const manifest = JSON.parse(
+        await readFile(
+          path.join(isolatedCorepackHome, "v1", "pnpm", "11.21.0", "package.json"),
+          "utf8"
+        )
+      ) as { name?: unknown; version?: unknown };
+      expect(manifest).toEqual({ name: "pnpm", version: "11.21.0" });
+      expect(
+        await readFile(
+          path.join(isolatedCorepackHome, "v1", "pnpm", "11.21.0", "bin", "pnpm.mjs"),
+          "utf8"
+        )
+      ).toBe("export {};\n");
+      preparedBeforeInstall = true;
+    }
+  });
+
+  await harness.source.verifyCandidateCompatibility(harness.candidate, harness.environment);
+
+  expect(preparedBeforeInstall).toBe(true);
+  await expectStableWorkspaceUnchanged(harness);
+});
+
+test("Gate C 对空白 Corepack 来源失败关闭且不创建候选副本", async () => {
+  const harness = await createCompatibilityRunnerHarness({ corepackHome: "   " });
+
+  await expect(
+    harness.source.verifyCandidateCompatibility(harness.candidate, harness.environment)
+  ).rejects.toMatchObject({ gate: "C", stage: "CANDIDATE_INSTALL" });
+
+  expect(harness.commands.some((command) => command.startsWith("git clone"))).toBe(false);
+  expect(harness.commands.some((command) => command.startsWith("pnpm "))).toBe(false);
+  await expectStableWorkspaceUnchanged(harness);
+});
+
+test("Gate C 忽略空的缓存环境变量并回退到有效用户缓存", async () => {
+  const localAppData = await createTemporaryDirectory();
+  await createCorepackPnpmFixture(path.join(localAppData, "node", "corepack"), "11.21.0");
+  const previousCorepackHome = process.env.COREPACK_HOME;
+  const previousXdgCacheHome = process.env.XDG_CACHE_HOME;
+  const previousLocalAppData = process.env.LOCALAPPDATA;
+  delete process.env.COREPACK_HOME;
+  process.env.XDG_CACHE_HOME = "";
+  process.env.LOCALAPPDATA = localAppData;
+
+  try {
+    const harness = await createCompatibilityRunnerHarness({ useDefaultCorepackHome: true });
+
+    await expect(
+      harness.source.verifyCandidateCompatibility(harness.candidate, harness.environment)
+    ).resolves.toBeDefined();
+    await expectStableWorkspaceUnchanged(harness);
+  } finally {
+    restoreEnvironmentVariable("COREPACK_HOME", previousCorepackHome);
+    restoreEnvironmentVariable("XDG_CACHE_HOME", previousXdgCacheHome);
+    restoreEnvironmentVariable("LOCALAPPDATA", previousLocalAppData);
+  }
+});
+
+test("Gate C 对空白工作区包管理器失败关闭且不创建候选副本", async () => {
+  const corepackHome = await createTemporaryDirectory();
+  const harness = await createCompatibilityRunnerHarness({
+    corepackHome,
+    workspacePackageManager: ""
+  });
+
+  await expect(
+    harness.source.verifyCandidateCompatibility(harness.candidate, harness.environment)
+  ).rejects.toMatchObject({ gate: "C", stage: "CANDIDATE_INSTALL" });
+
+  expect(harness.commands.some((command) => command.startsWith("git clone"))).toBe(false);
+  expect(harness.commands.some((command) => command.startsWith("pnpm "))).toBe(false);
+  await expectStableWorkspaceUnchanged(harness);
+});
+
+test("Gate C 在读取缓存前拒绝非锁定 pnpm 版本", async () => {
+  const corepackHome = await createTemporaryDirectory();
+  await createCorepackPnpmFixture(corepackHome, "11.20.0");
+  const harness = await createCompatibilityRunnerHarness({
+    corepackHome,
+    workspacePackageManager: "pnpm@11.20.0"
+  });
+
+  await expect(
+    harness.source.verifyCandidateCompatibility(harness.candidate, harness.environment)
+  ).rejects.toMatchObject({ gate: "C", stage: "CANDIDATE_INSTALL" });
+
+  expect(harness.commands.some((command) => command.startsWith("git clone"))).toBe(false);
+  expect(harness.commands.some((command) => command.startsWith("pnpm "))).toBe(false);
+  await expectStableWorkspaceUnchanged(harness);
+});
+
+test("Gate C 在复制前拒绝内容被篡改的 pnpm 缓存", async () => {
+  const corepackHome = await createTemporaryDirectory();
+  await createCorepackPnpmFixture(corepackHome, "11.21.0");
+  await writeFile(
+    path.join(corepackHome, "v1", "pnpm", "11.21.0", "bin", "pnpm.mjs"),
+    "throw new Error('tampered');\n",
+    "utf8"
+  );
+  const harness = await createCompatibilityRunnerHarness({ corepackHome });
+
+  await expect(
+    harness.source.verifyCandidateCompatibility(harness.candidate, harness.environment)
+  ).rejects.toMatchObject({ gate: "C", stage: "CANDIDATE_INSTALL" });
+
+  expect(harness.commands.some((command) => command.startsWith("git clone"))).toBe(false);
+  expect(harness.commands.some((command) => command.startsWith("pnpm "))).toBe(false);
+  await expectStableWorkspaceUnchanged(harness);
+});
+
+test("Gate C 在来源 pnpm 缓存缺失或不可访问时不创建候选副本", async () => {
+  const emptyCorepackHome = await createTemporaryDirectory();
+  const harness = await createCompatibilityRunnerHarness({ corepackHome: emptyCorepackHome });
+
+  await expect(
+    harness.source.verifyCandidateCompatibility(harness.candidate, harness.environment)
+  ).rejects.toMatchObject({ gate: "C", stage: "CANDIDATE_INSTALL" });
+
+  expect(harness.commands.some((command) => command.startsWith("git clone"))).toBe(false);
+  expect(harness.commands.some((command) => command.startsWith("pnpm "))).toBe(false);
+  await expectStableWorkspaceUnchanged(harness);
+});
+
+test("Gate C 在来源 pnpm 清单身份不匹配时失败关闭", async () => {
+  const corepackHome = await createTemporaryDirectory();
+  await createCorepackPnpmFixture(corepackHome, "11.21.0");
+  await writeFile(
+    path.join(corepackHome, "v1", "pnpm", "11.21.0", "package.json"),
+    `${JSON.stringify({ name: "not-pnpm", version: "11.21.0" })}\n`,
+    "utf8"
+  );
+  const harness = await createCompatibilityRunnerHarness({ corepackHome });
+
+  await expect(
+    harness.source.verifyCandidateCompatibility(harness.candidate, harness.environment)
+  ).rejects.toMatchObject({ gate: "C", stage: "CANDIDATE_INSTALL" });
+
+  expect(harness.commands.some((command) => command.startsWith("git clone"))).toBe(false);
+  expect(harness.commands.some((command) => command.startsWith("pnpm "))).toBe(false);
+  await expectStableWorkspaceUnchanged(harness);
+});
+
+test("Gate C 在 Corepack locator 或完整性元数据不匹配时失败关闭", async () => {
+  const corepackHome = await createTemporaryDirectory();
+  await createCorepackPnpmFixture(corepackHome, "11.21.0");
+  const packageDirectory = path.join(corepackHome, "v1", "pnpm", "11.21.0");
+  await writeFile(
+    path.join(packageDirectory, ".corepack"),
+    `${JSON.stringify({
+      locator: { name: "pnpm", reference: `11.20.0+sha512.${"b".repeat(128)}` },
+      hash: `sha512.${"b".repeat(128)}`
+    })}\n`,
+    "utf8"
+  );
+  const harness = await createCompatibilityRunnerHarness({ corepackHome });
+
+  await expect(
+    harness.source.verifyCandidateCompatibility(harness.candidate, harness.environment)
+  ).rejects.toMatchObject({ gate: "C", stage: "CANDIDATE_INSTALL" });
+
+  expect(harness.commands.some((command) => command.startsWith("git clone"))).toBe(false);
+  expect(harness.commands.some((command) => command.startsWith("pnpm "))).toBe(false);
+  await expectStableWorkspaceUnchanged(harness);
+});
+
+test("Gate C 只在隔离 pnpm 实际版本核验通过后执行安装", async () => {
+  const corepackHome = await createTemporaryDirectory();
+  await createCorepackPnpmFixture(corepackHome, "11.21.0");
+  const harness = await createCompatibilityRunnerHarness({
+    actualPnpmVersion: "11.20.0",
+    corepackHome
+  });
+
+  await expect(
+    harness.source.verifyCandidateCompatibility(harness.candidate, harness.environment)
+  ).rejects.toMatchObject({ gate: "C", stage: "CANDIDATE_INSTALL" });
+
+  expect(harness.commands).toContain("pnpm --version");
+  expect(harness.commands.some((command) => command.startsWith("pnpm install"))).toBe(false);
+  await expectStableWorkspaceUnchanged(harness);
+});
+
+test("隔离 pnpm 启动核验超时后不安装并清理本次缓存", async () => {
+  const harness = await createCompatibilityRunnerHarness({
+    commandTimeoutMs: 20,
+    shouldHang: (request) => request.command === "pnpm" && request.args[0] === "--version"
+  });
+
+  await expect(
+    harness.source.verifyCandidateCompatibility(harness.candidate, harness.environment)
+  ).rejects.toMatchObject({
+    gate: "C",
+    stage: "CANDIDATE_INSTALL",
+    reason: "TIMEOUT"
+  });
+
+  expect(harness.commands.some((command) => command.startsWith("pnpm install"))).toBe(false);
+  const isolatedCorepackHome = harness.pnpmEnvironments[0]?.COREPACK_HOME;
+  if (!isolatedCorepackHome) throw new Error("测试未观察到隔离 COREPACK_HOME");
+  await expect(access(isolatedCorepackHome)).rejects.toThrow();
+  await expectStableWorkspaceUnchanged(harness);
+});
+
+test("隔离 pnpm 启动异常时不安装并清理本次缓存", async () => {
+  const harness = await createCompatibilityRunnerHarness({
+    shouldFail: (request) => request.command === "pnpm" && request.args[0] === "--version"
+  });
+
+  await expect(
+    harness.source.verifyCandidateCompatibility(harness.candidate, harness.environment)
+  ).rejects.toMatchObject({
+    gate: "C",
+    stage: "CANDIDATE_INSTALL",
+    reason: "COMMAND_FAILED"
+  });
+
+  expect(harness.commands.some((command) => command.startsWith("pnpm install"))).toBe(false);
+  const isolatedCorepackHome = harness.pnpmEnvironments[0]?.COREPACK_HOME;
+  if (!isolatedCorepackHome) throw new Error("测试未观察到隔离 COREPACK_HOME");
+  await expect(access(isolatedCorepackHome)).rejects.toThrow();
+  await expectStableWorkspaceUnchanged(harness);
+});
+
+test("隔离 pnpm 启动核验取消后不安装并清理本次缓存", async () => {
+  const controller = new AbortController();
+  let markStarted: (() => void) | undefined;
+  const started = new Promise<void>((resolve) => {
+    markStarted = resolve;
+  });
+  const harness = await createCompatibilityRunnerHarness({
+    onHangStarted: () => markStarted?.(),
+    shouldHang: (request) => request.command === "pnpm" && request.args[0] === "--version",
+    signal: controller.signal
+  });
+  const running = harness.source.verifyCandidateCompatibility(
+    harness.candidate,
+    harness.environment
+  );
+  await started;
+
+  controller.abort("cancelled");
+
+  await expect(running).rejects.toMatchObject({
+    gate: "C",
+    stage: "CANDIDATE_INSTALL",
+    reason: "CANCELLED"
+  });
+  expect(harness.commands.some((command) => command.startsWith("pnpm install"))).toBe(false);
+  const isolatedCorepackHome = harness.pnpmEnvironments[0]?.COREPACK_HOME;
+  if (!isolatedCorepackHome) throw new Error("测试未观察到隔离 COREPACK_HOME");
+  await expect(access(isolatedCorepackHome)).rejects.toThrow();
+  await expectStableWorkspaceUnchanged(harness);
+});
+
+test("重复候选请求各自使用新的隔离缓存并完成清理", async () => {
+  const corepackHome = await createTemporaryDirectory();
+  await createCorepackPnpmFixture(corepackHome, "11.21.0");
+  const harness = await createCompatibilityRunnerHarness({ corepackHome });
+
+  await harness.source.verifyCandidateCompatibility(harness.candidate, harness.environment);
+  await harness.source.verifyCandidateCompatibility(harness.candidate, harness.environment);
+
+  expect(harness.installEnvironments).toHaveLength(2);
+  expect(
+    new Set(harness.installEnvironments.map((environment) => environment.COREPACK_HOME)).size
+  ).toBe(2);
+  for (const environment of harness.installEnvironments) {
+    await expect(access(environment.COREPACK_HOME ?? "")).rejects.toThrow();
+  }
+  await expectStableWorkspaceUnchanged(harness);
+});
+
+test("并发候选请求使用互不共享的工作副本和缓存", async () => {
+  const corepackHome = await createTemporaryDirectory();
+  await createCorepackPnpmFixture(corepackHome, "11.21.0");
+  const harness = await createCompatibilityRunnerHarness({ corepackHome });
+
+  await Promise.all([
+    harness.source.verifyCandidateCompatibility(harness.candidate, harness.environment),
+    harness.source.verifyCandidateCompatibility(harness.candidate, harness.environment)
+  ]);
+
+  expect(new Set(harness.installWorkingDirectories).size).toBe(2);
+  expect(
+    new Set(harness.installEnvironments.map((environment) => environment.COREPACK_HOME)).size
+  ).toBe(2);
+  for (const directory of [
+    ...harness.installWorkingDirectories,
+    ...harness.installEnvironments.map((environment) => environment.COREPACK_HOME ?? "")
+  ]) {
+    await expect(access(directory)).rejects.toThrow();
+  }
   await expectStableWorkspaceUnchanged(harness);
 });
 
@@ -800,13 +1114,17 @@ describe("CoreMind npm 制品边界", () => {
 interface CompatibilityRunnerHarnessOptions {
   actualNodeVersion?: string;
   actualPnpmVersion?: string;
+  corepackHome?: string;
   commandTimeoutMs?: number;
   gateEPassedTests?: number;
+  onInstall?: (request: CommandRequest) => Promise<void>;
   onHangStarted?: () => void;
   resolvedVersion?: string;
   shouldHang?: (request: CommandRequest) => boolean;
   shouldFail?: (request: CommandRequest) => boolean;
   signal?: AbortSignal;
+  useDefaultCorepackHome?: boolean;
+  workspacePackageManager?: string;
 }
 
 async function createCompatibilityRunnerHarness(
@@ -824,13 +1142,20 @@ async function createCompatibilityRunnerHarness(
     "node_modules",
     ".stable-marker"
   );
+  const corepackHome = options.corepackHome ?? path.join(root, "corepack-home");
   const candidate = createMaterializedCandidate();
   const commands: string[] = [];
   const installedOverrides: Record<string, string> = {};
   const installEnvironment: Record<string, string> = {};
+  const installEnvironments: Array<Record<string, string>> = [];
+  const installWorkingDirectories: string[] = [];
+  const pnpmEnvironments: Array<Record<string, string>> = [];
   let temporaryChoiceMindRoot = "";
 
   await mkdir(packageDirectory, { recursive: true });
+  if (options.corepackHome === undefined && !options.useDefaultCorepackHome) {
+    await createCorepackPnpmFixture(corepackHome, "11.21.0");
+  }
   await mkdir(path.dirname(stableNodeModulesMarkerPath), { recursive: true });
   await writeFile(stableMarkerPath, "stable\n", "utf8");
   await writeFile(stablePackagePath, '{"name":"stable-choice-mind","private":true}\n', "utf8");
@@ -867,27 +1192,32 @@ async function createCompatibilityRunnerHarness(
     await writeFile(path.join(packageDirectory, artifact.fileName), bytes);
   }
 
-  const source = createSystemCompatibilitySystem({
+  const systemOptions = {
     artifactDirectory,
     choiceMindRoot: stableChoiceMindRoot,
+    ...(options.useDefaultCorepackHome ? {} : { corepackHome }),
     ...(options.commandTimeoutMs === undefined
       ? {}
       : { commandTimeoutMs: options.commandTimeoutMs }),
     ...(options.signal === undefined ? {} : { signal: options.signal }),
     execute: async (request) => {
       commands.push(`${request.command} ${request.args.join(" ")}`);
+      if (request.command === "pnpm") {
+        pnpmEnvironments.push({ ...(request.environment ?? {}) });
+      }
       if (request.command === "git" && request.args[0] === "clone") {
-        temporaryChoiceMindRoot = request.args.at(-1) ?? "";
-        await mkdir(path.join(temporaryChoiceMindRoot, "apps", "orchestrator"), {
+        const clonedChoiceMindRoot = request.args.at(-1) ?? "";
+        temporaryChoiceMindRoot = clonedChoiceMindRoot;
+        await mkdir(path.join(clonedChoiceMindRoot, "apps", "orchestrator"), {
           recursive: true
         });
         await writeFile(
-          path.join(temporaryChoiceMindRoot, "package.json"),
+          path.join(clonedChoiceMindRoot, "package.json"),
           `${JSON.stringify({ name: "choicemind", private: true })}\n`,
           "utf8"
         );
         await writeFile(
-          path.join(temporaryChoiceMindRoot, "apps", "orchestrator", "package.json"),
+          path.join(clonedChoiceMindRoot, "apps", "orchestrator", "package.json"),
           `${JSON.stringify({
             name: "@choicemind/orchestrator",
             dependencies: { "coremind-ai": "0.3.0" }
@@ -913,11 +1243,15 @@ async function createCompatibilityRunnerHarness(
         });
       }
       if (request.command === "pnpm" && request.args[0] === "install") {
+        await options.onInstall?.(request);
+        if (!request.cwd) throw new Error("测试缺少候选安装工作目录");
         const manifest = JSON.parse(
-          await readFile(path.join(temporaryChoiceMindRoot, "package.json"), "utf8")
+          await readFile(path.join(request.cwd, "package.json"), "utf8")
         ) as { pnpm?: { overrides?: Record<string, string> } };
         Object.assign(installedOverrides, manifest.pnpm?.overrides ?? {});
         Object.assign(installEnvironment, request.environment ?? {});
+        installEnvironments.push({ ...(request.environment ?? {}) });
+        installWorkingDirectories.push(request.cwd);
         return Buffer.alloc(0);
       }
       if (request.command === "node" && request.args[0] === "--version") {
@@ -951,7 +1285,9 @@ async function createCompatibilityRunnerHarness(
       }
       return Buffer.alloc(0);
     }
-  });
+  } satisfies Parameters<typeof createSystemCompatibilitySystem>[0];
+  setTrustedPnpmContentSha512ForTest(systemOptions, trustedPnpmFixtureContentSha512);
+  const source = createSystemCompatibilitySystem(systemOptions);
 
   return {
     artifactDirectory,
@@ -960,10 +1296,13 @@ async function createCompatibilityRunnerHarness(
     environment: {
       choiceMindCommit: "b".repeat(40),
       nodeVersion: "22.22.1",
-      workspacePackageManager: "pnpm@11.21.0",
+      workspacePackageManager: options.workspacePackageManager ?? "pnpm@11.21.0",
       artifactPackageManager: "npm@10.9.4"
     },
     installEnvironment,
+    installEnvironments,
+    installWorkingDirectories,
+    pnpmEnvironments,
     installedOverrides,
     source,
     stableChoiceMindRoot,
@@ -1007,6 +1346,31 @@ async function createTemporaryDirectory(): Promise<string> {
   );
   temporaryPaths.push(directory);
   return directory;
+}
+
+function restoreEnvironmentVariable(name: string, value: string | undefined): void {
+  if (value === undefined) {
+    delete process.env[name];
+    return;
+  }
+  process.env[name] = value;
+}
+
+async function createCorepackPnpmFixture(corepackHome: string, version: string): Promise<void> {
+  const packageDirectory = path.join(corepackHome, "v1", "pnpm", version);
+  const hash = trustedPnpmCorepackHash;
+  await mkdir(path.join(packageDirectory, "bin"), { recursive: true });
+  await writeFile(
+    path.join(packageDirectory, "package.json"),
+    `${JSON.stringify({ name: "pnpm", version })}\n`,
+    "utf8"
+  );
+  await writeFile(
+    path.join(packageDirectory, ".corepack"),
+    `${JSON.stringify({ locator: { name: "pnpm", reference: `${version}+${hash}` }, hash })}\n`,
+    "utf8"
+  );
+  await writeFile(path.join(packageDirectory, "bin", "pnpm.mjs"), "export {};\n", "utf8");
 }
 
 function createGitCandidateExecutor(): {
