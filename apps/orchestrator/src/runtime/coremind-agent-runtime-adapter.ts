@@ -77,6 +77,9 @@ export function createCoreMindAgentRuntimeAdapter(
       }
 
       return buildRuntimeOutput(command, capture.draft, createdAt, now());
+    },
+    async runPersistent(command) {
+      return this.run(command);
     }
   };
 }

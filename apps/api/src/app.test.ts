@@ -1,7 +1,6 @@
 import Fastify from "fastify";
+import type { DecisionTaskSnapshotV1 } from "@choicemind/contracts/decision/v1";
 import { afterEach, describe, expect, it } from "vitest";
-import type { DecisionTaskResultV1 } from "@choicemind/contracts/decision/v1";
-
 import { buildApiApp } from "./app.js";
 
 const openApps: Array<ReturnType<typeof buildApiApp>> = [];
@@ -142,6 +141,172 @@ describe("GET /api/v1/system/health", () => {
 });
 
 describe("POST /api/v1/decision-tasks:execute", () => {
+  it("accepts a valid command as a persistent background task", async () => {
+    const app = buildApiApp({
+      decisionTaskPersistence: {
+        async submit(command) {
+          return {
+            contractType: "decision-task-snapshot",
+            contractVersion: "1.0",
+            executionRequestId: command.executionRequestId,
+            decisionTaskId: command.requirementRevision.decisionTaskId,
+            agentRunId: "agent-run-api-persistent",
+            state: "ACCEPTED",
+            terminal: false,
+            updatedAt: "2026-08-23T20:20:00.000Z"
+          };
+        },
+        async get() {
+          return undefined;
+        }
+      }
+    });
+    openApps.push(app);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/v1/decision-tasks:execute",
+      payload: {
+        contractType: "execute-decision-task-command",
+        contractVersion: "1.0",
+        executionRequestId: "exec-api-persistent",
+        requirementRevision: {
+          contractType: "requirement-revision",
+          contractVersion: "1.0",
+          requirementRevisionId: "req-api-persistent-r1",
+          decisionTaskId: "task-api-persistent",
+          revision: 1,
+          submittedText: "提交持久后台任务",
+          market: { country: "CN", currency: "CNY", locale: "zh-CN" },
+          intendedUses: ["后台任务测试"],
+          mustHaves: [],
+          niceToHaves: [],
+          mustNotHaves: [],
+          unknowns: ["budget.maxAmountMinor"]
+        }
+      }
+    });
+
+    expect(response.statusCode).toBe(202);
+    expect(response.json()).toEqual({
+      contractType: "decision-task-snapshot",
+      contractVersion: "1.0",
+      executionRequestId: "exec-api-persistent",
+      decisionTaskId: "task-api-persistent",
+      agentRunId: "agent-run-api-persistent",
+      state: "ACCEPTED",
+      terminal: false,
+      updatedAt: "2026-08-23T20:20:00.000Z"
+    });
+  });
+
+  it("returns a versioned 409 for an idempotency conflict", async () => {
+    const app = buildApiApp({
+      decisionTaskPersistence: {
+        async submit() {
+          throw Object.assign(new Error("内部冲突"), {
+            code: "IDEMPOTENCY_CONFLICT"
+          });
+        },
+        async get() {
+          return undefined;
+        }
+      },
+      now: () => new Date("2026-08-23T20:25:00.000Z")
+    });
+    openApps.push(app);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/v1/decision-tasks:execute",
+      payload: {
+        contractType: "execute-decision-task-command",
+        contractVersion: "1.0",
+        executionRequestId: "exec-api-conflict",
+        requirementRevision: {
+          contractType: "requirement-revision",
+          contractVersion: "1.0",
+          requirementRevisionId: "req-api-conflict-r1",
+          decisionTaskId: "task-api-conflict",
+          revision: 1,
+          submittedText: "验证幂等冲突",
+          market: { country: "CN", currency: "CNY", locale: "zh-CN" },
+          intendedUses: ["后台任务测试"],
+          mustHaves: [],
+          niceToHaves: [],
+          mustNotHaves: [],
+          unknowns: ["budget.maxAmountMinor"]
+        }
+      }
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toMatchObject({
+      ok: false,
+      error: {
+        code: "IDEMPOTENCY_CONFLICT",
+        category: "VALIDATION",
+        retryMode: "NONE",
+        occurredAt: "2026-08-23T20:25:00.000Z"
+      }
+    });
+    expect(response.body).not.toContain("内部冲突");
+  });
+
+  it("returns a versioned storage failure when submission persistence is unavailable", async () => {
+    const app = buildApiApp({
+      decisionTaskPersistence: {
+        async submit() {
+          throw Object.assign(new Error("password=private connection refused"), {
+            code: "PERSISTENCE_UNAVAILABLE"
+          });
+        },
+        async get() {
+          return undefined;
+        }
+      },
+      now: () => new Date("2026-08-23T20:27:00.000Z")
+    });
+    openApps.push(app);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/v1/decision-tasks:execute",
+      payload: {
+        contractType: "execute-decision-task-command",
+        contractVersion: "1.0",
+        executionRequestId: "exec-api-storage-failure",
+        requirementRevision: {
+          contractType: "requirement-revision",
+          contractVersion: "1.0",
+          requirementRevisionId: "req-api-storage-failure-r1",
+          decisionTaskId: "task-api-storage-failure",
+          revision: 1,
+          submittedText: "验证持久存储故障",
+          market: { country: "CN", currency: "CNY", locale: "zh-CN" },
+          intendedUses: ["后台任务测试"],
+          mustHaves: [],
+          niceToHaves: [],
+          mustNotHaves: [],
+          unknowns: ["budget.maxAmountMinor"]
+        }
+      }
+    });
+
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toMatchObject({
+      ok: false,
+      error: {
+        code: "PERSISTENCE_UNAVAILABLE",
+        category: "STORAGE",
+        retryMode: "SAME_EXECUTION_ONLY",
+        occurredAt: "2026-08-23T20:27:00.000Z"
+      }
+    });
+    expect(response.body).not.toContain("password");
+    expect(response.body).not.toContain("connection refused");
+  });
+
   it("returns a versioned contract error for malformed JSON", async () => {
     const app = buildApiApp();
     openApps.push(app);
@@ -270,7 +435,7 @@ describe("POST /api/v1/decision-tasks:execute", () => {
     });
   });
 
-  it("rejects an invalid budget before calling the Orchestrator", async () => {
+  it("rejects an invalid budget before submitting to persistence", async () => {
     const app = buildApiApp();
     openApps.push(app);
 
@@ -308,178 +473,25 @@ describe("POST /api/v1/decision-tasks:execute", () => {
     });
   });
 
-  it("does not expose a malformed Orchestrator response as a successful decision", async () => {
+});
+
+describe("GET /api/v1/decision-tasks/:decisionTaskId", () => {
+  it("returns the persisted task snapshot", async () => {
     const app = buildApiApp({
-      decisionOrchestrator: {
-        async execute() {
+      decisionTaskPersistence: {
+        async submit() {
+          throw new Error("本测试不应提交任务");
+        },
+        async get(decisionTaskId) {
           return {
-            contractType: "decision-task-result",
+            contractType: "decision-task-snapshot",
             contractVersion: "1.0",
-            ok: true,
-            bundle: { decision: { status: "BUY_NOW" } }
-          } as unknown as DecisionTaskResultV1;
-        }
-      }
-    });
-    openApps.push(app);
-
-    const response = await app.inject({
-      method: "POST",
-      url: "/api/v1/decision-tasks:execute",
-      payload: {
-        contractType: "execute-decision-task-command",
-        contractVersion: "1.0",
-        executionRequestId: "exec-api-malformed-response",
-        requirementRevision: {
-          contractType: "requirement-revision",
-          contractVersion: "1.0",
-          requirementRevisionId: "req-api-malformed-response-r1",
-          decisionTaskId: "task-api-malformed-response",
-          revision: 1,
-          submittedText: "校验上游响应",
-          market: { country: "CN", currency: "CNY", locale: "zh-CN" },
-          intendedUses: ["测试"],
-          mustHaves: [],
-          niceToHaves: [],
-          mustNotHaves: [],
-          unknowns: ["budget.maxAmountMinor"]
-        }
-      }
-    });
-
-    expect(response.statusCode).toBe(503);
-    expect(response.json()).toMatchObject({
-      ok: false,
-      error: {
-        code: "DECISION_EXECUTION_STATUS_UNKNOWN",
-        category: "TRANSPORT",
-        retryMode: "SAME_EXECUTION_ONLY"
-      }
-    });
-    expect(response.json()).not.toHaveProperty("bundle");
-  });
-
-  it("normalizes an Orchestrator transport exception without creating a decision", async () => {
-    const app = buildApiApp({
-      decisionOrchestrator: {
-        async execute() {
-          throw new TypeError("connection reset");
-        }
-      }
-    });
-    openApps.push(app);
-
-    const response = await app.inject({
-      method: "POST",
-      url: "/api/v1/decision-tasks:execute",
-      payload: {
-        contractType: "execute-decision-task-command",
-        contractVersion: "1.0",
-        executionRequestId: "exec-api-transport-error",
-        requirementRevision: {
-          contractType: "requirement-revision",
-          contractVersion: "1.0",
-          requirementRevisionId: "req-api-transport-error-r1",
-          decisionTaskId: "task-api-transport-error",
-          revision: 1,
-          submittedText: "验证传输异常",
-          market: { country: "CN", currency: "CNY", locale: "zh-CN" },
-          intendedUses: ["测试"],
-          mustHaves: [],
-          niceToHaves: [],
-          mustNotHaves: [],
-          unknowns: ["budget.maxAmountMinor"]
-        }
-      }
-    });
-
-    expect(response.statusCode).toBe(503);
-    expect(response.json()).toMatchObject({
-      ok: false,
-      error: {
-        code: "DECISION_EXECUTION_STATUS_UNKNOWN",
-        retryMode: "SAME_EXECUTION_ONLY"
-      }
-    });
-    expect(response.json()).not.toHaveProperty("taskStatus");
-  });
-
-  it("normalizes an exception while reading the Orchestrator result", async () => {
-    const app = buildApiApp({
-      decisionOrchestrator: {
-        async execute() {
-          return Object.defineProperties(
-            {},
-            {
-              contractType: { value: "decision-task-result", enumerable: true },
-              contractVersion: {
-                enumerable: true,
-                get() {
-                  throw new Error("Orchestrator getter leaked");
-                }
-              }
-            }
-          ) as DecisionTaskResultV1;
-        }
-      }
-    });
-    openApps.push(app);
-
-    const response = await app.inject({
-      method: "POST",
-      url: "/api/v1/decision-tasks:execute",
-      payload: {
-        contractType: "execute-decision-task-command",
-        contractVersion: "1.0",
-        executionRequestId: "exec-api-throwing-result",
-        requirementRevision: {
-          contractType: "requirement-revision",
-          contractVersion: "1.0",
-          requirementRevisionId: "req-api-throwing-result-r1",
-          decisionTaskId: "task-api-throwing-result",
-          revision: 1,
-          submittedText: "校验上游结果读取异常",
-          market: { country: "CN", currency: "CNY", locale: "zh-CN" },
-          intendedUses: ["测试"],
-          mustHaves: [],
-          niceToHaves: [],
-          mustNotHaves: [],
-          unknowns: ["budget.maxAmountMinor"]
-        }
-      }
-    });
-
-    expect(response.statusCode).toBe(503);
-    expect(response.json()).toMatchObject({
-      ok: false,
-      error: {
-        code: "DECISION_EXECUTION_STATUS_UNKNOWN",
-        category: "TRANSPORT",
-        retryMode: "SAME_EXECUTION_ONLY"
-      }
-    });
-    expect(response.body).not.toContain("Orchestrator getter leaked");
-  });
-
-  it("returns 503 when the Orchestrator reports an unknown execution status", async () => {
-    const app = buildApiApp({
-      decisionOrchestrator: {
-        async execute() {
-          return {
-            contractType: "decision-task-result",
-            contractVersion: "1.0",
-            ok: false,
-            error: {
-              contractType: "choice-mind-error",
-              contractVersion: "1.0",
-              errorId: "error-api-status-unknown",
-              code: "DECISION_EXECUTION_STATUS_UNKNOWN",
-              category: "TRANSPORT",
-              message: "本次执行状态暂时无法确认",
-              retryMode: "SAME_EXECUTION_ONLY",
-              issues: [],
-              occurredAt: "2026-08-13T08:00:00.000Z"
-            }
+            executionRequestId: "exec-api-get",
+            decisionTaskId,
+            agentRunId: "agent-run-api-get",
+            state: "ACCEPTED",
+            terminal: false,
+            updatedAt: "2026-08-23T20:21:00.000Z"
           };
         }
       }
@@ -487,41 +499,212 @@ describe("POST /api/v1/decision-tasks:execute", () => {
     openApps.push(app);
 
     const response = await app.inject({
-      method: "POST",
-      url: "/api/v1/decision-tasks:execute",
-      payload: {
-        contractType: "execute-decision-task-command",
-        contractVersion: "1.0",
-        executionRequestId: "exec-api-status-unknown",
-        requirementRevision: {
-          contractType: "requirement-revision",
-          contractVersion: "1.0",
-          requirementRevisionId: "req-api-status-unknown-r1",
-          decisionTaskId: "task-api-status-unknown",
-          revision: 1,
-          submittedText: "验证状态未知响应",
-          market: { country: "CN", currency: "CNY", locale: "zh-CN" },
-          intendedUses: ["测试"],
-          mustHaves: [],
-          niceToHaves: [],
-          mustNotHaves: [],
-          unknowns: ["budget.maxAmountMinor"]
+      method: "GET",
+      url: "/api/v1/decision-tasks/task-api-get"
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({
+      contractType: "decision-task-snapshot",
+      contractVersion: "1.0",
+      executionRequestId: "exec-api-get",
+      decisionTaskId: "task-api-get",
+      agentRunId: "agent-run-api-get",
+      state: "ACCEPTED",
+      terminal: false,
+      updatedAt: "2026-08-23T20:21:00.000Z"
+    });
+  });
+
+  it.each([
+    {
+      contractType: "decision-task-snapshot",
+      contractVersion: "1.0",
+      executionRequestId: "exec-api-failed-retryable",
+      decisionTaskId: "task-api-failed-retryable",
+      agentRunId: "agent-run-api-failed-retryable",
+      state: "FAILED_RETRYABLE",
+      terminal: false,
+      updatedAt: "2026-08-23T21:35:00.000Z"
+    },
+    {
+      contractType: "decision-task-snapshot",
+      contractVersion: "1.0",
+      executionRequestId: "exec-api-failed-final",
+      decisionTaskId: "task-api-failed-final",
+      agentRunId: "agent-run-api-failed-final",
+      state: "FAILED_FINAL",
+      terminal: true,
+      updatedAt: "2026-08-23T21:35:00.000Z"
+    },
+    {
+      contractType: "decision-task-snapshot",
+      contractVersion: "1.0",
+      executionRequestId: "exec-api-partial",
+      decisionTaskId: "task-api-partial",
+      agentRunId: "agent-run-api-partial",
+      state: "PARTIAL",
+      terminal: false,
+      updatedAt: "2026-08-23T21:35:00.000Z"
+    }
+  ] satisfies readonly DecisionTaskSnapshotV1[])(
+    "returns the public $state task state",
+    async (snapshot) => {
+    const app = buildApiApp({
+      decisionTaskPersistence: {
+        async submit() {
+          throw new Error("本测试不应提交任务");
+        },
+        async get() {
+          return snapshot;
         }
       }
+    });
+    openApps.push(app);
+
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/v1/decision-tasks/${snapshot.decisionTaskId}`
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual(snapshot);
+    expect(response.body).not.toContain('"ok":true');
+    }
+  );
+
+  it("returns a persisted terminal task result", async () => {
+    const app = buildApiApp({
+      decisionTaskPersistence: {
+        async submit() {
+          throw new Error("本测试不应提交任务");
+        },
+        async get(decisionTaskId) {
+          return buildPersistedFailureResult(decisionTaskId);
+        }
+      }
+    });
+    openApps.push(app);
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/v1/decision-tasks/task-api-failed"
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual(buildPersistedFailureResult("task-api-failed"));
+  });
+
+  it("returns a versioned 404 when the task does not exist", async () => {
+    const app = buildApiApp({
+      decisionTaskPersistence: {
+        async submit() {
+          throw new Error("本测试不应提交任务");
+        },
+        async get() {
+          return undefined;
+        }
+      },
+      now: () => new Date("2026-08-23T20:23:00.000Z")
+    });
+    openApps.push(app);
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/v1/decision-tasks/task-api-missing"
+    });
+
+    expect(response.statusCode).toBe(404);
+    expect(response.json()).toMatchObject({
+      ok: false,
+      error: {
+        code: "DECISION_TASK_NOT_FOUND",
+        category: "RESOURCE",
+        retryMode: "NONE",
+        occurredAt: "2026-08-23T20:23:00.000Z"
+      }
+    });
+  });
+
+  it("returns a versioned storage failure when the persisted task cannot be read", async () => {
+    const app = buildApiApp({
+      decisionTaskPersistence: {
+        async submit() {
+          throw new Error("本测试不应提交任务");
+        },
+        async get() {
+          throw Object.assign(new Error("private database timeout"), {
+            code: "PERSISTENCE_UNAVAILABLE"
+          });
+        }
+      },
+      now: () => new Date("2026-08-23T20:28:00.000Z")
+    });
+    openApps.push(app);
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/v1/decision-tasks/task-api-storage-failure"
     });
 
     expect(response.statusCode).toBe(503);
     expect(response.json()).toMatchObject({
       ok: false,
       error: {
-        code: "DECISION_EXECUTION_STATUS_UNKNOWN",
-        category: "TRANSPORT",
-        retryMode: "SAME_EXECUTION_ONLY"
+        code: "PERSISTENCE_UNAVAILABLE",
+        category: "STORAGE",
+        retryMode: "SAME_EXECUTION_ONLY",
+        occurredAt: "2026-08-23T20:28:00.000Z"
       }
     });
-    expect(response.json()).not.toHaveProperty("taskStatus");
+    expect(response.body).not.toContain("private database timeout");
   });
 });
+
+function buildPersistedFailureResult(decisionTaskId: string) {
+  return {
+    contractType: "decision-task-result" as const,
+    contractVersion: "1.0" as const,
+    ok: false as const,
+    taskStatus: {
+      contractType: "decision-task-status" as const,
+      contractVersion: "1.0" as const,
+      decisionTaskId,
+      agentRunId: "agent-run-api-failed",
+      state: "FAILED" as const,
+      terminal: true as const,
+      latestEventSequence: 1,
+      errorId: "error-api-persisted-runtime",
+      updatedAt: "2026-08-23T20:40:00.000Z"
+    },
+    runEvents: [
+      {
+        contractType: "run-event" as const,
+        contractVersion: "1.0" as const,
+        eventId: "event-api-persisted-runtime",
+        decisionTaskId,
+        agentRunId: "agent-run-api-failed",
+        sequence: 1,
+        occurredAt: "2026-08-23T20:40:00.000Z",
+        eventType: "RUNTIME_FAILED" as const,
+        taskState: "FAILED" as const,
+        summary: "合成 Runtime 执行失败",
+        synthetic: true as const
+      }
+    ],
+    error: {
+      contractType: "choice-mind-error" as const,
+      contractVersion: "1.0" as const,
+      errorId: "error-api-persisted-runtime",
+      code: "AGENT_RUNTIME_FAILED" as const,
+      category: "RUNTIME" as const,
+      message: "决策任务失败",
+      retryMode: "NEW_EXECUTION_ALLOWED" as const,
+      issues: [],
+      occurredAt: "2026-08-23T20:40:00.000Z"
+    }
+  };
+}
 
 async function listenToHealthApp(service: "web" | "orchestrator" | "data-worker") {
   const app = buildTestHealthApp(service);

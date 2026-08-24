@@ -21,7 +21,10 @@ const errorSemanticsByCode = {
   DECISION_EXECUTION_STATUS_UNKNOWN: {
     category: "TRANSPORT",
     retryMode: "SAME_EXECUTION_ONLY"
-  }
+  },
+  DECISION_TASK_NOT_FOUND: { category: "RESOURCE", retryMode: "NONE" },
+  IDEMPOTENCY_CONFLICT: { category: "VALIDATION", retryMode: "NONE" },
+  PERSISTENCE_UNAVAILABLE: { category: "STORAGE", retryMode: "SAME_EXECUTION_ONLY" }
 } as const;
 
 export function checkDecisionTaskResultInvariants(

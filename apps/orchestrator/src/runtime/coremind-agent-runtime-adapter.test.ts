@@ -6,8 +6,6 @@ import path from "node:path";
 import { CoreMindRuntime } from "coremind-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { buildApiApp } from "../../../api/src/app.js";
-import { createHttpDecisionOrchestratorAdapter } from "../../../api/src/decision-tasks/http-orchestrator-adapter.js";
 import { buildOrchestratorApp } from "../app.js";
 import { createDecisionTaskExecutor } from "../decision-tasks/executor.js";
 import type { ExecuteDecisionTaskCommandV1 } from "@choicemind/contracts/decision/v1";
@@ -37,12 +35,6 @@ type OfflineProviderScenario =
 const openProviders: Array<OfflineProvider> = [];
 const openApps: Array<ReturnType<typeof buildOrchestratorApp>> = [];
 const temporaryDirectories: string[] = [];
-const originalChoiceMindApiUrl = process.env.CHOICEMIND_API_URL;
-const webDecisionRouteModule = new URL(
-  "../../../web/src/app/api/decision-tasks/execute/route.ts",
-  import.meta.url
-).href;
-
 afterEach(async () => {
   vi.restoreAllMocks();
   await Promise.all(openApps.splice(0).map((app) => app.close()));
@@ -50,11 +42,6 @@ afterEach(async () => {
   await Promise.all(
     temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true }))
   );
-  if (originalChoiceMindApiUrl === undefined) {
-    delete process.env.CHOICEMIND_API_URL;
-  } else {
-    process.env.CHOICEMIND_API_URL = originalChoiceMindApiUrl;
-  }
 });
 
 describe("CoreMind AgentRuntimeRunPort", () => {
@@ -239,7 +226,7 @@ describe("CoreMind AgentRuntimeRunPort", () => {
     expect(createOptions?.env?.CHOICEMIND_COREMIND_PROVIDER_API_KEY).toBe("choice-key");
   });
 
-  it("Gate E: serves BUY_IF_PRICE and NEED_MORE_INFO through the Web, API and Orchestrator HTTP seams", async () => {
+  it("Gate E: serves BUY_IF_PRICE and NEED_MORE_INFO through the Orchestrator HTTP seam", async () => {
     const provider = await startOfflineProvider();
     const configDir = await createTemporaryDirectory();
     const orchestratorApp = buildOrchestratorApp({
@@ -258,33 +245,26 @@ describe("CoreMind AgentRuntimeRunPort", () => {
       })
     });
     openApps.push(orchestratorApp);
-    const orchestratorUrl = await orchestratorApp.listen({ host: "127.0.0.1", port: 0 });
-    const apiApp = buildApiApp({
-      decisionOrchestrator: createHttpDecisionOrchestratorAdapter({
-        baseUrl: orchestratorUrl
-      })
+
+    const buyResponse = await orchestratorApp.inject({
+      method: "POST",
+      url: "/internal/v1/decision-tasks:execute",
+      payload: buildCoreMindCommand("coremind-http-buy-if-price")
     });
-    openApps.push(apiApp);
-    process.env.CHOICEMIND_API_URL = await apiApp.listen({ host: "127.0.0.1", port: 0 });
-    const { POST: executeDecisionTaskViaWeb } = (await import(webDecisionRouteModule)) as {
-      POST: (request: Request) => Promise<Response>;
-    };
+    const gapResponse = await orchestratorApp.inject({
+      method: "POST",
+      url: "/internal/v1/decision-tasks:execute",
+      payload: buildCoreMindCommand("coremind-http-needs-budget", false)
+    });
 
-    const buyResponse = await executeDecisionTaskViaWeb(
-      createWebDecisionRequest(buildCoreMindCommand("coremind-http-buy-if-price"))
-    );
-    const gapResponse = await executeDecisionTaskViaWeb(
-      createWebDecisionRequest(buildCoreMindCommand("coremind-http-needs-budget", false))
-    );
-
-    expect(buyResponse.status).toBe(200);
-    expect(await buyResponse.json()).toMatchObject({
+    expect(buyResponse.statusCode).toBe(200);
+    expect(buyResponse.json()).toMatchObject({
       ok: true,
       taskStatus: { state: "COMPLETED" },
       bundle: { decision: { status: "BUY_IF_PRICE" } }
     });
-    expect(gapResponse.status).toBe(200);
-    expect(await gapResponse.json()).toMatchObject({
+    expect(gapResponse.statusCode).toBe(200);
+    expect(gapResponse.json()).toMatchObject({
       ok: true,
       taskStatus: { state: "COMPLETED" },
       bundle: {
@@ -296,7 +276,7 @@ describe("CoreMind AgentRuntimeRunPort", () => {
     });
   });
 
-  it("Gate E: returns a framework-neutral Runtime failure through the Web, API and Orchestrator HTTP seams", async () => {
+  it("Gate E: returns a framework-neutral Runtime failure through the Orchestrator HTTP seam", async () => {
     const provider = await startOfflineProvider("provider-error");
     const configDir = await createTemporaryDirectory();
     const orchestratorApp = buildOrchestratorApp({
@@ -309,36 +289,19 @@ describe("CoreMind AgentRuntimeRunPort", () => {
       })
     });
     openApps.push(orchestratorApp);
-    const orchestratorUrl = await orchestratorApp.listen({ host: "127.0.0.1", port: 0 });
-    const apiApp = buildApiApp({
-      decisionOrchestrator: createHttpDecisionOrchestratorAdapter({
-        baseUrl: orchestratorUrl
-      })
+
+    const response = await orchestratorApp.inject({
+      method: "POST",
+      url: "/internal/v1/decision-tasks:execute",
+      payload: buildCoreMindCommand("coremind-http-runtime-failure")
     });
-    openApps.push(apiApp);
-    process.env.CHOICEMIND_API_URL = await apiApp.listen({ host: "127.0.0.1", port: 0 });
-    const { POST: executeDecisionTaskViaWeb } = (await import(webDecisionRouteModule)) as {
-      POST: (request: Request) => Promise<Response>;
-    };
+    const body = response.json();
 
-    const response = await executeDecisionTaskViaWeb(
-      createWebDecisionRequest(buildCoreMindCommand("coremind-http-runtime-failure"))
-    );
-    const body = await response.json();
-
-    expect(response.status).toBe(502);
+    expect(response.statusCode).toBe(502);
     expectRuntimeFailure(body);
     expect(JSON.stringify(body)).not.toContain("provider-private-sentinel");
   });
 });
-
-function createWebDecisionRequest(command: ExecuteDecisionTaskCommandV1): Request {
-  return new Request("http://127.0.0.1/api/decision-tasks/execute", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(command)
-  });
-}
 
 async function startOfflineProvider(
   scenario: OfflineProviderScenario = "success"

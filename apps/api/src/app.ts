@@ -4,7 +4,7 @@ import {
   getDecisionTaskResultHttpStatusV1
 } from "@choicemind/contracts/decision/v1";
 
-import type { DecisionOrchestratorPort } from "./decision-tasks/orchestrator-port.js";
+import type { DecisionTaskPersistencePort } from "./decision-tasks/persistence-port.js";
 import { registerDecisionTaskRoutes } from "./decision-tasks/routes.js";
 
 type DependencyService = "web" | "orchestrator" | "data-worker";
@@ -17,7 +17,7 @@ type ComponentHealth = {
 };
 
 type ApiAppOptions = {
-  decisionOrchestrator?: DecisionOrchestratorPort;
+  decisionTaskPersistence?: DecisionTaskPersistencePort;
   healthUrls?: Record<DependencyService, string>;
   now?: () => Date;
   probe?: (service: DependencyService) => Promise<ComponentHealth>;
@@ -113,7 +113,11 @@ export function buildApiApp(options: ApiAppOptions = {}) {
     });
   });
 
-  registerDecisionTaskRoutes(app, options.decisionOrchestrator);
+  registerDecisionTaskRoutes(
+    app,
+    options.decisionTaskPersistence,
+    options.now ?? (() => new Date())
+  );
 
   return app;
 }

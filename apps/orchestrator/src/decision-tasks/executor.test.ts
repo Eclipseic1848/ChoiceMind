@@ -1272,6 +1272,64 @@ describe("DecisionTaskExecutor.execute", () => {
   });
 });
 
+describe("DecisionTaskExecutor.executePersistent", () => {
+  it.each([
+    ["FAILED_RETRYABLE", "上游暂时不可用，允许重试同一执行"],
+    ["FAILED_FINAL", "输入无法形成安全执行"],
+    ["PARTIAL", "已形成部分材料，但尚无完整 Decision"]
+  ] as const)("preserves an explicit %s Runtime outcome", async (state, summary) => {
+    const sourceRuntime = createFakeAgentRuntimeAdapter();
+    const executor = createDecisionTaskExecutor({
+      runtime: {
+        run: (command) => sourceRuntime.run(command),
+        async runPersistent() {
+          return { state, summary };
+        }
+      }
+    });
+    const command = buildRuntimeBoundaryCommand(`persistent-${state.toLowerCase()}`);
+
+    await expect(
+      executor.executePersistent(command, {
+        agentRunId: `agent-run-persistent-${state.toLowerCase()}`
+      })
+    ).resolves.toEqual({ state, summary });
+  });
+
+  it("重新调用 Runtime 处理同一执行的可重试失败", async () => {
+    const sourceRuntime = createFakeAgentRuntimeAdapter();
+    let runtimeCalls = 0;
+    const executor = createDecisionTaskExecutor({
+      runtime: {
+        run: (command) => sourceRuntime.run(command),
+        async runPersistent() {
+          runtimeCalls += 1;
+
+          return runtimeCalls === 1
+            ? {
+                state: "FAILED_RETRYABLE",
+                summary: "上游暂时不可用，允许重试同一执行"
+              }
+            : {
+                state: "FAILED_FINAL",
+                summary: "重试后确认无法完成"
+              };
+        }
+      }
+    });
+    const command = buildRuntimeBoundaryCommand("persistent-retry");
+    const context = { agentRunId: "agent-run-persistent-retry" };
+
+    await expect(executor.executePersistent(command, context)).resolves.toMatchObject({
+      state: "FAILED_RETRYABLE"
+    });
+    await expect(executor.executePersistent(command, context)).resolves.toMatchObject({
+      state: "FAILED_FINAL"
+    });
+    expect(runtimeCalls).toBe(2);
+  });
+});
+
 function buildRuntimeBoundaryCommand(suffix: string) {
   return {
     contractType: "execute-decision-task-command" as const,

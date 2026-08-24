@@ -7,11 +7,13 @@
     "build": "tsc --project tsconfig.build.json",
     "dev": "tsx watch src/server.ts",
     "start": "node dist/server.js",
+    "start:publisher": "node dist/outbox-publisher.js",
     "test": "vitest run",
     "typecheck": "tsc --project tsconfig.json"
   },
   "dependencies": {
     "@choicemind/contracts": "workspace:*",
+    "@choicemind/task-persistence": "workspace:*",
     "fastify": "5.11.3"
   }
 }
