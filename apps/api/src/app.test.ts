@@ -158,6 +158,9 @@ describe("POST /api/v1/decision-tasks:execute", () => {
         },
         async get() {
           return undefined;
+        },
+        async listEvents() {
+          return [];
         }
       }
     });
@@ -210,6 +213,9 @@ describe("POST /api/v1/decision-tasks:execute", () => {
         },
         async get() {
           return undefined;
+        },
+        async listEvents() {
+          return [];
         }
       },
       now: () => new Date("2026-08-23T20:25:00.000Z")
@@ -263,6 +269,9 @@ describe("POST /api/v1/decision-tasks:execute", () => {
         },
         async get() {
           return undefined;
+        },
+        async listEvents() {
+          return [];
         }
       },
       now: () => new Date("2026-08-23T20:27:00.000Z")
@@ -493,6 +502,9 @@ describe("GET /api/v1/decision-tasks/:decisionTaskId", () => {
             terminal: false,
             updatedAt: "2026-08-23T20:21:00.000Z"
           };
+        },
+        async listEvents() {
+          return [];
         }
       }
     });
@@ -557,6 +569,9 @@ describe("GET /api/v1/decision-tasks/:decisionTaskId", () => {
         },
         async get() {
           return snapshot;
+        },
+        async listEvents() {
+          return [];
         }
       }
     });
@@ -581,6 +596,9 @@ describe("GET /api/v1/decision-tasks/:decisionTaskId", () => {
         },
         async get(decisionTaskId) {
           return buildPersistedFailureResult(decisionTaskId);
+        },
+        async listEvents() {
+          return [];
         }
       }
     });
@@ -603,6 +621,9 @@ describe("GET /api/v1/decision-tasks/:decisionTaskId", () => {
         },
         async get() {
           return undefined;
+        },
+        async listEvents() {
+          return [];
         }
       },
       now: () => new Date("2026-08-23T20:23:00.000Z")
@@ -636,6 +657,9 @@ describe("GET /api/v1/decision-tasks/:decisionTaskId", () => {
           throw Object.assign(new Error("private database timeout"), {
             code: "PERSISTENCE_UNAVAILABLE"
           });
+        },
+        async listEvents() {
+          return [];
         }
       },
       now: () => new Date("2026-08-23T20:28:00.000Z")
@@ -658,6 +682,379 @@ describe("GET /api/v1/decision-tasks/:decisionTaskId", () => {
       }
     });
     expect(response.body).not.toContain("private database timeout");
+  });
+});
+
+describe("GET /api/v1/decision-tasks/:decisionTaskId/events", () => {
+  it("replays persisted events as SSE records with the cursor as id", async () => {
+    const persistedEvent = {
+      contractType: "persisted-run-event" as const,
+      contractVersion: "1.0" as const,
+      cursor: "42",
+      event: {
+        contractType: "run-event" as const,
+        contractVersion: "1.0" as const,
+        eventId: "event-api-replay-1",
+        decisionTaskId: "task-api-replay",
+        agentRunId: "agent-run-api-replay",
+        sequence: 1,
+        occurredAt: "2026-08-24T01:40:00.000Z",
+        eventType: "TASK_STATE_CHANGED" as const,
+        taskState: "CREATED" as const,
+        summary: "决策任务已接受",
+        synthetic: true as const
+      }
+    };
+    const app = buildApiApp({
+      decisionTaskPersistence: {
+        async submit() {
+          throw new Error("本测试不应提交任务");
+        },
+        async get(decisionTaskId) {
+          return {
+            contractType: "decision-task-snapshot",
+            contractVersion: "1.0",
+            executionRequestId: "exec-api-replay",
+            decisionTaskId,
+            agentRunId: "agent-run-api-replay",
+            state: "ACCEPTED",
+            terminal: false,
+            updatedAt: "2026-08-24T01:40:00.000Z"
+          };
+        },
+        async listEvents() {
+          return [persistedEvent];
+        }
+      }
+    });
+    openApps.push(app);
+    const origin = await app.listen({ host: "127.0.0.1", port: 0 });
+    const controller = new AbortController();
+
+    try {
+      const response = await fetch(`${origin}/api/v1/decision-tasks/task-api-replay/events`, {
+        signal: controller.signal
+      });
+      const reader = response.body?.getReader();
+
+      expect(response.status).toBe(200);
+      expect(response.headers.get("content-type")).toContain("text/event-stream");
+      expect(reader).toBeDefined();
+      const chunk = await reader?.read();
+      const body = new TextDecoder().decode(chunk?.value);
+
+      expect(body).toContain(`id: 42\ndata: ${JSON.stringify(persistedEvent)}\n\n`);
+      await reader?.cancel();
+    } finally {
+      controller.abort();
+    }
+  });
+
+  it("continues replay strictly after Last-Event-ID", async () => {
+    let receivedCursor: string | undefined;
+    const persistedEvent = {
+      contractType: "persisted-run-event" as const,
+      contractVersion: "1.0" as const,
+      cursor: "43",
+      event: {
+        contractType: "run-event" as const,
+        contractVersion: "1.0" as const,
+        eventId: "event-api-replay-2",
+        decisionTaskId: "task-api-reconnect",
+        agentRunId: "agent-run-api-reconnect",
+        sequence: 2,
+        occurredAt: "2026-08-24T01:41:00.000Z",
+        eventType: "TASK_STATE_CHANGED" as const,
+        taskState: "UNDERSTANDING" as const,
+        summary: "决策任务开始执行",
+        synthetic: true as const
+      }
+    };
+    const app = buildApiApp({
+      decisionTaskPersistence: {
+        async submit() {
+          throw new Error("本测试不应提交任务");
+        },
+        async get(decisionTaskId) {
+          return {
+            contractType: "decision-task-snapshot",
+            contractVersion: "1.0",
+            executionRequestId: "exec-api-reconnect",
+            decisionTaskId,
+            agentRunId: "agent-run-api-reconnect",
+            state: "RUNNING",
+            terminal: false,
+            updatedAt: "2026-08-24T01:41:00.000Z"
+          };
+        },
+        async listEvents(_decisionTaskId, afterCursor) {
+          receivedCursor = afterCursor;
+          return [persistedEvent];
+        }
+      }
+    });
+    openApps.push(app);
+    const origin = await app.listen({ host: "127.0.0.1", port: 0 });
+    const controller = new AbortController();
+
+    try {
+      const response = await fetch(`${origin}/api/v1/decision-tasks/task-api-reconnect/events`, {
+        headers: { "Last-Event-ID": "42" },
+        signal: controller.signal
+      });
+      const reader = response.body?.getReader();
+      const chunk = await reader?.read();
+
+      expect(response.status).toBe(200);
+      expect(receivedCursor).toBe("42");
+      expect(new TextDecoder().decode(chunk?.value)).toContain("id: 43\n");
+      await reader?.cancel();
+    } finally {
+      controller.abort();
+    }
+  });
+
+  it("rejects an invalid Last-Event-ID before querying event storage", async () => {
+    let eventQueries = 0;
+    const app = buildApiApp({
+      decisionTaskPersistence: {
+        async submit() {
+          throw new Error("本测试不应提交任务");
+        },
+        async get(decisionTaskId) {
+          return {
+            contractType: "decision-task-snapshot",
+            contractVersion: "1.0",
+            executionRequestId: "exec-api-invalid-cursor",
+            decisionTaskId,
+            agentRunId: "agent-run-api-invalid-cursor",
+            state: "RUNNING",
+            terminal: false,
+            updatedAt: "2026-08-24T01:42:00.000Z"
+          };
+        },
+        async listEvents() {
+          eventQueries += 1;
+          throw new Error("非法 cursor 不应访问事件存储");
+        }
+      },
+      now: () => new Date("2026-08-24T01:42:00.000Z")
+    });
+    openApps.push(app);
+
+    const response = await app.inject({
+      headers: { "last-event-id": "-1" },
+      method: "GET",
+      url: "/api/v1/decision-tasks/task-api-invalid-cursor/events"
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(eventQueries).toBe(0);
+    expect(response.json()).toMatchObject({
+      ok: false,
+      error: {
+        code: "CONTRACT_INVALID",
+        issues: [{ path: "Last-Event-ID" }],
+        occurredAt: "2026-08-24T01:42:00.000Z"
+      }
+    });
+  });
+
+  it("requeries Postgres after a Redis notification wakes the stream", async () => {
+    let eventQueries = 0;
+    let notificationWaits = 0;
+    let wake: (() => void) | undefined;
+    let markWaitStarted: (() => void) | undefined;
+    const waitStarted = new Promise<void>((resolve) => {
+      markWaitStarted = resolve;
+    });
+    const persistedEvent = {
+      contractType: "persisted-run-event" as const,
+      contractVersion: "1.0" as const,
+      cursor: "44",
+      event: {
+        contractType: "run-event" as const,
+        contractVersion: "1.0" as const,
+        eventId: "event-api-notified-1",
+        decisionTaskId: "task-api-notified",
+        agentRunId: "agent-run-api-notified",
+        sequence: 1,
+        occurredAt: "2026-08-24T01:43:00.000Z",
+        eventType: "TASK_STATE_CHANGED" as const,
+        taskState: "CREATED" as const,
+        summary: "决策任务已接受",
+        synthetic: true as const
+      }
+    };
+    const app = buildApiApp({
+      decisionTaskEventNotifications: {
+        async waitFor() {
+          notificationWaits += 1;
+          markWaitStarted?.();
+          await new Promise<void>((resolve) => {
+            wake = resolve;
+          });
+        }
+      },
+      decisionTaskPersistence: {
+        async submit() {
+          throw new Error("本测试不应提交任务");
+        },
+        async get(decisionTaskId) {
+          return {
+            contractType: "decision-task-snapshot",
+            contractVersion: "1.0",
+            executionRequestId: "exec-api-notified",
+            decisionTaskId,
+            agentRunId: "agent-run-api-notified",
+            state: "RUNNING",
+            terminal: false,
+            updatedAt: "2026-08-24T01:43:00.000Z"
+          };
+        },
+        async listEvents() {
+          eventQueries += 1;
+          return eventQueries === 1 ? [] : [persistedEvent];
+        }
+      }
+    });
+    openApps.push(app);
+    const origin = await app.listen({ host: "127.0.0.1", port: 0 });
+    const controller = new AbortController();
+
+    try {
+      const response = await fetch(`${origin}/api/v1/decision-tasks/task-api-notified/events`, {
+        signal: controller.signal
+      });
+      const reader = response.body?.getReader();
+      await waitStarted;
+      wake?.();
+      const chunk = await reader?.read();
+
+      expect(response.status).toBe(200);
+      expect(notificationWaits).toBeGreaterThanOrEqual(1);
+      expect(eventQueries).toBe(2);
+      expect(new TextDecoder().decode(chunk?.value)).toContain("id: 44\n");
+      await reader?.cancel();
+    } finally {
+      controller.abort();
+    }
+  });
+
+  it("falls back to Postgres polling when Redis notification waiting fails", async () => {
+    let eventQueries = 0;
+    const persistedEvent = {
+      contractType: "persisted-run-event" as const,
+      contractVersion: "1.0" as const,
+      cursor: "45",
+      event: {
+        contractType: "run-event" as const,
+        contractVersion: "1.0" as const,
+        eventId: "event-api-poll-fallback-1",
+        decisionTaskId: "task-api-poll-fallback",
+        agentRunId: "agent-run-api-poll-fallback",
+        sequence: 1,
+        occurredAt: "2026-08-24T01:44:00.000Z",
+        eventType: "TASK_STATE_CHANGED" as const,
+        taskState: "CREATED" as const,
+        summary: "从 Postgres 补查恢复",
+        synthetic: true as const
+      }
+    };
+    const app = buildApiApp({
+      decisionTaskEventNotifications: {
+        async waitFor() {
+          throw new Error("Redis unavailable");
+        }
+      },
+      decisionTaskEventPollIntervalMs: 10,
+      decisionTaskPersistence: {
+        async submit() {
+          throw new Error("本测试不应提交任务");
+        },
+        async get(decisionTaskId) {
+          return {
+            contractType: "decision-task-snapshot",
+            contractVersion: "1.0",
+            executionRequestId: "exec-api-poll-fallback",
+            decisionTaskId,
+            agentRunId: "agent-run-api-poll-fallback",
+            state: "RUNNING",
+            terminal: false,
+            updatedAt: "2026-08-24T01:44:00.000Z"
+          };
+        },
+        async listEvents() {
+          eventQueries += 1;
+          return eventQueries === 1 ? [] : [persistedEvent];
+        }
+      }
+    });
+    openApps.push(app);
+    const origin = await app.listen({ host: "127.0.0.1", port: 0 });
+    const controller = new AbortController();
+
+    try {
+      const response = await fetch(
+        `${origin}/api/v1/decision-tasks/task-api-poll-fallback/events`,
+        { signal: controller.signal }
+      );
+      const reader = response.body?.getReader();
+      const chunk = await reader?.read();
+
+      expect(response.status).toBe(200);
+      expect(eventQueries).toBe(2);
+      expect(new TextDecoder().decode(chunk?.value)).toContain("id: 45\n");
+      await reader?.cancel();
+    } finally {
+      controller.abort();
+    }
+  });
+
+  it("sends an SSE comment heartbeat without fabricating a RunEvent", async () => {
+    const app = buildApiApp({
+      decisionTaskEventPollIntervalMs: 10,
+      decisionTaskPersistence: {
+        async submit() {
+          throw new Error("本测试不应提交任务");
+        },
+        async get(decisionTaskId) {
+          return {
+            contractType: "decision-task-snapshot",
+            contractVersion: "1.0",
+            executionRequestId: "exec-api-heartbeat",
+            decisionTaskId,
+            agentRunId: "agent-run-api-heartbeat",
+            state: "RUNNING",
+            terminal: false,
+            updatedAt: "2026-08-24T01:45:00.000Z"
+          };
+        },
+        async listEvents() {
+          return [];
+        }
+      }
+    });
+    openApps.push(app);
+    const origin = await app.listen({ host: "127.0.0.1", port: 0 });
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 500);
+
+    try {
+      const response = await fetch(`${origin}/api/v1/decision-tasks/task-api-heartbeat/events`, {
+        signal: controller.signal
+      });
+      const reader = response.body?.getReader();
+      const chunk = await reader?.read();
+      const body = new TextDecoder().decode(chunk?.value);
+
+      expect(body).toContain(": heartbeat\n\n");
+      expect(body).not.toContain("data:");
+      await reader?.cancel();
+    } finally {
+      clearTimeout(timeout);
+      controller.abort();
+    }
   });
 });
 

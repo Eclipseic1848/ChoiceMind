@@ -14,7 +14,11 @@ export async function resetPersistentDecisionTaskTestData(databaseUrl: string): 
     );
     await client.query("DROP FUNCTION IF EXISTS test_reject_outbox_published_mark()");
     await client.query(
-      "TRUNCATE outbox_messages, agent_run_operations, decision_task_submissions"
+      "DROP TRIGGER IF EXISTS test_reject_run_event_notification_insert ON decision_task_run_event_notifications"
+    );
+    await client.query("DROP FUNCTION IF EXISTS test_reject_run_event_notification_insert()");
+    await client.query(
+      "TRUNCATE decision_task_run_event_notifications, decision_task_run_events, decision_task_agent_runs, outbox_messages, agent_run_operations, decision_task_submissions"
     );
   } finally {
     await client.end();

@@ -3,15 +3,28 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   decodeDecisionTaskResultV1,
   decodeExecuteDecisionTaskCommandV1,
+  decodePersistedRunEventV1,
   type DecisionTaskResultV1,
   type DecisionTaskSnapshotV1,
-  type ExecuteDecisionTaskCommandV1
+  type DecisionTaskStateV1,
+  type ExecuteDecisionTaskCommandV1,
+  type PersistedRunEventV1,
+  type RunEventV1
 } from "@choicemind/contracts/decision/v1";
 import { createClient } from "@redis/client";
 import { Pool, type PoolClient } from "pg";
 
 import { migratePersistentDecisionTasks } from "./migration.js";
 
+export {
+  openRunEventNotificationPublisher,
+  type RunEventNotificationPublisher,
+  type RunEventNotificationPublisherBatchResult
+} from "./event-publisher.js";
+export {
+  openRunEventNotificationSubscriber,
+  type RunEventNotificationSubscriber
+} from "./event-subscriber.js";
 export {
   openOutboxPublisher,
   type OutboxPublisher,
@@ -41,6 +54,7 @@ export type PersistentDecisionTaskModule = Readonly<{
   get(
     decisionTaskId: string
   ): Promise<DecisionTaskSnapshotV1 | PersistedDecisionTaskResultV1 | undefined>;
+  listEvents(decisionTaskId: string, afterCursor?: string): Promise<readonly PersistedRunEventV1[]>;
   claimNext(
     operationId: string,
     workerId: string,
@@ -138,11 +152,15 @@ type ExistingSubmissionRow = TaskRow &
 type ClaimedOperationRow = Readonly<{
   operation_id: string;
   agent_run_id: string;
+  decision_task_id: string;
+  state: TaskRow["state"];
+  lease_expires_at: Date | null;
   command_payload: unknown;
 }>;
 
-type OperationStateRow = Readonly<{
-  state: TaskRow["state"];
+type RunEventRow = Readonly<{
+  cursor: string;
+  event_payload: unknown;
 }>;
 
 export async function openPersistentDecisionTaskModule(
@@ -228,57 +246,87 @@ export async function openPersistentDecisionTaskModule(
         throw new PersistenceUnavailableError();
       }
     },
+    async listEvents(decisionTaskId, afterCursor) {
+      assertOpen(closed);
+
+      try {
+        const result = await pool.query<RunEventRow>(
+          `SELECT cursor::text, event_payload
+           FROM decision_task_run_events
+           WHERE decision_task_id = $1
+             AND ($2::bigint IS NULL OR cursor > $2::bigint)
+           ORDER BY cursor ASC`,
+          [decisionTaskId, afterCursor ?? null]
+        );
+
+        return result.rows.map((row) => {
+          const decoded = decodePersistedRunEventV1({
+            contractType: "persisted-run-event",
+            contractVersion: "1.0",
+            cursor: row.cursor,
+            event: row.event_payload
+          });
+
+          if (!decoded.ok) {
+            throw new PersistenceUnavailableError();
+          }
+
+          return decoded.value;
+        });
+      } catch (error) {
+        if (error instanceof PersistenceUnavailableError) {
+          throw error;
+        }
+
+        throw new PersistenceUnavailableError();
+      }
+    },
     async claimNext(operationId, workerId, leaseDurationMs) {
       assertOpen(closed);
       const claimedAt = now();
+      let client: PoolClient | undefined;
+      let transactionStarted = false;
 
       try {
-        const result = await pool.query<ClaimedOperationRow>(
-          `UPDATE agent_run_operations AS operation
-           SET state = 'RUNNING',
-               worker_id = $2,
-               lease_expires_at = $3,
-               updated_at = $4
-           FROM decision_task_submissions AS submission
-           WHERE operation.operation_id = $1
-             AND operation.execution_request_id = submission.execution_request_id
-             AND (
-               operation.state = 'ACCEPTED'
-               OR operation.state = 'FAILED_RETRYABLE'
-               OR (
-                 operation.state = 'RUNNING'
-                 AND operation.lease_expires_at < $4
-               )
-             )
-           RETURNING
+        client = await pool.connect();
+        await client.query("BEGIN");
+        transactionStarted = true;
+        const result = await client.query<ClaimedOperationRow>(
+          `SELECT
              operation.operation_id,
              operation.agent_run_id,
-             submission.command_payload`,
-          [
-            operationId,
-            workerId,
-            new Date(claimedAt.getTime() + leaseDurationMs),
-            claimedAt
-          ]
+             operation.decision_task_id,
+             operation.state,
+             operation.lease_expires_at,
+             submission.command_payload
+           FROM agent_run_operations AS operation
+           INNER JOIN decision_task_submissions AS submission
+             ON submission.execution_request_id = operation.execution_request_id
+           WHERE operation.operation_id = $1
+           FOR UPDATE OF operation`,
+          [operationId]
         );
         const row = result.rows[0];
 
         if (row === undefined) {
-          const stateResult = await pool.query<OperationStateRow>(
-            `SELECT state
-             FROM agent_run_operations
-             WHERE operation_id = $1`,
-            [operationId]
-          );
-          const state = stateResult.rows[0]?.state;
+          await client.query("COMMIT");
+          transactionStarted = false;
+          return { status: "UNKNOWN" };
+        }
 
-          if (state === undefined) {
-            return { status: "UNKNOWN" };
-          }
+        const claimable =
+          row.state === "ACCEPTED" ||
+          row.state === "FAILED_RETRYABLE" ||
+          (row.state === "RUNNING" &&
+            row.lease_expires_at !== null &&
+            row.lease_expires_at < claimedAt);
 
-          return state === "COMPLETED" ||
-            state === "FAILED_FINAL" ||
-            state === "PARTIAL"
+        if (!claimable) {
+          await client.query("COMMIT");
+          transactionStarted = false;
+          return row.state === "COMPLETED" ||
+            row.state === "FAILED_FINAL" ||
+            row.state === "PARTIAL"
             ? { status: "ALREADY_FINISHED" }
             : { status: "DEFERRED" };
         }
@@ -289,18 +337,97 @@ export async function openPersistentDecisionTaskModule(
           throw new PersistenceUnavailableError();
         }
 
+        let agentRunId = row.agent_run_id;
+
+        if (row.state === "FAILED_RETRYABLE") {
+          agentRunId = `agent-run-${randomUUID()}`;
+          await client.query(
+            `INSERT INTO decision_task_agent_runs (
+               agent_run_id,
+               operation_id,
+               attempt,
+               created_at
+             )
+             SELECT $1, $2, COALESCE(MAX(attempt), 0) + 1, $3
+             FROM decision_task_agent_runs
+             WHERE operation_id = $2`,
+            [agentRunId, operationId, claimedAt]
+          );
+          const createdEvent: RunEventV1 = {
+            contractType: "run-event",
+            contractVersion: "1.0",
+            eventId: `event-persistent-${randomUUID()}`,
+            decisionTaskId: row.decision_task_id,
+            agentRunId,
+            sequence: 1,
+            occurredAt: claimedAt.toISOString(),
+            eventType: "TASK_STATE_CHANGED",
+            taskState: "CREATED",
+            summary: "决策任务开始新的重试执行",
+            synthetic: true
+          };
+          await insertRunEvent(client, createdEvent, claimedAt);
+        }
+
+        await client.query(
+          `UPDATE agent_run_operations
+           SET agent_run_id = $2,
+               state = 'RUNNING',
+               worker_id = $3,
+               lease_expires_at = $4,
+               updated_at = $5
+           WHERE operation_id = $1`,
+          [
+            operationId,
+            agentRunId,
+            workerId,
+            new Date(claimedAt.getTime() + leaseDurationMs),
+            claimedAt
+          ]
+        );
+        const existingEvents = await loadRunEvents(
+          client,
+          row.decision_task_id,
+          agentRunId
+        );
+
+        if (existingEvents.at(-1)?.taskState !== "UNDERSTANDING") {
+          const runningEvent: RunEventV1 = {
+            contractType: "run-event",
+            contractVersion: "1.0",
+            eventId: `event-persistent-${randomUUID()}`,
+            decisionTaskId: row.decision_task_id,
+            agentRunId,
+            sequence: existingEvents.length + 1,
+            occurredAt: claimedAt.toISOString(),
+            eventType: "TASK_STATE_CHANGED",
+            taskState: "UNDERSTANDING",
+            summary: "决策任务开始执行",
+            synthetic: true
+          };
+          await insertRunEvent(client, runningEvent, claimedAt);
+        }
+        await client.query("COMMIT");
+        transactionStarted = false;
+
         return {
           status: "CLAIMED",
           operationId: row.operation_id,
-          agentRunId: row.agent_run_id,
+          agentRunId,
           command: decoded.value
         };
       } catch (error) {
+        if (transactionStarted && client !== undefined) {
+          await client.query("ROLLBACK");
+        }
+
         if (error instanceof PersistenceUnavailableError) {
           throw error;
         }
 
         throw new PersistenceUnavailableError();
+      } finally {
+        client?.release();
       }
     },
     async complete(operationId, workerId, outcome) {
@@ -308,9 +435,14 @@ export async function openPersistentDecisionTaskModule(
       const decodedOutcome = decodePersistentOutcome(outcome);
 
       const completedAt = now();
+      let client: PoolClient | undefined;
+      let transactionStarted = false;
 
       try {
-        const update = await pool.query<TaskRow>(
+        client = await pool.connect();
+        await client.query("BEGIN");
+        transactionStarted = true;
+        const update = await client.query<TaskRow>(
           `UPDATE agent_run_operations AS operation
            SET state = $4,
                result_payload = $5::jsonb,
@@ -345,23 +477,69 @@ export async function openPersistentDecisionTaskModule(
         const row = update.rows[0];
 
         if (row === undefined) {
+          await client.query("COMMIT");
+          transactionStarted = false;
           return { status: "NOT_COMPLETABLE" };
         }
 
-        if (row.state === "COMPLETED") {
-          return {
-            status: "COMMITTED",
-            result: decodePersistedResult(row.result_payload, row)
+        let completion: DecisionTaskCompletionResult;
+
+        if ("runEvents" in decodedOutcome.payload) {
+          const persistedResult = await persistResultRunEvents(
+            client,
+            row,
+            decodedOutcome.payload,
+            completedAt
+          );
+          await client.query(
+            `UPDATE agent_run_operations
+             SET result_payload = $2::jsonb,
+                 updated_at = $3
+             WHERE operation_id = $1`,
+            [operationId, JSON.stringify(persistedResult), persistedResult.taskStatus.updatedAt]
+          );
+          completion =
+            row.state === "COMPLETED"
+              ? { status: "COMMITTED", result: persistedResult }
+              : { status: "COMMITTED", snapshot: toTaskSnapshot(row) };
+        } else {
+          const existingEvents = await loadRunEvents(
+            client,
+            row.decision_task_id,
+            row.agent_run_id
+          );
+          const completedEvent: RunEventV1 = {
+            contractType: "run-event",
+            contractVersion: "1.0",
+            eventId: `event-persistent-${randomUUID()}`,
+            decisionTaskId: row.decision_task_id,
+            agentRunId: row.agent_run_id,
+            sequence: existingEvents.length + 1,
+            occurredAt: completedAt.toISOString(),
+            eventType: row.state === "COMPLETED" ? "RUNTIME_SUCCEEDED" : "RUNTIME_FAILED",
+            taskState: row.state === "COMPLETED" ? "COMPLETED" : "FAILED",
+            summary: getPublicOutcomeSummary(row.state),
+            synthetic: true
           };
+          await insertRunEvent(client, completedEvent, completedAt);
+          completion = { status: "COMMITTED", snapshot: toTaskSnapshot(row) };
         }
 
-        return { status: "COMMITTED", snapshot: toTaskSnapshot(row) };
+        await client.query("COMMIT");
+        transactionStarted = false;
+        return completion;
       } catch (error) {
+        if (transactionStarted && client !== undefined) {
+          await client.query("ROLLBACK");
+        }
+
         if (error instanceof PersistenceUnavailableError) {
           throw error;
         }
 
         throw new PersistenceUnavailableError();
+      } finally {
+        client?.release();
       }
     },
     async close() {
@@ -511,6 +689,19 @@ async function submitInTransaction(
   const agentRunId = `agent-run-${randomUUID()}`;
   const operationId = randomUUID();
   const messageId = randomUUID();
+  const submittedEvent: RunEventV1 = {
+    contractType: "run-event",
+    contractVersion: "1.0",
+    eventId: `event-persistent-${randomUUID()}`,
+    decisionTaskId: command.requirementRevision.decisionTaskId,
+    agentRunId,
+    sequence: 1,
+    occurredAt: submittedAt.toISOString(),
+    eventType: "TASK_STATE_CHANGED",
+    taskState: "CREATED",
+    summary: "决策任务已接受",
+    synthetic: true
+  };
 
   await client.query("BEGIN");
 
@@ -579,6 +770,15 @@ async function submitInTransaction(
       ]
     );
     await client.query(
+      `INSERT INTO decision_task_agent_runs (
+         agent_run_id,
+         operation_id,
+         attempt,
+         created_at
+       ) VALUES ($1, $2, 1, $3)`,
+      [agentRunId, operationId, submittedAt]
+    );
+    await client.query(
       `INSERT INTO outbox_messages (
          message_id,
          operation_id,
@@ -595,6 +795,7 @@ async function submitInTransaction(
         submittedAt
       ]
     );
+    await insertRunEvent(client, submittedEvent, submittedAt);
     await client.query("COMMIT");
   } catch (error) {
     await client.query("ROLLBACK");
@@ -675,6 +876,162 @@ function decodePersistentOutcome(outcome: PersistentDecisionTaskOutcome): Readon
     agentRunId: decoded.value.taskStatus.agentRunId,
     decisionTaskId: decoded.value.taskStatus.decisionTaskId
   };
+}
+
+function getPublicOutcomeSummary(state: TaskRow["state"]): string {
+  if (state === "FAILED_RETRYABLE") {
+    return "决策任务暂时失败，等待重试";
+  }
+
+  if (state === "FAILED_FINAL") {
+    return "决策任务执行失败，已结束";
+  }
+
+  if (state === "PARTIAL") {
+    return "决策任务仅部分完成";
+  }
+
+  return "决策任务已完成";
+}
+
+const publicTaskStateSummaries = {
+  CREATED: "决策任务已创建",
+  UNDERSTANDING: "正在理解需求",
+  PLANNING: "正在规划决策步骤",
+  RESEARCHING: "正在收集候选与证据",
+  VERIFYING: "正在核验候选与证据",
+  GAP_RESEARCH: "正在补充证据缺口",
+  COMPARING: "正在比较可行候选",
+  CRITIQUING: "正在检查风险与反例",
+  GENERATING: "正在生成可审查决策",
+  PAUSED_USER: "等待用户补充信息",
+  PAUSED_PERMISSION: "等待必要权限",
+  PAUSED_SOURCE_LOGIN: "等待数据源登录",
+  PAUSED_LIMIT: "因资源限制暂停",
+  COMPLETED: "决策任务已完成",
+  FAILED: "决策任务执行失败",
+  CANCELLED: "决策任务已取消"
+} satisfies Readonly<Record<DecisionTaskStateV1, string>>;
+
+async function insertRunEvent(
+  client: PoolClient,
+  event: RunEventV1,
+  persistedAt: Date
+): Promise<void> {
+  const inserted = await client.query<{ cursor: string }>(
+    `INSERT INTO decision_task_run_events (
+       event_id,
+       decision_task_id,
+       agent_run_id,
+       run_sequence,
+       event_payload,
+       occurred_at,
+       persisted_at
+     ) VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
+     RETURNING cursor::text`,
+    [
+      event.eventId,
+      event.decisionTaskId,
+      event.agentRunId,
+      event.sequence,
+      JSON.stringify(event),
+      event.occurredAt,
+      persistedAt
+    ]
+  );
+  const cursor = inserted.rows[0]?.cursor;
+
+  if (cursor === undefined) {
+    throw new PersistenceUnavailableError();
+  }
+
+  await client.query(
+    `INSERT INTO decision_task_run_event_notifications (
+       event_cursor,
+       decision_task_id,
+       next_attempt_at,
+       created_at
+     ) VALUES ($1::bigint, $2, $3, $3)`,
+    [cursor, event.decisionTaskId, persistedAt]
+  );
+}
+
+async function loadRunEvents(
+  client: PoolClient,
+  decisionTaskId: string,
+  agentRunId: string
+): Promise<readonly RunEventV1[]> {
+  const result = await client.query<RunEventRow>(
+    `SELECT cursor::text, event_payload
+     FROM decision_task_run_events
+     WHERE decision_task_id = $1
+       AND agent_run_id = $2
+     ORDER BY run_sequence ASC`,
+    [decisionTaskId, agentRunId]
+  );
+
+  return result.rows.map((row) => {
+    const decoded = decodePersistedRunEventV1({
+      contractType: "persisted-run-event",
+      contractVersion: "1.0",
+      cursor: row.cursor,
+      event: row.event_payload
+    });
+
+    if (!decoded.ok) {
+      throw new PersistenceUnavailableError();
+    }
+
+    return decoded.value.event;
+  });
+}
+
+async function persistResultRunEvents(
+  client: PoolClient,
+  row: TaskRow,
+  outcome: PersistedDecisionTaskResultV1,
+  persistedAt: Date
+): Promise<PersistedDecisionTaskResultV1> {
+  const existingEvents = await loadRunEvents(
+    client,
+    row.decision_task_id,
+    row.agent_run_id
+  );
+  const persistedStates = new Set(existingEvents.map((event) => event.taskState));
+  const newEvents = outcome.runEvents
+    .filter((event) => !persistedStates.has(event.taskState))
+    .map((event, index, events): RunEventV1 => ({
+      ...event,
+      eventId: `event-persistent-${randomUUID()}`,
+      decisionTaskId: row.decision_task_id,
+      agentRunId: row.agent_run_id,
+      sequence: existingEvents.length + index + 1,
+      summary: publicTaskStateSummaries[event.taskState],
+      occurredAt:
+        index === events.length - 1 ? persistedAt.toISOString() : event.occurredAt
+    }));
+  const runEvents = [...existingEvents, ...newEvents];
+  const finalEvent = runEvents.at(-1);
+
+  if (finalEvent === undefined) {
+    throw new PersistenceUnavailableError();
+  }
+
+  for (const event of newEvents) {
+    await insertRunEvent(client, event, persistedAt);
+  }
+
+  const canonicalResult = {
+    ...outcome,
+    taskStatus: {
+      ...outcome.taskStatus,
+      latestEventSequence: finalEvent.sequence,
+      updatedAt: finalEvent.occurredAt
+    },
+    runEvents
+  };
+
+  return decodePersistedResult(canonicalResult, row);
 }
 
 function decodePersistedResult(

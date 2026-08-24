@@ -2,6 +2,7 @@ import {
   createContractRejectedDecisionTaskResultV1,
   createUnknownDecisionExecutionResultV1,
   decodeDecisionTaskResultV1,
+  decodeDecisionTaskSnapshotV1,
   decodeExecuteDecisionTaskCommandV1,
   getDecisionTaskResultHttpStatusV1
 } from "@choicemind/contracts/decision/v1";
@@ -46,7 +47,14 @@ export async function POST(request: Request) {
       cache: "no-store",
       signal: AbortSignal.timeout(15_000)
     });
-    const decodedResult = decodeDecisionTaskResultV1(await response.json());
+    const responseBody: unknown = await response.json();
+    const decodedSnapshot = decodeDecisionTaskSnapshotV1(responseBody);
+
+    if (response.status === 202 && decodedSnapshot.ok) {
+      return Response.json(decodedSnapshot.value, { status: 202 });
+    }
+
+    const decodedResult = decodeDecisionTaskResultV1(responseBody);
 
     if (!decodedResult.ok) {
       const result = createUnknownDecisionExecutionResultV1({

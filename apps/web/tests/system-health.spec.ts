@@ -4,11 +4,15 @@ import { expect, test } from "@playwright/test";
 
 let apiServer: Server;
 let decisionResponseStatus = 200;
+const sseRecoveryRunId = "agent-run-web-sse-recovery";
+const sseRecoveryTaskId = "task-web-sse-recovery";
+let sseRecoveryCursors: Array<string | null> = [];
 
 test.describe.configure({ mode: "serial" });
 
 test.beforeEach(() => {
   decisionResponseStatus = 200;
+  sseRecoveryCursors = [];
 });
 
 test.beforeAll(async () => {
@@ -34,6 +38,30 @@ test.beforeAll(async () => {
       response.setHeader("content-type", "application/json; charset=utf-8");
       response.statusCode = decisionResponseStatus;
       response.end(JSON.stringify(buildSyntheticDecisionResult()));
+      return;
+    }
+
+    if (request.url === `/api/v1/decision-tasks/${sseRecoveryTaskId}/events`) {
+      sseRecoveryCursors.push(request.headers["last-event-id"] ?? null);
+
+      if (sseRecoveryCursors.length === 2) {
+        response.writeHead(503).end();
+        return;
+      }
+
+      const event = buildPersistedEvent({
+        cursor: sseRecoveryCursors.length === 1 ? "301" : "302",
+        eventId:
+          sseRecoveryCursors.length === 1
+            ? "event-web-sse-initial"
+            : "event-web-sse-recovered",
+        runId: sseRecoveryRunId,
+        sequence: sseRecoveryCursors.length === 1 ? 1 : 2,
+        summary: sseRecoveryCursors.length === 1 ? "中断前的事件" : "服务恢复后的事件",
+        taskId: sseRecoveryTaskId
+      });
+      response.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
+      response.end(`id: ${event.cursor}\ndata: ${JSON.stringify(event)}\n\n`);
       return;
     }
 
@@ -70,16 +98,16 @@ test("shows a reviewable decision with conditions, risk and synthetic evidence",
   await expect(page.getByText("合成测试数据，不代表真实商品、价格或购买建议")).toBeVisible();
   await expect(page.getByText("有条件购买")).toBeVisible();
   await expect(page.getByText("CM-SYNTH-LAPTOP-A-32")).toBeVisible();
-  await expect(page.getByRole("listitem").filter({ hasText: "实际到手价不高于 7800 元" })).toBeVisible();
+  await expect(
+    page.getByRole("listitem").filter({ hasText: "实际到手价不高于 7800 元" })
+  ).toBeVisible();
   await expect(page.getByRole("listitem").filter({ hasText: "必须提供官方保修" })).toBeVisible();
   await expect(page.getByText(/超过 8000 元硬预算/)).toBeVisible();
   await expect(
-    page
-      .getByRole("listitem")
-      .filter({
-        hasText:
-          "memory.upgradeable：否；合成规格标记内存不可升级；购买前由用户核验准确 SKU 的官方规格"
-      })
+    page.getByRole("listitem").filter({
+      hasText:
+        "memory.upgradeable：否；合成规格标记内存不可升级；购买前由用户核验准确 SKU 的官方规格"
+    })
   ).toBeVisible();
   await expect(page.getByRole("heading", { name: "Claim 评估" })).toBeVisible();
   await expect(
@@ -91,6 +119,198 @@ test("shows a reviewable decision with conditions, risk and synthetic evidence",
   await expect(page.getByText("核验实际到手价", { exact: true })).toBeVisible();
   await expect(page.getByText("合成观测价为 7699 元", { exact: true })).toBeVisible();
   await expect(page.getByText("2026-08-19T12:00:00.000Z").first()).toBeVisible();
+});
+
+test("stores the accepted task in the URL and restores persisted events after refresh", async ({
+  page
+}) => {
+  let taskId = "";
+  const runId = "agent-run-web-refresh";
+
+  await page.route("**/api/decision-tasks/execute", async (route) => {
+    const command = route.request().postDataJSON() as {
+      executionRequestId: string;
+      requirementRevision: { decisionTaskId: string };
+    };
+    taskId = command.requirementRevision.decisionTaskId;
+    await route.fulfill({
+      status: 202,
+      contentType: "application/json; charset=utf-8",
+      body: JSON.stringify({
+        contractType: "decision-task-snapshot",
+        contractVersion: "1.0",
+        executionRequestId: command.executionRequestId,
+        decisionTaskId: taskId,
+        agentRunId: runId,
+        state: "ACCEPTED",
+        terminal: false,
+        updatedAt: "2026-08-24T01:50:00.000Z"
+      })
+    });
+  });
+  await page.route(/\/api\/decision-tasks\/task-[^/]+\/events$/, async (route) => {
+    const persistedEvent = {
+      contractType: "persisted-run-event",
+      contractVersion: "1.0",
+      cursor: "101",
+      event: {
+        contractType: "run-event",
+        contractVersion: "1.0",
+        eventId: "event-web-refresh-1",
+        decisionTaskId: taskId,
+        agentRunId: runId,
+        sequence: 1,
+        occurredAt: "2026-08-24T01:50:00.000Z",
+        eventType: "TASK_STATE_CHANGED",
+        taskState: "CREATED",
+        summary: "已从 Postgres 恢复任务事件",
+        synthetic: true
+      }
+    };
+    await route.fulfill({
+      status: 200,
+      contentType: "text/event-stream; charset=utf-8",
+      body: `id: 101\ndata: ${JSON.stringify(persistedEvent)}\n\n`
+    });
+  });
+  await page.route(/\/api\/decision-tasks\/task-[^/]+$/, async (route) => {
+    const result = buildSyntheticDecisionResult();
+    replaceDecisionTaskIdentity(result, taskId, runId);
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json; charset=utf-8",
+      body: JSON.stringify(result)
+    });
+  });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "运行合成决策" }).click();
+
+  await expect.poll(() => taskId).toMatch(/^task-/);
+  await expect(page).toHaveURL(new RegExp(`decisionTaskId=${taskId}`));
+  await expect(page.getByText("已从 Postgres 恢复任务事件")).toBeVisible();
+
+  await page.reload();
+
+  await expect(page).toHaveURL(new RegExp(`decisionTaskId=${taskId}`));
+  await expect(page.getByText("权威状态：COMPLETED")).toBeVisible();
+  await expect(page.getByText("已从 Postgres 恢复任务事件")).toBeVisible();
+});
+
+test("deduplicates and orders replayed events while treating disconnect as reconnecting", async ({
+  page
+}) => {
+  const taskId = "task-web-replay-order";
+  const runId = "agent-run-web-replay-order";
+  const first = buildPersistedEvent({
+    cursor: "201",
+    eventId: "event-web-order-1",
+    runId,
+    sequence: 1,
+    summary: "第一阶段",
+    taskId
+  });
+  const second = buildPersistedEvent({
+    cursor: "202",
+    eventId: "event-web-order-2",
+    runId,
+    sequence: 2,
+    summary: "第二阶段",
+    taskId
+  });
+  const forged = {
+    ...buildPersistedEvent({
+      cursor: "203",
+      eventId: "event-web-order-forged",
+      runId,
+      sequence: 3,
+      summary: "不应显示的事件",
+      taskId
+    }),
+    hiddenThought: "模型隐藏思维链"
+  };
+
+  await page.route(/\/api\/decision-tasks\/task-web-replay-order\/events$/, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "text/event-stream; charset=utf-8",
+      body: [second, first, second, forged]
+        .map((event) => `id: ${event.cursor}\ndata: ${JSON.stringify(event)}\n\n`)
+        .join("")
+    });
+  });
+  await page.route(/\/api\/decision-tasks\/task-web-replay-order$/, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json; charset=utf-8",
+      body: JSON.stringify({
+        contractType: "decision-task-snapshot",
+        contractVersion: "1.0",
+        executionRequestId: "exec-web-replay-order",
+        decisionTaskId: taskId,
+        agentRunId: runId,
+        state: "RUNNING",
+        terminal: false,
+        updatedAt: "2026-08-24T01:55:00.000Z"
+      })
+    });
+  });
+
+  await page.goto(`/?decisionTaskId=${taskId}`);
+  const progress = page.getByRole("region", { name: "任务进度" });
+
+  await expect(progress.getByRole("listitem")).toHaveText(["第一阶段", "第二阶段"]);
+  await expect(progress.getByText("事件连接中断，正在重连")).toBeVisible();
+  await expect(page.getByText("模型隐藏思维链")).not.toBeVisible();
+  await expect(page.getByRole("heading", { name: "决策任务失败" })).not.toBeVisible();
+});
+
+test("reconnects after SSE is temporarily unavailable and replays the recovered event", async ({
+  page
+}) => {
+  await page.route(`**/api/decision-tasks/${sseRecoveryTaskId}`, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json; charset=utf-8",
+      body: JSON.stringify({
+        contractType: "decision-task-snapshot",
+        contractVersion: "1.0",
+        executionRequestId: "exec-web-sse-recovery",
+        decisionTaskId: sseRecoveryTaskId,
+        agentRunId: sseRecoveryRunId,
+        state: "RUNNING",
+        terminal: false,
+        updatedAt: "2026-08-24T02:10:00.000Z"
+      })
+    });
+  });
+
+  await page.goto(`/?decisionTaskId=${sseRecoveryTaskId}`);
+
+  await expect.poll(() => sseRecoveryCursors.slice(0, 3)).toEqual([null, "301", "301"]);
+  await expect(page.getByRole("region", { name: "任务进度" })).toContainText(
+    "服务恢复后的事件"
+  );
+});
+
+test("does not label a task observation failure as a business task failure", async ({ page }) => {
+  const taskId = "task-web-observation-unavailable";
+
+  await page.route(`**/api/decision-tasks/${taskId}/events`, async (route) => {
+    await route.fulfill({ status: 503, body: "" });
+  });
+  await page.route(`**/api/decision-tasks/${taskId}`, async (route) => {
+    await route.fulfill({
+      status: 503,
+      contentType: "application/json; charset=utf-8",
+      body: JSON.stringify(createObservationUnavailableResult())
+    });
+  });
+
+  await page.goto(`/?decisionTaskId=${taskId}`);
+
+  await expect(page.getByText("任务状态暂时无法读取")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "决策任务失败" })).not.toBeVisible();
 });
 
 test("does not mark Evidence expired when validUntil equals Decision validFrom with different ISO precision", async ({
@@ -322,7 +542,11 @@ function buildSyntheticDecisionResult() {
             market: "CN",
             configuration: "32 GiB / 1 TiB"
           },
-          observedPrice: { amountMinor: 769900, currency: "CNY", observedAt: validFrom }
+          observedPrice: {
+            amountMinor: 769900,
+            currency: "CNY",
+            observedAt: validFrom
+          }
         },
         {
           contractType: "candidate",
@@ -337,7 +561,11 @@ function buildSyntheticDecisionResult() {
             market: "CN",
             configuration: "32 GiB / 1 TiB"
           },
-          observedPrice: { amountMinor: candidateBPrice, currency: "CNY", observedAt: validFrom }
+          observedPrice: {
+            amountMinor: candidateBPrice,
+            currency: "CNY",
+            observedAt: validFrom
+          }
         }
       ],
       claims: [
@@ -368,7 +596,11 @@ function buildSyntheticDecisionResult() {
           decisionTaskId: taskId,
           subject: { subjectType: "CANDIDATE", subjectId: "candidate-synth-b" },
           predicate: "price.observed",
-          value: { kind: "MONEY", amountMinor: candidateBPrice, currency: "CNY" },
+          value: {
+            kind: "MONEY",
+            amountMinor: candidateBPrice,
+            currency: "CNY"
+          },
           claimKind: "FACT_ASSERTION"
         }
       ],
@@ -584,6 +816,80 @@ function buildPreferenceDecisionResult() {
   ];
 
   return result;
+}
+
+function replaceDecisionTaskIdentity(
+  result: ReturnType<typeof buildSyntheticDecisionResult>,
+  taskId: string,
+  runId: string
+) {
+  result.taskStatus.decisionTaskId = taskId;
+  result.taskStatus.agentRunId = runId;
+  result.bundle.requirementRevision.decisionTaskId = taskId;
+  result.bundle.candidates.forEach((candidate) => {
+    candidate.decisionTaskId = taskId;
+  });
+  result.bundle.claims.forEach((claim) => {
+    claim.decisionTaskId = taskId;
+  });
+  result.bundle.evidence.forEach((evidence) => {
+    evidence.decisionTaskId = taskId;
+  });
+  result.bundle.claimEvidenceLinks.forEach((link) => {
+    link.decisionTaskId = taskId;
+  });
+  result.bundle.decision.decisionTaskId = taskId;
+  result.runEvents.forEach((event) => {
+    event.decisionTaskId = taskId;
+    event.agentRunId = runId;
+  });
+}
+
+function buildPersistedEvent(input: {
+  cursor: string;
+  eventId: string;
+  runId: string;
+  sequence: number;
+  summary: string;
+  taskId: string;
+}) {
+  return {
+    contractType: "persisted-run-event",
+    contractVersion: "1.0",
+    cursor: input.cursor,
+    event: {
+      contractType: "run-event",
+      contractVersion: "1.0",
+      eventId: input.eventId,
+      decisionTaskId: input.taskId,
+      agentRunId: input.runId,
+      sequence: input.sequence,
+      occurredAt: "2026-08-24T01:55:00.000Z",
+      eventType: "TASK_STATE_CHANGED",
+      taskState: "UNDERSTANDING",
+      summary: input.summary,
+      synthetic: true
+    }
+  };
+}
+
+function createObservationUnavailableResult() {
+  return {
+    contractType: "decision-task-result",
+    contractVersion: "1.0",
+    ok: false,
+    error: {
+      contractType: "choice-mind-error",
+      contractVersion: "1.0",
+      errorId: "error-web-observation-unavailable",
+      code: "PERSISTENCE_UNAVAILABLE",
+      category: "STORAGE",
+      message: "持久任务存储暂时不可用",
+      retryMode: "SAME_EXECUTION_ONLY",
+      issues: [],
+      occurredAt: "2026-08-24T02:00:00.000Z"
+    }
+  };
 }
 
 function buildCompletedRunEvents(taskId: string, runId: string) {

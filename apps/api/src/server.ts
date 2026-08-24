@@ -1,4 +1,7 @@
-import { openPersistentDecisionTaskModule } from "@choicemind/task-persistence";
+import {
+  openPersistentDecisionTaskModule,
+  openRunEventNotificationSubscriber
+} from "@choicemind/task-persistence";
 
 import { buildApiApp } from "./app.js";
 
@@ -9,8 +12,24 @@ if (databaseUrl === undefined || databaseUrl.length === 0) {
 }
 
 const decisionTaskPersistence = await openPersistentDecisionTaskModule({ databaseUrl });
+const redisUrl = process.env.CHOICEMIND_REDIS_URL;
+let decisionTaskEventNotifications:
+  | Awaited<ReturnType<typeof openRunEventNotificationSubscriber>>
+  | undefined;
+
+if (redisUrl !== undefined && redisUrl.length > 0) {
+  try {
+    decisionTaskEventNotifications = await openRunEventNotificationSubscriber({
+      channelName: process.env.CHOICEMIND_RUN_EVENT_CHANNEL ?? "choicemind:run-events",
+      redisUrl
+    });
+  } catch {
+    decisionTaskEventNotifications = undefined;
+  }
+}
 
 const app = buildApiApp({
+  ...(decisionTaskEventNotifications === undefined ? {} : { decisionTaskEventNotifications }),
   decisionTaskPersistence,
   healthUrls: {
     "data-worker": process.env.DATA_WORKER_HEALTH_URL ?? "http://127.0.0.1:3300/health/live",
@@ -19,7 +38,9 @@ const app = buildApiApp({
   }
 });
 
-app.addHook("onClose", async () => decisionTaskPersistence.close());
+app.addHook("onClose", async () => {
+  await Promise.all([decisionTaskPersistence.close(), decisionTaskEventNotifications?.close()]);
+});
 
 const port = Number(process.env.PORT ?? 3100);
 const host = process.env.HOST ?? "127.0.0.1";

@@ -1,7 +1,8 @@
 import type {
   DecisionTaskResultV1,
   DecisionTaskSnapshotV1,
-  ExecuteDecisionTaskCommandV1
+  ExecuteDecisionTaskCommandV1,
+  PersistedRunEventV1
 } from "@choicemind/contracts/decision/v1";
 
 type PersistedDecisionTaskResultV1 = Extract<
@@ -14,4 +15,5 @@ export interface DecisionTaskPersistencePort {
   get(
     decisionTaskId: string
   ): Promise<DecisionTaskSnapshotV1 | PersistedDecisionTaskResultV1 | undefined>;
+  listEvents(decisionTaskId: string, afterCursor?: string): Promise<readonly PersistedRunEventV1[]>;
 }
