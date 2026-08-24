@@ -56,7 +56,23 @@ describe("Persistent Decision Task Worker", () => {
     const execute = async (claim: {
       command: ExecuteDecisionTaskCommandV1;
       agentRunId: string;
-    }) => executor.execute(claim.command, { agentRunId: claim.agentRunId });
+    }) => {
+      const outcome = await executor.execute(claim.command, {
+        agentRunId: claim.agentRunId
+      });
+
+      if (!("taskStatus" in outcome)) {
+        return outcome;
+      }
+
+      return {
+        ...outcome,
+        runEvents: outcome.runEvents.map((event) => ({
+          ...event,
+          summary: "不得公开的 Runtime 隐藏推理"
+        }))
+      };
+    };
     const firstWorker = await openPersistentDecisionTaskWorker({
       databaseUrl,
       redisUrl,
@@ -83,7 +99,8 @@ describe("Persistent Decision Task Worker", () => {
     expect(batches.reduce((sum, batch) => sum + batch.executed, 0)).toBe(1);
     expect(batches.reduce((sum, batch) => sum + batch.acknowledged, 0)).toBe(1);
     expect(runtimeCalls).toBe(1);
-    expect(await taskModule.get(command.requirementRevision.decisionTaskId)).toMatchObject({
+    const persistedTask = await taskModule.get(command.requirementRevision.decisionTaskId);
+    expect(persistedTask).toMatchObject({
       contractType: "decision-task-result",
       contractVersion: "1.0",
       ok: true,
@@ -94,6 +111,36 @@ describe("Persistent Decision Task Worker", () => {
         terminal: true
       }
     });
+    const persistedEvents = await taskModule.listEvents(
+      command.requirementRevision.decisionTaskId
+    );
+    expect(persistedEvents).toHaveLength(9);
+    expect(persistedEvents.slice(0, 2)).toMatchObject([
+      { event: { sequence: 1, taskState: "CREATED" } },
+      { event: { sequence: 2, taskState: "UNDERSTANDING" } }
+    ]);
+    expect(persistedEvents.at(-1)).toMatchObject({
+      event: {
+        sequence: 9,
+        eventType: "RUNTIME_SUCCEEDED",
+        taskState: "COMPLETED"
+      }
+    });
+    expect(persistedEvents.map(({ event }) => event.summary)).toEqual([
+      "决策任务已接受",
+      "决策任务开始执行",
+      "正在规划决策步骤",
+      "正在收集候选与证据",
+      "正在核验候选与证据",
+      "正在比较可行候选",
+      "正在检查风险与反例",
+      "正在生成可审查决策",
+      "决策任务已完成"
+    ]);
+    expect(persistedTask).toHaveProperty(
+      "runEvents",
+      persistedEvents.map((persistedEvent) => persistedEvent.event)
+    );
     const deferredWorker = batches[0]?.executed === 0 ? firstWorker : secondWorker;
 
     expect(await deferredWorker.runOnce()).toEqual({
@@ -275,6 +322,114 @@ describe("Persistent Decision Task Worker", () => {
       state: "FAILED_FINAL",
       terminal: true
     });
+  });
+
+  it("creates a new Agent Run when a retryable task succeeds on retry", async () => {
+    const databaseUrl = requireEnvironment("CHOICEMIND_TEST_DATABASE_URL");
+    const redisUrl = requireEnvironment("CHOICEMIND_TEST_REDIS_URL");
+    const suffix = randomUUID();
+    const streamName = `choicemind:test:worker-retry-success:${suffix}`;
+    const consumerGroup = `choicemind-test-retry-success-${suffix}`;
+    const command = buildCommand(suffix);
+    const taskModule = await openPersistentDecisionTaskModule({ databaseUrl });
+    const publisher = await openOutboxPublisher({ databaseUrl, redisUrl, streamName });
+    openModules.push(taskModule, publisher);
+    const accepted = await taskModule.submit(command);
+    expect(await publisher.runOnce()).toMatchObject({ published: 1 });
+    const firstWorker = await openPersistentDecisionTaskWorker({
+      databaseUrl,
+      redisUrl,
+      streamName,
+      consumerGroup,
+      workerId: `retry-success-worker-a-${suffix}`,
+      pendingClaimIdleMs: 0,
+      async execute() {
+        return {
+          state: "FAILED_RETRYABLE",
+          summary: "临时资源不足，允许使用新的 Agent Run 重试"
+        };
+      }
+    });
+    const executor = createDecisionTaskExecutor({
+      runtime: createFakeAgentRuntimeAdapter()
+    });
+    const secondWorker = await openPersistentDecisionTaskWorker({
+      databaseUrl,
+      redisUrl,
+      streamName,
+      consumerGroup,
+      workerId: `retry-success-worker-b-${suffix}`,
+      pendingClaimIdleMs: 0,
+      execute: async (claim) =>
+        executor.execute(claim.command, { agentRunId: claim.agentRunId })
+    });
+    openModules.push(firstWorker, secondWorker);
+
+    expect(await firstWorker.runOnce()).toEqual({
+      acknowledged: 0,
+      executed: 1,
+      received: 1
+    });
+    expect(await taskModule.get(command.requirementRevision.decisionTaskId)).toMatchObject({
+      agentRunId: accepted.agentRunId,
+      state: "FAILED_RETRYABLE",
+      terminal: false
+    });
+    expect(await secondWorker.runOnce()).toEqual({
+      acknowledged: 1,
+      executed: 1,
+      received: 1
+    });
+
+    const persistedTask = await taskModule.get(command.requirementRevision.decisionTaskId);
+    expect(persistedTask).toMatchObject({
+      contractType: "decision-task-result",
+      ok: true,
+      taskStatus: {
+        state: "COMPLETED",
+        terminal: true
+      }
+    });
+    const persistedEvents = await taskModule.listEvents(
+      command.requirementRevision.decisionTaskId
+    );
+    const retryAgentRunId = persistedEvents[3]?.event.agentRunId;
+
+    expect(retryAgentRunId).toBeDefined();
+    expect(retryAgentRunId).not.toBe(accepted.agentRunId);
+    expect(persistedEvents).toHaveLength(12);
+    expect(persistedEvents.slice(0, 3)).toMatchObject([
+      { event: { agentRunId: accepted.agentRunId, sequence: 1, taskState: "CREATED" } },
+      {
+        event: {
+          agentRunId: accepted.agentRunId,
+          sequence: 2,
+          taskState: "UNDERSTANDING"
+        }
+      },
+      { event: { agentRunId: accepted.agentRunId, sequence: 3, taskState: "FAILED" } }
+    ]);
+    expect(persistedEvents.slice(3).map(({ event }) => event.agentRunId)).toEqual(
+      Array(9).fill(retryAgentRunId)
+    );
+    expect(persistedEvents.slice(3).map(({ event }) => event.sequence)).toEqual([
+      1, 2, 3, 4, 5, 6, 7, 8, 9
+    ]);
+    expect(persistedEvents.slice(3)).toMatchObject([
+      { event: { taskState: "CREATED" } },
+      { event: { taskState: "UNDERSTANDING" } },
+      { event: { taskState: "PLANNING" } },
+      { event: { taskState: "RESEARCHING" } },
+      { event: { taskState: "VERIFYING" } },
+      { event: { taskState: "COMPARING" } },
+      { event: { taskState: "CRITIQUING" } },
+      { event: { taskState: "GENERATING" } },
+      { event: { taskState: "COMPLETED" } }
+    ]);
+    expect(persistedTask).toHaveProperty(
+      "runEvents",
+      persistedEvents.slice(3).map(({ event }) => event)
+    );
   });
 
   it("acknowledges a persisted partial outcome without presenting a successful result", async () => {

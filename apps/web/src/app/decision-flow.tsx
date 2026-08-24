@@ -1,25 +1,154 @@
 "use client";
 
 import {
-  createUnknownDecisionExecutionResultV1,
-  decodeDecisionTaskResultV1,
-  getDecisionTaskResultHttpStatusV1,
   type ClaimValueV1,
+  createUnknownDecisionExecutionResultV1,
   type DecisionTaskResultV1,
+  type DecisionTaskSnapshotV1,
+  decodeDecisionTaskResultV1,
+  decodeDecisionTaskSnapshotV1,
+  decodePersistedRunEventV1,
+  getDecisionTaskResultHttpStatusV1,
+  type PersistedRunEventV1,
   type SuccessfulDecisionTaskResultV1
 } from "@choicemind/contracts/decision/v1";
-import { type FormEvent, useState } from "react";
+import { type FormEvent, useCallback, useEffect, useState } from "react";
 
 const defaultRequirement = "预算不超过 8000 元，至少 32 GiB 内存和 1 TiB 存储。";
 
 export function DecisionFlow() {
   const [pending, setPending] = useState(false);
   const [result, setResult] = useState<DecisionTaskResultV1 | null>(null);
+  const [snapshot, setSnapshot] = useState<DecisionTaskSnapshotV1 | null>(null);
+  const [taskId, setTaskId] = useState<string | null>(null);
+  const [persistedEvents, setPersistedEvents] = useState<readonly PersistedRunEventV1[]>([]);
+  const [observationError, setObservationError] = useState(false);
+  const [connectionState, setConnectionState] = useState<"idle" | "connected" | "reconnecting">(
+    "idle"
+  );
+
+  const loadTask = useCallback(async (decisionTaskId: string) => {
+    try {
+      const response = await fetch(`/api/decision-tasks/${encodeURIComponent(decisionTaskId)}`, {
+        cache: "no-store"
+      });
+      const responseBody: unknown = await response.json();
+      const decodedSnapshot = decodeDecisionTaskSnapshotV1(responseBody);
+
+      if (
+        response.status === 200 &&
+        decodedSnapshot.ok &&
+        decodedSnapshot.value.decisionTaskId === decisionTaskId
+      ) {
+        setSnapshot(decodedSnapshot.value);
+        setResult(null);
+        setObservationError(false);
+        return;
+      }
+
+      const decodedResult = decodeDecisionTaskResultV1(responseBody);
+
+      if (
+        response.status === 200 &&
+        decodedResult.ok &&
+        "taskStatus" in decodedResult.value &&
+        decodedResult.value.taskStatus.decisionTaskId === decisionTaskId
+      ) {
+        setSnapshot(null);
+        setResult(decodedResult.value);
+        setObservationError(false);
+        return;
+      }
+
+      throw new Error("任务响应不符合合同");
+    } catch {
+      setObservationError(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    const decisionTaskId = new URL(window.location.href).searchParams.get("decisionTaskId");
+
+    if (decisionTaskId !== null && decisionTaskId.length > 0) {
+      setTaskId(decisionTaskId);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (taskId === null) {
+      return;
+    }
+
+    const decisionTaskId = taskId;
+    let active = true;
+    let reconnectTimer: number | undefined;
+    let source: EventSource | undefined;
+    setConnectionState("idle");
+    void loadTask(decisionTaskId);
+
+    function connect() {
+      const nextSource = new EventSource(
+        `/api/decision-tasks/${encodeURIComponent(decisionTaskId)}/events`
+      );
+      source = nextSource;
+      nextSource.onopen = () => {
+        if (active) {
+          setConnectionState("connected");
+        }
+      };
+      nextSource.onmessage = (message) => {
+        if (!active) {
+          return;
+        }
+
+        let responseBody: unknown;
+
+        try {
+          responseBody = JSON.parse(message.data) as unknown;
+        } catch {
+          return;
+        }
+
+        const decoded = decodePersistedRunEventV1(responseBody);
+
+        if (!decoded.ok || decoded.value.event.decisionTaskId !== decisionTaskId) {
+          return;
+        }
+
+        setPersistedEvents((current) => mergePersistedEvent(current, decoded.value));
+        setConnectionState("connected");
+        void loadTask(decisionTaskId);
+      };
+      nextSource.onerror = () => {
+        if (!active) {
+          return;
+        }
+
+        setConnectionState("reconnecting");
+        nextSource.close();
+        reconnectTimer = window.setTimeout(connect, 1_000);
+      };
+    }
+
+    connect();
+
+    return () => {
+      active = false;
+      source?.close();
+
+      if (reconnectTimer !== undefined) {
+        window.clearTimeout(reconnectTimer);
+      }
+    };
+  }, [loadTask, taskId]);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setPending(true);
     setResult(null);
+    setSnapshot(null);
+    setPersistedEvents([]);
+    setObservationError(false);
     const id = crypto.randomUUID();
 
     try {
@@ -63,25 +192,34 @@ export function DecisionFlow() {
           }
         })
       });
-      const decodedResult = decodeDecisionTaskResultV1(await response.json());
-      const responseBody = decodedResult.ok ? decodedResult.value : undefined;
+      const responseBody: unknown = await response.json();
+      const decodedSnapshot = decodeDecisionTaskSnapshotV1(responseBody);
+
+      if (
+        response.status === 202 &&
+        decodedSnapshot.ok &&
+        decodedSnapshot.value.decisionTaskId === `task-${id}`
+      ) {
+        const acceptedTaskId = decodedSnapshot.value.decisionTaskId;
+        const url = new URL(window.location.href);
+        url.searchParams.set("decisionTaskId", acceptedTaskId);
+        window.history.replaceState(null, "", url);
+        setSnapshot(decodedSnapshot.value);
+        setTaskId(acceptedTaskId);
+        return;
+      }
+
+      const decodedResult = decodeDecisionTaskResultV1(responseBody);
+      const taskResult = decodedResult.ok ? decodedResult.value : undefined;
 
       setResult(
-        responseBody !== undefined &&
-          response.status === getDecisionTaskResultHttpStatusV1(responseBody)
-          ? responseBody
-          : createUnknownDecisionExecutionResultV1({
-              errorId: "error-web-response-status-mismatch",
-              occurredAt: new Date().toISOString()
-            })
+        taskResult !== undefined &&
+          response.status === getDecisionTaskResultHttpStatusV1(taskResult)
+          ? taskResult
+          : createUnknownWebResult("error-web-response-status-mismatch")
       );
     } catch {
-      setResult(
-        createUnknownDecisionExecutionResultV1({
-          errorId: "error-web-decision-execution-status-unknown",
-          occurredAt: new Date().toISOString()
-        })
-      );
+      setResult(createUnknownWebResult("error-web-decision-execution-status-unknown"));
     } finally {
       setPending(false);
     }
@@ -107,6 +245,15 @@ export function DecisionFlow() {
         </button>
       </form>
       <p aria-live="polite">{pending ? "正在理解需求并核验合成证据" : ""}</p>
+      {taskId === null ? null : (
+        <TaskProgress
+          connectionState={connectionState}
+          events={persistedEvents}
+          observationError={observationError}
+          snapshot={snapshot}
+          taskId={taskId}
+        />
+      )}
       {result === null ? null : result.ok ? (
         <DecisionResult result={result} />
       ) : (
@@ -118,6 +265,63 @@ export function DecisionFlow() {
       )}
     </section>
   );
+}
+
+function TaskProgress({
+  connectionState,
+  events,
+  observationError,
+  snapshot,
+  taskId
+}: Readonly<{
+  connectionState: "idle" | "connected" | "reconnecting";
+  events: readonly PersistedRunEventV1[];
+  observationError: boolean;
+  snapshot: DecisionTaskSnapshotV1 | null;
+  taskId: string;
+}>) {
+  return (
+    <section aria-labelledby="task-progress-heading">
+      <h2 id="task-progress-heading">任务进度</h2>
+      <p>任务：{taskId}</p>
+      {snapshot === null ? null : <p>权威状态：{snapshot.state}</p>}
+      {observationError ? <p role="status">任务状态暂时无法读取</p> : null}
+      <p aria-live="polite">
+        {connectionState === "reconnecting"
+          ? "事件连接中断，正在重连"
+          : connectionState === "connected"
+            ? "事件连接正常"
+            : "正在恢复任务事件"}
+      </p>
+      <ol>
+        {events.map((persistedEvent) => (
+          <li key={persistedEvent.cursor}>{persistedEvent.event.summary}</li>
+        ))}
+      </ol>
+    </section>
+  );
+}
+
+function mergePersistedEvent(
+  current: readonly PersistedRunEventV1[],
+  incoming: PersistedRunEventV1
+): readonly PersistedRunEventV1[] {
+  const byCursor = new Map(current.map((event) => [event.cursor, event] as const));
+  byCursor.set(incoming.cursor, incoming);
+  return [...byCursor.values()].sort((left, right) =>
+    BigInt(left.cursor) < BigInt(right.cursor)
+      ? -1
+      : BigInt(left.cursor) > BigInt(right.cursor)
+        ? 1
+        : 0
+  );
+}
+
+function createUnknownWebResult(errorId: string): DecisionTaskResultV1 {
+  return createUnknownDecisionExecutionResultV1({
+    errorId,
+    occurredAt: new Date().toISOString()
+  });
 }
 
 function DecisionResult({ result }: Readonly<{ result: SuccessfulDecisionTaskResultV1 }>) {
@@ -162,9 +366,7 @@ function DecisionResult({ result }: Readonly<{ result: SuccessfulDecisionTaskRes
       <h3>候选去向</h3>
       <ul>
         {decision.candidateDispositions.map((disposition) => (
-          <li key={disposition.dispositionId}>
-            违反硬约束，已淘汰：{disposition.reason}
-          </li>
+          <li key={disposition.dispositionId}>违反硬约束，已淘汰：{disposition.reason}</li>
         ))}
       </ul>
 
@@ -198,7 +400,8 @@ function DecisionResult({ result }: Readonly<{ result: SuccessfulDecisionTaskRes
 
           return (
             <li key={assessment.claimId}>
-              {claim.predicate}：{formatClaimValue(claim.value)}；类型：{claim.claimKind}
+              {claim.predicate}：{formatClaimValue(claim.value)}；类型：
+              {claim.claimKind}
               ；证据状态：{assessment.evidenceState}
               <EvidenceReferences
                 evidenceIds={assessment.supportingEvidenceIds}
@@ -273,10 +476,7 @@ function EvidenceReferences({
   label
 }: Readonly<{
   evidenceIds: readonly string[];
-  evidenceById: ReadonlyMap<
-    string,
-    SuccessfulDecisionTaskResultV1["bundle"]["evidence"][number]
-  >;
+  evidenceById: ReadonlyMap<string, SuccessfulDecisionTaskResultV1["bundle"]["evidence"][number]>;
   label: string;
 }>) {
   if (evidenceIds.length === 0) {

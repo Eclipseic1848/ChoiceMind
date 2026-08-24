@@ -4,6 +4,7 @@ import {
   getDecisionTaskResultHttpStatusV1
 } from "@choicemind/contracts/decision/v1";
 
+import type { DecisionTaskEventNotificationsPort } from "./decision-tasks/event-notifications-port.js";
 import type { DecisionTaskPersistencePort } from "./decision-tasks/persistence-port.js";
 import { registerDecisionTaskRoutes } from "./decision-tasks/routes.js";
 
@@ -17,6 +18,8 @@ type ComponentHealth = {
 };
 
 type ApiAppOptions = {
+  decisionTaskEventNotifications?: DecisionTaskEventNotificationsPort;
+  decisionTaskEventPollIntervalMs?: number;
   decisionTaskPersistence?: DecisionTaskPersistencePort;
   healthUrls?: Record<DependencyService, string>;
   now?: () => Date;
@@ -116,7 +119,9 @@ export function buildApiApp(options: ApiAppOptions = {}) {
   registerDecisionTaskRoutes(
     app,
     options.decisionTaskPersistence,
-    options.now ?? (() => new Date())
+    options.now ?? (() => new Date()),
+    options.decisionTaskEventNotifications,
+    options.decisionTaskEventPollIntervalMs ?? 1_000
   );
 
   return app;

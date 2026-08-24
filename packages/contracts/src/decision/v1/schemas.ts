@@ -3,8 +3,10 @@ import * as z from "zod";
 import type {
   DecisionTaskResultV1,
   DecisionTaskSnapshotV1,
-  ExecuteDecisionTaskCommandV1
+  ExecuteDecisionTaskCommandV1,
+  PersistedRunEventV1
 } from "./index.js";
+import { isPersistedRunEventCursorV1 } from "./cursor.js";
 
 const meaningfulTextSchema = z.string().refine((value) => value.trim().length > 0);
 
@@ -287,6 +289,13 @@ const runEventSchema = z.strictObject({
   synthetic: z.literal(true)
 });
 
+export const persistedRunEventSchema = z.strictObject({
+  ...contractHeader,
+  contractType: z.literal("persisted-run-event"),
+  cursor: z.string().refine(isPersistedRunEventCursorV1),
+  event: runEventSchema
+});
+
 const completedTaskStatusSchema = z.strictObject({
   ...contractHeader,
   contractType: z.literal("decision-task-status"),
@@ -459,7 +468,8 @@ const schemaContractConsistency: readonly [
   >,
   Assert<
     IsExact<z.output<typeof decisionTaskResultSchema>, DeepMutable<DecisionTaskResultV1>>
-  >
-] = [true, true, true];
+  >,
+  Assert<IsExact<z.output<typeof persistedRunEventSchema>, DeepMutable<PersistedRunEventV1>>>
+] = [true, true, true, true];
 
 void schemaContractConsistency;

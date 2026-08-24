@@ -51,6 +51,8 @@ services:
         condition: service_healthy
     environment:
       CHOICEMIND_DATABASE_URL: "${CHOICEMIND_DATABASE_URL:?CHOICEMIND_DATABASE_URL is required}"
+      CHOICEMIND_REDIS_URL: redis://redis:6379
+      CHOICEMIND_RUN_EVENT_CHANNEL: choicemind:run-events
       DATA_WORKER_HEALTH_URL: http://data-worker:3300/health/live
       HOST: 0.0.0.0
       ORCHESTRATOR_HEALTH_URL: http://orchestrator:3200/health/live
@@ -75,6 +77,7 @@ services:
     environment:
       CHOICEMIND_DATABASE_URL: "${CHOICEMIND_DATABASE_URL:?CHOICEMIND_DATABASE_URL is required}"
       CHOICEMIND_REDIS_URL: redis://redis:6379
+      CHOICEMIND_RUN_EVENT_CHANNEL: choicemind:run-events
       CHOICEMIND_TASK_STREAM: choicemind:decision-tasks
     restart: unless-stopped
 

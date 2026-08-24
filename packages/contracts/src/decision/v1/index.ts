@@ -2,6 +2,7 @@ import {
   decisionTaskResultSchema,
   decisionTaskSnapshotSchema,
   executeDecisionTaskCommandSchema,
+  persistedRunEventSchema,
   successfulDecisionTaskResultDraftSchema
 } from "./schemas.js";
 import { evaluateDecisionBasisV1 } from "./decision-basis.js";
@@ -14,6 +15,7 @@ export {
   createPersistenceUnavailableResultV1,
   createUnknownDecisionExecutionResultV1
 } from "./errors.js";
+export { isPersistedRunEventCursorV1 } from "./cursor.js";
 
 export type QuantityV1 = Readonly<{
   amount: number;
@@ -333,6 +335,13 @@ export type RunEventV1 = Readonly<{
   synthetic: true;
 }>;
 
+export type PersistedRunEventV1 = Readonly<{
+  contractType: "persisted-run-event";
+  contractVersion: "1.0";
+  cursor: string;
+  event: RunEventV1;
+}>;
+
 export type CompletedDecisionTaskStatusV1 = Readonly<{
   contractType: "decision-task-status";
   contractVersion: "1.0";
@@ -555,6 +564,35 @@ export function decodeDecisionTaskResultV1(
   }
 
   return { ok: true, value };
+}
+
+export function decodePersistedRunEventV1(
+  input: unknown
+): ContractDecodeResult<PersistedRunEventV1> {
+  const unsupportedVersion = findUnsupportedVersion(input);
+
+  if (unsupportedVersion !== undefined) {
+    return {
+      ok: false,
+      code: "CONTRACT_VERSION_UNSUPPORTED",
+      issues: [unsupportedVersion]
+    };
+  }
+
+  const parsed = persistedRunEventSchema.safeParse(input);
+
+  if (!parsed.success) {
+    return {
+      ok: false,
+      code: "CONTRACT_INVALID",
+      issues: parsed.error.issues.map((issue) => ({
+        message: "字段不符合合同要求",
+        path: issue.path.join(".")
+      }))
+    };
+  }
+
+  return { ok: true, value: parsed.data };
 }
 
 export function finalizeSuccessfulDecisionTaskResultV1(
