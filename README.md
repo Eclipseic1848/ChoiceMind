@@ -4,9 +4,9 @@
 
 **把消费问题转化为可审查、可验证、可恢复的个人决策。**
 
-[![status](https://img.shields.io/badge/status-P0%20foundation-1f6feb)](#phase-路线) [![phase](https://img.shields.io/badge/phase-P0--04%20complete-2da44e)](#phase-路线) [![Node.js](https://img.shields.io/badge/Node.js-22.22.1-339933?logo=nodedotjs&logoColor=white)](#本地开发) [![pnpm](https://img.shields.io/badge/pnpm-11.21.0-f69220?logo=pnpm&logoColor=white)](#本地开发) [![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-8250df)](#本地开发) [![license](https://img.shields.io/badge/license-MIT-2da44e)](LICENSE)
+[![status](https://img.shields.io/badge/status-P0%20foundation-1f6feb)](#phase-路线) [![phase](https://img.shields.io/badge/phase-P0--05%20complete-2da44e)](#phase-路线) [![Node.js](https://img.shields.io/badge/Node.js-22.22.1-339933?logo=nodedotjs&logoColor=white)](#本地开发) [![pnpm](https://img.shields.io/badge/pnpm-11.21.0-f69220?logo=pnpm&logoColor=white)](#本地开发) [![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-8250df)](#本地开发) [![license](https://img.shields.io/badge/license-MIT-2da44e)](LICENSE)
 
-Requirement · Candidate · Claim/Evidence · Decision · Persistent Task · Runtime Adapter
+Requirement · Candidate · Claim/Evidence · Decision · Persistent Task · Replayable RunEvent · Runtime Adapter
 
 [项目定位](#项目定位) · [已验证能力](#已验证能力) · [Phase 路线](#phase-路线) · [本地开发](#本地开发) · [参与贡献](CONTRIBUTING.md) · [安全策略](SECURITY.md) · [行为准则](CODE_OF_CONDUCT.md)
 
@@ -16,7 +16,7 @@ Requirement · Candidate · Claim/Evidence · Decision · Persistent Task · Run
 
 ChoiceMind 是面向单个消费者的智能消费决策 Agent。它把需求、候选方案、可定位证据、约束、风险和未决信息组织成可审查的 Decision；目标不是生成商品榜单，也不代替用户下单。
 
-> 当前处于 **P0：合同、边界、安全、持久化、恢复和可验证底座**。P0-01/02/03、P0-07A 与 P0-04 已闭环，下一切片 P0-05 正在规划。该状态不代表 P0 整体完成、P1 已开始、生产认证或正式发布。
+> 当前处于 **P0：合同、边界、安全、持久化、恢复和可验证底座**。P0-01/02/03、P0-07A、P0-04 与 P0-05 已闭环，下一切片 P0-06 尚未开始。该状态不代表 P0 整体完成、P1 已开始、生产认证或正式发布。
 
 本仓库公开代码与工程配置；内部 ADR、规格书、验收证据和 handoff 按仓库策略保留在本地，不随公开仓库发布。
 
@@ -27,6 +27,9 @@ ChoiceMind 是面向单个消费者的智能消费决策 Agent。它把需求、
 - ChoiceMind 持有业务语义，CoreMind 通过薄 Runtime Adapter 接入；精确候选的隔离兼容门禁已完成产品验收。
 - Postgres/pgvector 权威任务状态、同事务 Outbox、Redis Streams Publisher、租约 Worker、幂等完成和故障恢复。
 - P0-04 根级工程验证、真实 Postgres/Redis 集成与 Compose 故障验收通过；[Issue #4](https://github.com/Eclipseic1848/ChoiceMind/issues/4) 已完成产品验收并关闭。
+- Postgres 持久化公开 RunEvent 与单调游标；Redis 只发送实时通知，通知不可用时 SSE 仍从 Postgres 轮询恢复。
+- Web 支持按 `Last-Event-ID` 补发、重复事件去重和乱序排序；刷新、断线与 API 短暂不可用后可恢复权威任务状态和已有事件。
+- P0-05 根级工程验证、真实八服务 Compose 与 Chrome 产品验收通过；[PR #33](https://github.com/Eclipseic1848/ChoiceMind/pull/33) 已合并。
 
 这些是当前代码与验收范围内的证据，不等于真实消费数据质量、完整 Provider 认证、生产安全或发布资格。
 
@@ -44,6 +47,13 @@ Web
 
 Redis 只承担可恢复的传输职责，不能覆盖 Postgres 权威事实；Provider 与 Runtime 输出均视为不可信输入，必须经过 ChoiceMind 合同校验。
 
+```text
+Postgres（权威任务状态与持久 RunEvent）
+  → Redis 实时通知（非权威，可降级）
+    → API SSE（Last-Event-ID 补发）
+      → Web 刷新与断线恢复
+```
+
 ## Phase 路线
 
 | 切片 | 状态 | 公开结果 |
@@ -51,8 +61,9 @@ Redis 只承担可恢复的传输职责，不能覆盖 Postgres 权威事实；P
 | P0-01 / P0-02 / P0-03 | 已完成 | 领域边界、四服务基线、首个合成 Decision 纵向 |
 | P0-07A | 已完成 | 最小 Runtime Adapter、候选兼容门禁、本地合成模型冒烟 |
 | [P0-04](https://github.com/Eclipseic1848/ChoiceMind/issues/4) | 已完成 | 持久任务、同事务 Outbox、Redis Streams、幂等 Worker |
-| [P0-05](https://github.com/Eclipseic1848/ChoiceMind/issues/5) | 规划中 | 持久 RunEvent、单调游标、SSE `Last-Event-ID` 回放 |
-| [P0-06](https://github.com/Eclipseic1848/ChoiceMind/issues/6) 及后续 P0 | 未开始或待裁决 | 用户隔离、安全恢复、服务合同、Evidence 最小链路与 Gold Gate |
+| [P0-05](https://github.com/Eclipseic1848/ChoiceMind/issues/5) | 已完成 | 持久 RunEvent、单调游标、SSE `Last-Event-ID` 回放与 Web 恢复 |
+| [P0-06](https://github.com/Eclipseic1848/ChoiceMind/issues/6) | 未开始 | 用户隔离、CredentialVault、RiskPolicy、EgressRecord 与审计路径 |
+| 后续 P0 | 未开始或待裁决 | Runtime 安全恢复、真实模型认证、服务合同、Evidence 最小链路与 Gold Gate |
 
 每个 Phase 切片只有在工程证据、独立审查、产品验收、代码合并和 Issue 证据同步分别完成后，才能标记为“已完成”。Phase 完成时必须同步更新本表、上方状态说明、已验证能力、必要的社区文档和 GitHub About；详细清单见[贡献指南](CONTRIBUTING.md#phase-完成同步门禁)。
 
