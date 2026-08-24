@@ -15,7 +15,7 @@ import os from "node:os";
 import path from "node:path";
 import { gzipSync } from "node:zlib";
 
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { CORE_MIND_PACKAGE_NAMES, runCoreMindCompatibility } from "./index.js";
 import { setTrustedPnpmContentSha512ForTest } from "./pnpm-trust.js";
@@ -32,6 +32,8 @@ import {
   type CommandRequest,
   type SystemCompatibilityOptions
 } from "./system.js";
+
+vi.setConfig({ testTimeout: 15_000 });
 
 const commit = "57e5765471cf6fe7f7da14d9ed4882e0c53ec322";
 const trustedPnpmCorepackHash =

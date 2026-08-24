@@ -5,6 +5,31 @@ x-node-runtime: &node-runtime
     dockerfile: deploy/compose/Dockerfile.node
 
 services:
+  postgres:
+    image: pgvector/pgvector@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b
+    environment:
+      POSTGRES_DB: choicemind
+      POSTGRES_PASSWORD: "${CHOICEMIND_POSTGRES_PASSWORD:?CHOICEMIND_POSTGRES_PASSWORD is required}"
+      POSTGRES_USER: choicemind
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U choicemind -d choicemind"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis@sha256:9d317178eceac8454a2284a9e6df2466b93c745529947f0cd42a0fa9609d7005
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   web:
     <<: *node-runtime
     command: ["corepack", "pnpm", "--filter", "@choicemind/web", "start"]
@@ -21,11 +46,14 @@ services:
   api:
     <<: *node-runtime
     command: ["corepack", "pnpm", "--filter", "@choicemind/api", "start"]
+    depends_on:
+      postgres:
+        condition: service_healthy
     environment:
+      CHOICEMIND_DATABASE_URL: "${CHOICEMIND_DATABASE_URL:?CHOICEMIND_DATABASE_URL is required}"
       DATA_WORKER_HEALTH_URL: http://data-worker:3300/health/live
       HOST: 0.0.0.0
       ORCHESTRATOR_HEALTH_URL: http://orchestrator:3200/health/live
-      ORCHESTRATOR_URL: http://orchestrator:3200
       PORT: "3100"
       WEB_HEALTH_URL: http://web:3000/health/live
     ports:
@@ -35,6 +63,20 @@ services:
       interval: 10s
       timeout: 3s
       retries: 5
+
+  outbox-publisher:
+    <<: *node-runtime
+    command: ["corepack", "pnpm", "--filter", "@choicemind/api", "start:publisher"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      CHOICEMIND_DATABASE_URL: "${CHOICEMIND_DATABASE_URL:?CHOICEMIND_DATABASE_URL is required}"
+      CHOICEMIND_REDIS_URL: redis://redis:6379
+      CHOICEMIND_TASK_STREAM: choicemind:decision-tasks
+    restart: unless-stopped
 
   orchestrator:
     <<: *node-runtime
@@ -50,6 +92,23 @@ services:
       timeout: 3s
       retries: 5
 
+  orchestrator-worker:
+    <<: *node-runtime
+    command: ["corepack", "pnpm", "--filter", "@choicemind/orchestrator", "start:worker"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      CHOICEMIND_DATABASE_URL: "${CHOICEMIND_DATABASE_URL:?CHOICEMIND_DATABASE_URL is required}"
+      CHOICEMIND_REDIS_URL: redis://redis:6379
+      CHOICEMIND_RUNTIME: fake
+      CHOICEMIND_TASK_CONSUMER_GROUP: choicemind-orchestrator
+      CHOICEMIND_TASK_STREAM: choicemind:decision-tasks
+      CHOICEMIND_WORKER_ID: orchestrator-worker-1
+    restart: unless-stopped
+
   data-worker:
     image: choicemind-data-worker:p0
     build:
@@ -62,3 +121,7 @@ services:
       interval: 10s
       timeout: 3s
       retries: 5
+
+volumes:
+  postgres-data:
+  redis-data:

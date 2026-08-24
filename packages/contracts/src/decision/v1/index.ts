@@ -1,5 +1,6 @@
 import {
   decisionTaskResultSchema,
+  decisionTaskSnapshotSchema,
   executeDecisionTaskCommandSchema,
   successfulDecisionTaskResultDraftSchema
 } from "./schemas.js";
@@ -8,6 +9,9 @@ import { checkDecisionTaskResultInvariants } from "./invariants.js";
 
 export {
   createContractRejectedDecisionTaskResultV1,
+  createDecisionTaskNotFoundResultV1,
+  createIdempotencyConflictResultV1,
+  createPersistenceUnavailableResultV1,
   createUnknownDecisionExecutionResultV1
 } from "./errors.js";
 
@@ -55,6 +59,68 @@ export type ExecuteDecisionTaskCommandV1 = Readonly<{
   executionRequestId: string;
   requirementRevision: RequirementRevisionV1;
 }>;
+
+export type AcceptedDecisionTaskSnapshotV1 = Readonly<{
+  contractType: "decision-task-snapshot";
+  contractVersion: "1.0";
+  executionRequestId: string;
+  decisionTaskId: string;
+  agentRunId: string;
+  state: "ACCEPTED";
+  terminal: false;
+  updatedAt: string;
+}>;
+
+export type RunningDecisionTaskSnapshotV1 = Readonly<{
+  contractType: "decision-task-snapshot";
+  contractVersion: "1.0";
+  executionRequestId: string;
+  decisionTaskId: string;
+  agentRunId: string;
+  state: "RUNNING";
+  terminal: false;
+  updatedAt: string;
+}>;
+
+export type RetryableFailedDecisionTaskSnapshotV1 = Readonly<{
+  contractType: "decision-task-snapshot";
+  contractVersion: "1.0";
+  executionRequestId: string;
+  decisionTaskId: string;
+  agentRunId: string;
+  state: "FAILED_RETRYABLE";
+  terminal: false;
+  updatedAt: string;
+}>;
+
+export type FinalFailedDecisionTaskSnapshotV1 = Readonly<{
+  contractType: "decision-task-snapshot";
+  contractVersion: "1.0";
+  executionRequestId: string;
+  decisionTaskId: string;
+  agentRunId: string;
+  state: "FAILED_FINAL";
+  terminal: true;
+  updatedAt: string;
+}>;
+
+export type PartialDecisionTaskSnapshotV1 = Readonly<{
+  contractType: "decision-task-snapshot";
+  contractVersion: "1.0";
+  executionRequestId: string;
+  decisionTaskId: string;
+  agentRunId: string;
+  state: "PARTIAL";
+  terminal: false;
+  updatedAt: string;
+}>;
+
+export type DecisionTaskSnapshotV1 =
+  | AcceptedDecisionTaskSnapshotV1
+  | RunningDecisionTaskSnapshotV1
+  | RetryableFailedDecisionTaskSnapshotV1
+  | FinalFailedDecisionTaskSnapshotV1
+  | PartialDecisionTaskSnapshotV1;
 
 export type CandidateV1 = Readonly<{
   contractType: "candidate";
@@ -301,8 +367,17 @@ export type ChoiceMindErrorV1 = Readonly<{
     | "CONTRACT_INVALID"
     | "CONTRACT_VERSION_UNSUPPORTED"
     | "AGENT_RUNTIME_FAILED"
-    | "DECISION_EXECUTION_STATUS_UNKNOWN";
-  category: "VALIDATION" | "VERSION" | "RUNTIME" | "TRANSPORT";
+    | "DECISION_EXECUTION_STATUS_UNKNOWN"
+    | "DECISION_TASK_NOT_FOUND"
+    | "IDEMPOTENCY_CONFLICT"
+    | "PERSISTENCE_UNAVAILABLE";
+  category:
+    | "VALIDATION"
+    | "VERSION"
+    | "RUNTIME"
+    | "TRANSPORT"
+    | "RESOURCE"
+    | "STORAGE";
   message: string;
   retryMode: RetryModeV1;
   issues: readonly ContractIssueV1[];
@@ -407,6 +482,35 @@ export function decodeExecuteDecisionTaskCommandV1(
           path
         };
       })
+    };
+  }
+
+  return { ok: true, value: parsed.data };
+}
+
+export function decodeDecisionTaskSnapshotV1(
+  input: unknown
+): ContractDecodeResult<DecisionTaskSnapshotV1> {
+  const unsupportedVersion = findUnsupportedVersion(input);
+
+  if (unsupportedVersion !== undefined) {
+    return {
+      ok: false,
+      code: "CONTRACT_VERSION_UNSUPPORTED",
+      issues: [unsupportedVersion]
+    };
+  }
+
+  const parsed = decisionTaskSnapshotSchema.safeParse(input);
+
+  if (!parsed.success) {
+    return {
+      ok: false,
+      code: "CONTRACT_INVALID",
+      issues: parsed.error.issues.map((issue) => ({
+        message: "字段不符合合同要求",
+        path: issue.path.join(".")
+      }))
     };
   }
 

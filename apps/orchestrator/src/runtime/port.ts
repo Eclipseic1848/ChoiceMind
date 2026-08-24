@@ -24,6 +24,18 @@ export type AgentRuntimeRunOutputV1 = Readonly<{
   runEvents: readonly RunEventV1[];
 }>;
 
+export type AgentRuntimeNonSuccessfulOutcomeV1 = Readonly<{
+  state: "FAILED_RETRYABLE" | "FAILED_FINAL" | "PARTIAL";
+  summary: string;
+}>;
+
+export type AgentRuntimePersistentRunResultV1 =
+  | AgentRuntimeRunOutputV1
+  | AgentRuntimeNonSuccessfulOutcomeV1;
+
 export interface AgentRuntimeRunPort {
   run(command: AgentRuntimeRunCommandV1): Promise<AgentRuntimeRunOutputV1>;
+  runPersistent?(
+    command: AgentRuntimeRunCommandV1
+  ): Promise<AgentRuntimePersistentRunResultV1>;
 }

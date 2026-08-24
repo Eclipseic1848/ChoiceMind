@@ -1,6 +1,10 @@
 import * as z from "zod";
 
-import type { DecisionTaskResultV1, ExecuteDecisionTaskCommandV1 } from "./index.js";
+import type {
+  DecisionTaskResultV1,
+  DecisionTaskSnapshotV1,
+  ExecuteDecisionTaskCommandV1
+} from "./index.js";
 
 const meaningfulTextSchema = z.string().refine((value) => value.trim().length > 0);
 
@@ -315,9 +319,19 @@ const choiceMindErrorSchema = z.strictObject({
     "CONTRACT_INVALID",
     "CONTRACT_VERSION_UNSUPPORTED",
     "AGENT_RUNTIME_FAILED",
-    "DECISION_EXECUTION_STATUS_UNKNOWN"
+    "DECISION_EXECUTION_STATUS_UNKNOWN",
+    "DECISION_TASK_NOT_FOUND",
+    "IDEMPOTENCY_CONFLICT",
+    "PERSISTENCE_UNAVAILABLE"
   ]),
-  category: z.enum(["VALIDATION", "VERSION", "RUNTIME", "TRANSPORT"]),
+  category: z.enum([
+    "VALIDATION",
+    "VERSION",
+    "RUNTIME",
+    "TRANSPORT",
+    "RESOURCE",
+    "STORAGE"
+  ]),
   message: meaningfulTextSchema,
   retryMode: z.enum(["NONE", "SAME_EXECUTION_ONLY", "NEW_EXECUTION_ALLOWED"]),
   issues: z.array(
@@ -386,6 +400,28 @@ export const executeDecisionTaskCommandSchema = z.strictObject({
   requirementRevision: requirementRevisionSchema
 });
 
+const decisionTaskSnapshotShape = {
+  ...contractHeader,
+  contractType: z.literal("decision-task-snapshot"),
+  executionRequestId: z.string().min(1),
+  decisionTaskId: z.string().min(1),
+  agentRunId: z.string().min(1),
+  terminal: z.literal(false),
+  updatedAt: utcTimestampSchema
+};
+
+export const decisionTaskSnapshotSchema = z.discriminatedUnion("state", [
+  z.strictObject({ ...decisionTaskSnapshotShape, state: z.literal("ACCEPTED") }),
+  z.strictObject({ ...decisionTaskSnapshotShape, state: z.literal("RUNNING") }),
+  z.strictObject({ ...decisionTaskSnapshotShape, state: z.literal("FAILED_RETRYABLE") }),
+  z.strictObject({
+    ...decisionTaskSnapshotShape,
+    state: z.literal("FAILED_FINAL"),
+    terminal: z.literal(true)
+  }),
+  z.strictObject({ ...decisionTaskSnapshotShape, state: z.literal("PARTIAL") })
+]);
+
 export const decisionTaskResultSchema = z.union([
   successfulDecisionTaskResultSchema,
   failedDecisionTaskResultSchema,
@@ -419,8 +455,11 @@ const schemaContractConsistency: readonly [
     >
   >,
   Assert<
+    IsExact<z.output<typeof decisionTaskSnapshotSchema>, DeepMutable<DecisionTaskSnapshotV1>>
+  >,
+  Assert<
     IsExact<z.output<typeof decisionTaskResultSchema>, DeepMutable<DecisionTaskResultV1>>
   >
-] = [true, true];
+] = [true, true, true];
 
 void schemaContractConsistency;

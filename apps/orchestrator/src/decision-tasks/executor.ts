@@ -12,28 +12,69 @@ type DecisionTaskExecutorOptions = Readonly<{
 }>;
 
 export interface DecisionTaskExecutor {
-  execute(command: ExecuteDecisionTaskCommandV1): Promise<DecisionTaskResultV1>;
+  execute(
+    command: ExecuteDecisionTaskCommandV1,
+    context?: Readonly<{ agentRunId: string }>
+  ): Promise<DecisionTaskResultV1>;
 }
+
+export interface PersistentDecisionTaskExecutor extends DecisionTaskExecutor {
+  executePersistent(
+    command: ExecuteDecisionTaskCommandV1,
+    context: Readonly<{ agentRunId: string }>
+  ): Promise<DecisionTaskExecutionOutcome>;
+}
+
+export type DecisionTaskExecutionOutcome =
+  | Extract<DecisionTaskResultV1, Readonly<{ taskStatus: unknown }>>
+  | Readonly<{
+      state: "FAILED_RETRYABLE" | "FAILED_FINAL" | "PARTIAL";
+      summary: string;
+    }>;
+
+type DecisionTaskExecutionAttempt = Readonly<{
+  result: DecisionTaskResultV1;
+  persistentOutcome: DecisionTaskExecutionOutcome;
+}>;
 
 export function createDecisionTaskExecutor(
   options: DecisionTaskExecutorOptions
-): DecisionTaskExecutor {
+): PersistentDecisionTaskExecutor {
   const receipts = new Map<
     string,
-    Readonly<{ fingerprint: string; result: Promise<DecisionTaskResultV1> }>
+    Readonly<{
+      fingerprint: string;
+      attempt?: Promise<DecisionTaskExecutionAttempt>;
+    }>
   >();
 
   return {
-    execute(command) {
+    execute(command, context) {
+      return executeAttempt(command, context?.agentRunId, false).then(
+        (attempt) => attempt.result
+      );
+    },
+    executePersistent(command, context) {
+      return executeAttempt(command, context.agentRunId, true).then(
+        (attempt) => attempt.persistentOutcome
+      );
+    }
+  };
+
+  function executeAttempt(
+    command: ExecuteDecisionTaskCommandV1,
+    persistedAgentRunId: string | undefined,
+    forPersistence: boolean
+  ): Promise<DecisionTaskExecutionAttempt> {
       const fingerprint = canonicalize(command);
       const receipt = receipts.get(command.executionRequestId);
 
-      if (receipt?.fingerprint === fingerprint) {
-        return receipt.result;
+      if (receipt?.fingerprint === fingerprint && receipt.attempt !== undefined) {
+        return receipt.attempt;
       }
 
-      if (receipt !== undefined) {
-        return Promise.resolve({
+      if (receipt !== undefined && receipt.fingerprint !== fingerprint) {
+        const result: DecisionTaskResultV1 = {
           contractType: "decision-task-result",
           contractVersion: "1.0",
           ok: false,
@@ -53,28 +94,62 @@ export function createDecisionTaskExecutor(
             ],
             occurredAt: "2026-08-12T12:00:00.000Z"
           }
+        };
+
+        return Promise.resolve({
+          result,
+          persistentOutcome: {
+            state: "FAILED_FINAL",
+            summary: "执行标识与原命令不一致"
+          }
         });
       }
 
-      const result = executeOnce(command);
-      receipts.set(command.executionRequestId, { fingerprint, result });
-      return result;
-    }
-  };
+      const attempt = executeOnce(command, persistedAgentRunId, forPersistence);
+      const activeReceipt = { fingerprint, attempt };
+      receipts.set(command.executionRequestId, activeReceipt);
+      void attempt.then((completedAttempt) => {
+        if (
+          isRetryableOutcome(completedAttempt.persistentOutcome) &&
+          receipts.get(command.executionRequestId) === activeReceipt
+        ) {
+          receipts.set(command.executionRequestId, { fingerprint });
+        }
+      });
+      return attempt;
+  }
 
   async function executeOnce(
-    command: ExecuteDecisionTaskCommandV1
-  ): Promise<DecisionTaskResultV1> {
-    const agentRunId = `agent-run-${command.executionRequestId}`;
+    command: ExecuteDecisionTaskCommandV1,
+    persistedAgentRunId: string | undefined,
+    forPersistence: boolean
+  ): Promise<DecisionTaskExecutionAttempt> {
+    const agentRunId = persistedAgentRunId ?? `agent-run-${command.executionRequestId}`;
     const decisionTaskId = command.requirementRevision.decisionTaskId;
 
     try {
-      const runtimeOutput: unknown = await options.runtime.run({
+      const runtimeCommand = {
         contractVersion: "1.0",
         decisionTaskId,
         agentRunId,
         requirementRevision: command.requirementRevision
-      });
+      } as const;
+      const runtimeOutput: unknown = await (forPersistence && options.runtime.runPersistent
+        ? options.runtime.runPersistent(runtimeCommand)
+        : options.runtime.run(runtimeCommand));
+
+      if (isExplicitRuntimeOutcome(runtimeOutput)) {
+        return {
+          result: createRuntimeFailedResult(
+            decisionTaskId,
+            agentRunId,
+            runtimeOutput.state === "FAILED_RETRYABLE"
+              ? "SAME_EXECUTION_ONLY"
+              : "NEW_EXECUTION_ALLOWED"
+          ),
+          persistentOutcome: runtimeOutput
+        };
+      }
 
       if (
         !isRecord(runtimeOutput) ||
@@ -85,13 +160,13 @@ export function createDecisionTaskExecutor(
         !Array.isArray(runtimeOutput.claimEvidenceLinks) ||
         !isRecord(runtimeOutput.decision)
       ) {
-        return createRuntimeFailedResult(decisionTaskId, agentRunId);
+        return createFailedExecutionAttempt(decisionTaskId, agentRunId);
       }
 
       const completedEvent = runtimeOutput.runEvents[runtimeOutput.runEvents.length - 1];
 
       if (!isRecord(completedEvent)) {
-        return createRuntimeFailedResult(decisionTaskId, agentRunId);
+        return createFailedExecutionAttempt(decisionTaskId, agentRunId);
       }
 
       const result = {
@@ -122,17 +197,37 @@ export function createDecisionTaskExecutor(
       const decoded = finalizeSuccessfulDecisionTaskResultV1(result);
 
       return decoded.ok
-        ? decoded.value
-        : createRuntimeFailedResult(decisionTaskId, agentRunId);
+        ? { result: decoded.value, persistentOutcome: decoded.value }
+        : createFailedExecutionAttempt(decisionTaskId, agentRunId);
     } catch {
-      return createRuntimeFailedResult(decisionTaskId, agentRunId);
+      return createFailedExecutionAttempt(decisionTaskId, agentRunId);
     }
   }
 }
 
-function createRuntimeFailedResult(
+function isRetryableOutcome(outcome: DecisionTaskExecutionOutcome): boolean {
+  return "state" in outcome && outcome.state === "FAILED_RETRYABLE";
+}
+
+function createFailedExecutionAttempt(
   decisionTaskId: string,
   agentRunId: string
+): DecisionTaskExecutionAttempt {
+  const result = createRuntimeFailedResult(decisionTaskId, agentRunId);
+
+  return {
+    result,
+    persistentOutcome: {
+      state: "FAILED_FINAL",
+      summary: "Agent Runtime 未形成合法 Decision"
+    }
+  };
+}
+
+function createRuntimeFailedResult(
+  decisionTaskId: string,
+  agentRunId: string,
+  retryMode: "SAME_EXECUTION_ONLY" | "NEW_EXECUTION_ALLOWED" = "NEW_EXECUTION_ALLOWED"
 ): FailedDecisionTaskResultV1 {
   const errorId = "error-synth-runtime-failure";
   const failedAt = "2026-08-12T12:00:01.000Z";
@@ -187,11 +282,25 @@ function createRuntimeFailedResult(
       code: "AGENT_RUNTIME_FAILED",
       category: "RUNTIME",
       message: "决策任务失败",
-      retryMode: "NEW_EXECUTION_ALLOWED",
+      retryMode,
       issues: [],
       occurredAt: failedAt
     }
   };
+}
+
+function isExplicitRuntimeOutcome(value: unknown): value is Exclude<
+  DecisionTaskExecutionOutcome,
+  DecisionTaskResultV1
+> {
+  return (
+    isRecord(value) &&
+    (value.state === "FAILED_RETRYABLE" ||
+      value.state === "FAILED_FINAL" ||
+      value.state === "PARTIAL") &&
+    typeof value.summary === "string" &&
+    value.summary.trim().length > 0
+  );
 }
 
 function canonicalize(value: unknown): string {

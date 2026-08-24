@@ -5,6 +5,9 @@ export function createFakeAgentRuntimeAdapter(): AgentRuntimeRunPort {
   return {
     async run(command) {
       return buildSyntheticLaptopRunOutput(command);
+    },
+    async runPersistent(command) {
+      return buildSyntheticLaptopRunOutput(command);
     }
   };
 }
