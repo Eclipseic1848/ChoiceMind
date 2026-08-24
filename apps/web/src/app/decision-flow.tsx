@@ -2,12 +2,14 @@
 
 import {
   type ClaimValueV1,
+  type CompletedDecisionTaskStatusV1,
   createUnknownDecisionExecutionResultV1,
   type DecisionTaskResultV1,
   type DecisionTaskSnapshotV1,
   decodeDecisionTaskResultV1,
   decodeDecisionTaskSnapshotV1,
   decodePersistedRunEventV1,
+  type FailedDecisionTaskStatusV1,
   getDecisionTaskResultHttpStatusV1,
   type PersistedRunEventV1,
   type SuccessfulDecisionTaskResultV1
@@ -81,14 +83,16 @@ export function DecisionFlow() {
 
     const decisionTaskId = taskId;
     let active = true;
+    let lastEventCursor: string | undefined;
     let reconnectTimer: number | undefined;
     let source: EventSource | undefined;
     setConnectionState("idle");
     void loadTask(decisionTaskId);
 
     function connect() {
+      const after = lastEventCursor === undefined ? "" : `?after=${encodeURIComponent(lastEventCursor)}`;
       const nextSource = new EventSource(
-        `/api/decision-tasks/${encodeURIComponent(decisionTaskId)}/events`
+        `/api/decision-tasks/${encodeURIComponent(decisionTaskId)}/events${after}`
       );
       source = nextSource;
       nextSource.onopen = () => {
@@ -113,6 +117,13 @@ export function DecisionFlow() {
 
         if (!decoded.ok || decoded.value.event.decisionTaskId !== decisionTaskId) {
           return;
+        }
+
+        if (
+          lastEventCursor === undefined ||
+          BigInt(decoded.value.cursor) > BigInt(lastEventCursor)
+        ) {
+          lastEventCursor = decoded.value.cursor;
         }
 
         setPersistedEvents((current) => mergePersistedEvent(current, decoded.value));
@@ -247,10 +258,13 @@ export function DecisionFlow() {
       <p aria-live="polite">{pending ? "正在理解需求并核验合成证据" : ""}</p>
       {taskId === null ? null : (
         <TaskProgress
+          authoritativeState={
+            snapshot?.state ??
+            (result !== null && "taskStatus" in result ? result.taskStatus.state : null)
+          }
           connectionState={connectionState}
           events={persistedEvents}
           observationError={observationError}
-          snapshot={snapshot}
           taskId={taskId}
         />
       )}
@@ -268,23 +282,27 @@ export function DecisionFlow() {
 }
 
 function TaskProgress({
+  authoritativeState,
   connectionState,
   events,
   observationError,
-  snapshot,
   taskId
 }: Readonly<{
+  authoritativeState:
+    | DecisionTaskSnapshotV1["state"]
+    | CompletedDecisionTaskStatusV1["state"]
+    | FailedDecisionTaskStatusV1["state"]
+    | null;
   connectionState: "idle" | "connected" | "reconnecting";
   events: readonly PersistedRunEventV1[];
   observationError: boolean;
-  snapshot: DecisionTaskSnapshotV1 | null;
   taskId: string;
 }>) {
   return (
     <section aria-labelledby="task-progress-heading">
       <h2 id="task-progress-heading">任务进度</h2>
       <p>任务：{taskId}</p>
-      {snapshot === null ? null : <p>权威状态：{snapshot.state}</p>}
+      {authoritativeState === null ? null : <p>权威状态：{authoritativeState}</p>}
       {observationError ? <p role="status">任务状态暂时无法读取</p> : null}
       <p aria-live="polite">
         {connectionState === "reconnecting"

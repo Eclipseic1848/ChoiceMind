@@ -5,7 +5,8 @@ type RouteContext = Readonly<{
 export async function GET(request: Request, context: RouteContext) {
   const { decisionTaskId } = await context.params;
   const apiUrl = process.env.CHOICEMIND_API_URL ?? "http://127.0.0.1:3100";
-  const lastEventId = request.headers.get("last-event-id");
+  const lastEventId =
+    request.headers.get("last-event-id") ?? new URL(request.url).searchParams.get("after");
   const headers = new Headers({ Accept: "text/event-stream" });
 
   if (lastEventId !== null) {

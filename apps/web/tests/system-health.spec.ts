@@ -4,11 +4,15 @@ import { expect, test } from "@playwright/test";
 
 let apiServer: Server;
 let decisionResponseStatus = 200;
+const sseRecoveryRunId = "agent-run-web-sse-recovery";
+const sseRecoveryTaskId = "task-web-sse-recovery";
+let sseRecoveryCursors: Array<string | null> = [];
 
 test.describe.configure({ mode: "serial" });
 
 test.beforeEach(() => {
   decisionResponseStatus = 200;
+  sseRecoveryCursors = [];
 });
 
 test.beforeAll(async () => {
@@ -34,6 +38,30 @@ test.beforeAll(async () => {
       response.setHeader("content-type", "application/json; charset=utf-8");
       response.statusCode = decisionResponseStatus;
       response.end(JSON.stringify(buildSyntheticDecisionResult()));
+      return;
+    }
+
+    if (request.url === `/api/v1/decision-tasks/${sseRecoveryTaskId}/events`) {
+      sseRecoveryCursors.push(request.headers["last-event-id"] ?? null);
+
+      if (sseRecoveryCursors.length === 2) {
+        response.writeHead(503).end();
+        return;
+      }
+
+      const event = buildPersistedEvent({
+        cursor: sseRecoveryCursors.length === 1 ? "301" : "302",
+        eventId:
+          sseRecoveryCursors.length === 1
+            ? "event-web-sse-initial"
+            : "event-web-sse-recovered",
+        runId: sseRecoveryRunId,
+        sequence: sseRecoveryCursors.length === 1 ? 1 : 2,
+        summary: sseRecoveryCursors.length === 1 ? "中断前的事件" : "服务恢复后的事件",
+        taskId: sseRecoveryTaskId
+      });
+      response.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
+      response.end(`id: ${event.cursor}\ndata: ${JSON.stringify(event)}\n\n`);
       return;
     }
 
@@ -165,6 +193,7 @@ test("stores the accepted task in the URL and restores persisted events after re
   await page.reload();
 
   await expect(page).toHaveURL(new RegExp(`decisionTaskId=${taskId}`));
+  await expect(page.getByText("权威状态：COMPLETED")).toBeVisible();
   await expect(page.getByText("已从 Postgres 恢复任务事件")).toBeVisible();
 });
 
@@ -239,32 +268,7 @@ test("deduplicates and orders replayed events while treating disconnect as recon
 test("reconnects after SSE is temporarily unavailable and replays the recovered event", async ({
   page
 }) => {
-  const taskId = "task-web-sse-recovery";
-  const runId = "agent-run-web-sse-recovery";
-  const recoveredEvent = buildPersistedEvent({
-    cursor: "302",
-    eventId: "event-web-sse-recovered",
-    runId,
-    sequence: 2,
-    summary: "服务恢复后的事件",
-    taskId
-  });
-
-  await page.route(`**/api/decision-tasks/${taskId}/events`, async (route) => {
-    await route.fulfill({
-      status: 200,
-      contentType: "text/event-stream; charset=utf-8",
-      body: `id: ${recoveredEvent.cursor}\ndata: ${JSON.stringify(recoveredEvent)}\n\n`
-    });
-  });
-  await page.route(
-    `**/api/decision-tasks/${taskId}/events`,
-    async (route) => {
-      await route.fulfill({ status: 503, body: "" });
-    },
-    { times: 1 }
-  );
-  await page.route(`**/api/decision-tasks/${taskId}`, async (route) => {
+  await page.route(`**/api/decision-tasks/${sseRecoveryTaskId}`, async (route) => {
     await route.fulfill({
       status: 200,
       contentType: "application/json; charset=utf-8",
@@ -272,8 +276,8 @@ test("reconnects after SSE is temporarily unavailable and replays the recovered 
         contractType: "decision-task-snapshot",
         contractVersion: "1.0",
         executionRequestId: "exec-web-sse-recovery",
-        decisionTaskId: taskId,
-        agentRunId: runId,
+        decisionTaskId: sseRecoveryTaskId,
+        agentRunId: sseRecoveryRunId,
         state: "RUNNING",
         terminal: false,
         updatedAt: "2026-08-24T02:10:00.000Z"
@@ -281,8 +285,9 @@ test("reconnects after SSE is temporarily unavailable and replays the recovered 
     });
   });
 
-  await page.goto(`/?decisionTaskId=${taskId}`);
+  await page.goto(`/?decisionTaskId=${sseRecoveryTaskId}`);
 
+  await expect.poll(() => sseRecoveryCursors.slice(0, 3)).toEqual([null, "301", "301"]);
   await expect(page.getByRole("region", { name: "任务进度" })).toContainText(
     "服务恢复后的事件"
   );
