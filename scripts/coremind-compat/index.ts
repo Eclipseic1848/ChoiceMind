@@ -6,9 +6,13 @@ import type {
   CoreMindCompatibilitySystem,
   CoreMindCandidateVerification,
   CoreMindCompatibilityEnvironment,
-  CoreMindMaterializationFailureReason,
+  CoreMindCompatibilityPolicy,
+  CoreMindVerificationSubject,
+  CoreMindSafeCleanupFailure,
+  CoreMindSafeProgress,
   MaterializedCoreMindCandidate,
-  MaterializedCoreMindPackage
+  MaterializedCoreMindPackage,
+  CoreMindVerificationFailureReason
 } from "./internal-types.js";
 
 export const CORE_MIND_REPOSITORY = "https://github.com/Eclipseic1848/CoreMind.git";
@@ -33,6 +37,8 @@ export const CORE_MIND_RUNTIME_DEPENDENCIES = [
   "coremind-templates"
 ] as const;
 
+export type CoreMindRuntimePackageName = (typeof CORE_MIND_RUNTIME_DEPENDENCIES)[number];
+
 const CORE_MIND_AI_DEPENDENCIES = CORE_MIND_RUNTIME_DEPENDENCIES.filter(
   (name) => name !== "coremind-ai"
 );
@@ -40,10 +46,10 @@ const CORE_MIND_AI_DEPENDENCIES = CORE_MIND_RUNTIME_DEPENDENCIES.filter(
 type CoreMindPackageName = (typeof CORE_MIND_PACKAGE_NAMES)[number];
 type GateState = "PASSED" | "FAILED" | "NOT_RUN";
 
-export type CoreMindVerificationGate = "C" | "D" | "E" | "F";
+export type CoreMindVerificationGate = "C" | "D" | "E" | "F" | "G";
 
 export class CoreMindCompatibilityError extends Error {
-  readonly gate: "A" | "B" | "C" | "D" | "E" | "F";
+  readonly gate: "A" | "B" | "C" | "D" | "E" | "F" | "G";
   readonly code:
     | "CANDIDATE_INVALID"
     | "ENVIRONMENT_IDENTITY_FAILED"
@@ -54,14 +60,22 @@ export class CoreMindCompatibilityError extends Error {
     | "REPORT_WRITE_FAILED"
     | "ARTIFACT_PROMOTION_FAILED";
   readonly stage: CoreMindCompatibilityStage | undefined;
-  readonly reason: CoreMindMaterializationFailureReason | undefined;
+  readonly reason: CoreMindVerificationFailureReason | undefined;
+  readonly progress: CoreMindSafeProgress | undefined;
+  readonly cleanupFailure: CoreMindSafeCleanupFailure | undefined;
+  readonly cleanupFailures: CoreMindSafeCleanupFailure[];
+  readonly subject: CoreMindVerificationSubject | undefined;
 
   constructor(
-    gate: "A" | "B" | "C" | "D" | "E" | "F",
+    gate: "A" | "B" | "C" | "D" | "E" | "F" | "G",
     code: CoreMindCompatibilityError["code"],
     message: string,
     stage?: CoreMindCompatibilityStage,
-    reason?: CoreMindMaterializationFailureReason
+    reason?: CoreMindVerificationFailureReason,
+    progress?: CoreMindSafeProgress,
+    cleanupFailure?: CoreMindSafeCleanupFailure,
+    cleanupFailures?: CoreMindSafeCleanupFailure[],
+    subject?: CoreMindVerificationSubject
   ) {
     super(message);
     this.name = "CoreMindCompatibilityError";
@@ -69,6 +83,10 @@ export class CoreMindCompatibilityError extends Error {
     this.code = code;
     this.stage = stage;
     this.reason = reason;
+    this.progress = progress;
+    this.cleanupFailure = cleanupFailure;
+    this.cleanupFailures = cleanupFailures ?? (cleanupFailure ? [cleanupFailure] : []);
+    this.subject = subject;
   }
 }
 
@@ -93,6 +111,10 @@ export interface NpmReleaseCandidate {
 export type CoreMindCandidate = GitCommitCandidate | NpmReleaseCandidate;
 
 export type CoreMindMaterializationStage =
+  | "MATERIALIZATION_PREFLIGHT"
+  | "MATERIALIZATION_LOCK"
+  | "ARTIFACT_REUSE"
+  | "ARTIFACT_PERSIST"
   | "NPM_SANDBOX"
   | "GIT_FETCH"
   | "NPM_CI"
@@ -114,6 +136,7 @@ export type CoreMindCompatibilityStage =
   | "VERTICAL_TEST"
   | "ROOT_VERIFY"
   | "RESOURCE_CLEANUP"
+  | "LOCAL_MODEL_SMOKE"
   | "REPORT_WRITE"
   | "ARTIFACT_PROMOTION";
 
@@ -128,11 +151,16 @@ export interface CoreMindCompatibilitySuccessReport {
 
 export interface CoreMindCompatibilityFailureReport {
   schemaVersion: 1;
+  compatibilityPolicy?: CoreMindCompatibilityPolicy;
   gates: Record<"A" | "B" | "C" | "D" | "E" | "F" | "G" | "H", GateState>;
   failure: {
     code: CoreMindCompatibilityError["code"];
     stage?: CoreMindCompatibilityStage;
-    reason?: CoreMindMaterializationFailureReason;
+    reason?: CoreMindVerificationFailureReason;
+    subject?: CoreMindVerificationSubject;
+    progress?: CoreMindSafeProgress;
+    cleanupFailure?: CoreMindSafeCleanupFailure;
+    cleanupFailures?: CoreMindSafeCleanupFailure[];
   };
 }
 
@@ -168,7 +196,10 @@ export async function runCoreMindCompatibility(
       "ARTIFACT_MATERIALIZATION_FAILED",
       error,
       error instanceof CoreMindArtifactMaterializationError ? error.stage : undefined,
-      error instanceof CoreMindArtifactMaterializationError ? error.reason : undefined
+      error instanceof CoreMindArtifactMaterializationError ? error.reason : undefined,
+      error instanceof CoreMindArtifactMaterializationError ? error.progress : undefined,
+      error instanceof CoreMindArtifactMaterializationError ? error.cleanupFailure : undefined,
+      error instanceof CoreMindArtifactMaterializationError ? error.cleanupFailures : undefined
     );
   }
 
@@ -188,7 +219,11 @@ export async function runCoreMindCompatibility(
       "COMPATIBILITY_VERIFICATION_FAILED",
       error,
       error instanceof CoreMindCandidateVerificationError ? error.stage : undefined,
-      error instanceof CoreMindCandidateVerificationError ? error.reason : undefined
+      error instanceof CoreMindCandidateVerificationError ? error.reason : undefined,
+      error instanceof CoreMindCandidateVerificationError ? error.progress : undefined,
+      error instanceof CoreMindCandidateVerificationError ? error.cleanupFailure : undefined,
+      error instanceof CoreMindCandidateVerificationError ? error.cleanupFailures : undefined,
+      error instanceof CoreMindCandidateVerificationError ? error.subject : undefined
     );
   }
 
@@ -203,7 +238,7 @@ export async function runCoreMindCompatibility(
       D: "PASSED",
       E: "PASSED",
       F: "PASSED",
-      G: "NOT_RUN",
+      G: verification.localModelSmoke === undefined ? "NOT_RUN" : "PASSED",
       H: "NOT_RUN"
     },
     artifacts,
@@ -393,11 +428,15 @@ function assemblyError(message: string): CoreMindCompatibilityError {
 }
 
 function compatibilityError(
-  gate: "A" | "B" | "C" | "D" | "E" | "F",
+  gate: "A" | "B" | "C" | "D" | "E" | "F" | "G",
   code: CoreMindCompatibilityError["code"],
   error: unknown,
   stage?: CoreMindCompatibilityStage,
-  reason?: CoreMindMaterializationFailureReason
+  reason?: CoreMindVerificationFailureReason,
+  progress?: CoreMindSafeProgress,
+  cleanupFailure?: CoreMindSafeCleanupFailure,
+  cleanupFailures?: CoreMindSafeCleanupFailure[],
+  subject?: CoreMindVerificationSubject
 ): CoreMindCompatibilityError {
   if (error instanceof CoreMindCompatibilityError) return error;
   return new CoreMindCompatibilityError(
@@ -405,6 +444,10 @@ function compatibilityError(
     code,
     error instanceof Error ? error.message : "CoreMind 候选验证失败",
     stage,
-    reason
+    reason,
+    progress,
+    cleanupFailure,
+    cleanupFailures,
+    subject
   );
 }

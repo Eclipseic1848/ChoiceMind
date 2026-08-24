@@ -1,4 +1,5 @@
 import { once } from "node:events";
+import { randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, rename, rm, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage } from "node:http";
 import os from "node:os";
@@ -19,10 +20,13 @@ const model = requireEnvironmentValue("CHOICEMIND_COREMIND_MODEL");
 const executionRequestId = "coremind-qwen-local-smoke";
 const decisionTaskId = "task-coremind-qwen-local-smoke";
 const requirementRevisionId = "req-coremind-qwen-local-smoke-r1";
-const summaryPath = path.resolve(
-  path.dirname(fileURLToPath(import.meta.url)),
-  "../.artifacts/coremind-qwen-smoke.json"
-);
+const evidenceNonce = process.env.CHOICEMIND_COREMIND_SMOKE_NONCE ?? randomUUID();
+const summaryPath =
+  process.env.CHOICEMIND_COREMIND_SMOKE_SUMMARY_PATH ??
+  path.resolve(
+    path.dirname(fileURLToPath(import.meta.url)),
+    "../.artifacts/coremind-qwen-smoke.json"
+  );
 const configDir = await mkdtemp(path.join(os.tmpdir(), "choicemind-qwen-smoke-"));
 let proxy: RecordingProxy | undefined;
 
@@ -161,9 +165,16 @@ try {
   const result = await executor.execute(command);
   await recordingProxy.close();
   proxy = undefined;
+  const evidenceBoundary = {
+    executedAt: new Date().toISOString(),
+    evidenceNonce,
+    synthetic: true,
+    scope: "INTEGRATION_SMOKE_ONLY"
+  } as const;
   const summary = result.ok
     ? {
         ok: true,
+        ...evidenceBoundary,
         provider: describeProvider(providerBaseUrl, model),
         taskState: result.taskStatus.state,
         decisionStatus: result.bundle.decision.status,
@@ -173,6 +184,7 @@ try {
       }
     : {
         ok: false,
+        ...evidenceBoundary,
         provider: describeProvider(providerBaseUrl, model),
         taskState: "taskStatus" in result ? result.taskStatus.state : undefined,
         errorCode: result.error.code,

@@ -7,16 +7,33 @@ import {
   runCoreMindCompatibility,
   type CoreMindCompatibilityReport
 } from "./index.js";
-import type { CoreMindCompatibilitySystem } from "./internal-types.js";
+import {
+  LOCAL_QWEN_GATE_CONFIGURATION,
+  type CoreMindCompatibilitySystem,
+  type LocalModelGateConfiguration
+} from "./internal-types.js";
+import {
+  CANDIDATE_DEPENDENCY_FETCH_POLICY,
+  DEFAULT_DEPENDENCY_REGISTRY,
+  normalizeDependencyRegistry
+} from "./registry.js";
 import { createSystemCompatibilitySystem } from "./system.js";
+import { isPermissionError } from "./utilities.js";
 
 export interface CoreMindCompatCliDependencies {
-  createCompatibilitySystem(runDirectory: string): CoreMindCompatibilitySystem;
+  createCompatibilitySystem(
+    runDirectory: string,
+    materializationDirectory: string,
+    dependencyRegistry: string,
+    gateG: LocalModelGateConfiguration | undefined
+  ): CoreMindCompatibilitySystem;
   outputRoot: string;
+  removeDirectory?: typeof rm;
 }
 
 export interface CoreMindCompatCliResult {
   reportPath: string;
+  highestPassedGate: "F" | "G";
 }
 
 export class CoreMindCompatCliFailure extends Error {
@@ -33,15 +50,23 @@ export async function runCoreMindCompatCli(
   args: string[],
   dependencies: CoreMindCompatCliDependencies
 ): Promise<CoreMindCompatCliResult> {
-  const candidatePath = parseCandidatePath(args);
+  const { candidatePath, dependencyRegistry, gateG } = parseCliArguments(args);
   await mkdir(dependencies.outputRoot, { recursive: true });
   const stagingDirectory = await mkdtemp(path.join(dependencies.outputRoot, ".staging-"));
   const runId = path.basename(stagingDirectory).slice(".staging-".length);
+  let compatibilitySystem: CoreMindCompatibilitySystem | undefined;
+  let passedGateStates: CoreMindCompatibilityReport["gates"] | undefined;
 
   try {
+    compatibilitySystem = dependencies.createCompatibilitySystem(
+      stagingDirectory,
+      path.join(dependencies.outputRoot, ".materialized"),
+      dependencyRegistry,
+      gateG
+    );
     const candidate = await readCandidate(candidatePath);
-    const compatibilitySystem = dependencies.createCompatibilitySystem(stagingDirectory);
     const report = await runCoreMindCompatibility(candidate, compatibilitySystem);
+    passedGateStates = report.gates;
     try {
       await writeReportAtomically(path.join(stagingDirectory, "report.json"), report);
     } catch {
@@ -63,14 +88,27 @@ export async function runCoreMindCompatCli(
         "ARTIFACT_PROMOTION"
       );
     }
-    return { reportPath: path.join(candidateDirectory, "report.json") };
+    return {
+      reportPath: path.join(candidateDirectory, "report.json"),
+      highestPassedGate: report.gates.G === "PASSED" ? "G" : "F"
+    };
   } catch (error) {
-    await rm(stagingDirectory, {
-      force: true,
-      maxRetries: 5,
-      recursive: true,
-      retryDelay: 100
-    });
+    let stagingCleanupFailure:
+      | { stage: "CLEANUP"; reason: "PERMISSION_DENIED" | "CLEANUP_FAILED" }
+      | undefined;
+    try {
+      await (dependencies.removeDirectory ?? rm)(stagingDirectory, {
+        force: true,
+        maxRetries: 5,
+        recursive: true,
+        retryDelay: 100
+      });
+    } catch (cleanupError) {
+      stagingCleanupFailure = {
+        stage: "CLEANUP",
+        reason: isPermissionError(cleanupError) ? "PERMISSION_DENIED" : "CLEANUP_FAILED"
+      };
+    }
     const failureDirectory = path.join(dependencies.outputRoot, `failure-${runId}`);
     await mkdir(failureDirectory, { recursive: true });
     const reportPath = path.join(failureDirectory, "report.json");
@@ -82,9 +120,24 @@ export async function runCoreMindCompatCli(
             "CANDIDATE_INVALID",
             "候选输入读取失败"
           );
+    const cleanupFailures = [
+      ...compatibilityError.cleanupFailures,
+      ...(stagingCleanupFailure ? [stagingCleanupFailure] : [])
+    ];
+    const cleanupFailure = cleanupFailures[0];
     const report = {
       schemaVersion: 1,
-      gates: failureGateStates(compatibilityError.gate),
+      compatibilityPolicy:
+        compatibilitySystem?.compatibilityPolicy ?? {
+          dependencyRegistry,
+          dependencyFetch: CANDIDATE_DEPENDENCY_FETCH_POLICY,
+          materializationConcurrency: 2,
+          stageTimeouts: {}
+        },
+      gates:
+        passedGateStates?.G === "PASSED"
+          ? passedGateStates
+          : failureGateStates(compatibilityError.gate),
       failure: {
         code: compatibilityError.code,
         ...(compatibilityError.stage === undefined
@@ -92,7 +145,15 @@ export async function runCoreMindCompatCli(
           : { stage: compatibilityError.stage }),
         ...(compatibilityError.reason === undefined
           ? {}
-          : { reason: compatibilityError.reason })
+          : { reason: compatibilityError.reason }),
+        ...(compatibilityError.subject === undefined
+          ? {}
+          : { subject: compatibilityError.subject }),
+        ...(compatibilityError.progress === undefined
+          ? {}
+          : { progress: compatibilityError.progress }),
+        ...(cleanupFailure === undefined ? {} : { cleanupFailure }),
+        ...(cleanupFailures.length > 1 ? { cleanupFailures } : {})
       }
     } satisfies CoreMindCompatibilityReport;
     await writeReportAtomically(reportPath, report);
@@ -103,7 +164,7 @@ export async function runCoreMindCompatCli(
 function failureGateStates(
   failedGate: CoreMindCompatibilityError["gate"]
 ): CoreMindCompatibilityReport["gates"] {
-  const orderedGates = ["A", "B", "C", "D", "E", "F"] as const;
+  const orderedGates = ["A", "B", "C", "D", "E", "F", "G"] as const;
   const failedIndex = orderedGates.indexOf(failedGate);
   return {
     A: failedIndex > 0 ? "PASSED" : "FAILED",
@@ -111,17 +172,44 @@ function failureGateStates(
     C: failedIndex > 2 ? "PASSED" : failedGate === "C" ? "FAILED" : "NOT_RUN",
     D: failedIndex > 3 ? "PASSED" : failedGate === "D" ? "FAILED" : "NOT_RUN",
     E: failedIndex > 4 ? "PASSED" : failedGate === "E" ? "FAILED" : "NOT_RUN",
-    F: failedGate === "F" ? "FAILED" : "NOT_RUN",
-    G: "NOT_RUN",
+    F: failedIndex > 5 ? "PASSED" : failedGate === "F" ? "FAILED" : "NOT_RUN",
+    G: failedGate === "G" ? "FAILED" : "NOT_RUN",
     H: "NOT_RUN"
   };
 }
 
-function parseCandidatePath(args: string[]): string {
-  if (args.length !== 2 || args[0] !== "--candidate" || !args[1]) {
-    throw new Error("用法：pnpm coremind:compat --candidate <versioned-candidate.json>");
+function parseCliArguments(args: string[]): {
+  candidatePath: string;
+  dependencyRegistry: string;
+  gateG: LocalModelGateConfiguration | undefined;
+} {
+  if (args[0] !== "--candidate" || !args[1]) {
+    throw new Error(
+      "用法：pnpm coremind:compat --candidate <versioned-candidate.json> [--registry <https-url>] [--gate-g-local-qwen]"
+    );
   }
-  return path.resolve(args[1]);
+  let dependencyRegistry = DEFAULT_DEPENDENCY_REGISTRY;
+  let gateG: LocalModelGateConfiguration | undefined;
+  for (let index = 2; index < args.length; index += 1) {
+    const argument = args[index];
+    if (argument === "--registry" && args[index + 1]) {
+      dependencyRegistry = normalizeDependencyRegistry(args[index + 1] ?? "");
+      index += 1;
+      continue;
+    }
+    if (argument === "--gate-g-local-qwen" && gateG === undefined) {
+      gateG = LOCAL_QWEN_GATE_CONFIGURATION;
+      continue;
+    }
+    throw new Error(
+      "用法：pnpm coremind:compat --candidate <versioned-candidate.json> [--registry <https-url>] [--gate-g-local-qwen]"
+    );
+  }
+  return {
+    candidatePath: path.resolve(args[1]),
+    dependencyRegistry,
+    gateG
+  };
 }
 
 async function readCandidate(candidatePath: string): Promise<unknown> {
@@ -146,15 +234,28 @@ if (path.resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) {
   process.once("SIGINT", cancel);
   try {
     const result = await runCoreMindCompatCli(process.argv.slice(2), {
-      createCompatibilitySystem: (runDirectory) =>
+      createCompatibilitySystem: (
+        runDirectory,
+        materializationDirectory,
+        dependencyRegistry,
+        gateG
+      ) =>
         createSystemCompatibilitySystem({
           artifactDirectory: runDirectory,
           choiceMindRoot,
+          dependencyRegistry,
+          materializationAllowedRoot: path.join(choiceMindRoot, ".artifacts", "coremind-compat"),
+          materializationDirectory,
+          ...(gateG === undefined ? {} : { localModelGate: gateG }),
           signal: cancellation.signal
         }),
       outputRoot: path.join(choiceMindRoot, ".artifacts", "coremind-compat")
     });
-    console.log(`CoreMind 候选 Gate A-F 离线兼容通过：${result.reportPath}`);
+    console.log(
+      result.highestPassedGate === "G"
+        ? `CoreMind 候选 Gate A-G 本地模型集成通过：${result.reportPath}`
+        : `CoreMind 候选 Gate A-F 离线兼容通过：${result.reportPath}`
+    );
   } catch (error) {
     if (error instanceof CoreMindCompatCliFailure) {
       console.error(`CoreMind 候选兼容验证失败；安全报告：${error.reportPath}`);
