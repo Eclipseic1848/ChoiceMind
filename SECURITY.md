@@ -30,7 +30,8 @@ ChoiceMind 尚未发布 V1.0，也未声明生产就绪。当前仅对 `main` �
 
 - 不得把 API Key、Provider Credential、Source Credential、Cookie 或访问令牌写入仓库、Issue、测试 fixture 或运行证据。
 - Provider、Runtime、工具和外部来源输出均是不可信输入，必须经过 ChoiceMind 合同、安全策略与失败关闭校验。
-- Postgres 是任务权威状态；Redis、缓存或消息传输不能覆盖权威事实。
+- Postgres 是任务状态和公开 RunEvent 的权威来源；Redis、缓存或实时通知不能覆盖权威事实。SSE 断线恢复必须按持久游标从 Postgres 补发。
+- 公开 RunEvent 只能包含可审查的阶段、动作和失败摘要，不得包含模型隐藏思维链、凭据、个人数据或原始模型响应。
 - 本地测试、合成数据、真实服务冒烟和产品验收都不等于生产安全认证。
 
 普通缺陷、功能建议或不涉及安全影响的问题请使用公开 [Issues](https://github.com/Eclipseic1848/ChoiceMind/issues)。
