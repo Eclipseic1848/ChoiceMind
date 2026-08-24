@@ -4,14 +4,14 @@ import path from "node:path";
 
 import { CORE_MIND_PACKAGE_NAMES } from "./index.js";
 import type {
-  CoreMindArtifactSource,
+  CoreMindCompatibilitySystem,
   MaterializedCoreMindCandidate
 } from "./internal-types.js";
 
-export function createArtifactSource(
+export function createCompatibilitySystem(
   materialized = createMaterializedCandidate(),
   runDirectory?: string
-): CoreMindArtifactSource {
+): CoreMindCompatibilitySystem {
   const materialize = async () => {
     if (runDirectory) {
       const packageDirectory = path.join(runDirectory, "packages");
@@ -32,6 +32,12 @@ export function createArtifactSource(
       nodeVersion: "22.22.1",
       workspacePackageManager: "pnpm@11.21.0",
       artifactPackageManager: "npm@10.9.4"
+    }),
+    verifyCandidateCompatibility: async (candidate) => ({
+      resolvedRuntimePackages: candidate.packages
+        .filter((artifact) => !["coremind-worker", "coremind-cli"].includes(artifact.name))
+        .map((artifact) => ({ name: artifact.name, version: artifact.version })),
+      testCounts: { D: 1, E: 2 }
     })
   };
 }

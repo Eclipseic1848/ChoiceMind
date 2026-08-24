@@ -58,7 +58,7 @@ afterEach(async () => {
 });
 
 describe("CoreMind AgentRuntimeRunPort", () => {
-  it("runs through the public CoreMind HTTP/SSE and Tool path before finalizing a Decision", async () => {
+  it("Gate D: runs through the public CoreMind HTTP/SSE and Tool path before finalizing a Decision", async () => {
     const provider = await startOfflineProvider();
     const configDir = await createTemporaryDirectory();
     const command = buildCoreMindCommand("coremind-offline-buy-if-price");
@@ -126,7 +126,7 @@ describe("CoreMind AgentRuntimeRunPort", () => {
     expect(toolParameters).not.toContain("ok");
   });
 
-  it("keeps a deterministic CoreMind Decision field-identical across independent executions", async () => {
+  it("Gate D: keeps a deterministic CoreMind Decision field-identical across independent executions", async () => {
     const provider = await startOfflineProvider();
     const firstConfigDir = await createTemporaryDirectory();
     const secondConfigDir = await createTemporaryDirectory();
@@ -163,7 +163,7 @@ describe("CoreMind AgentRuntimeRunPort", () => {
     expect(provider.requests).toHaveLength(4);
   });
 
-  it("fails closed when the Provider submits the Decision draft Tool more than once", async () => {
+  it("Gate D: fails closed when the Provider submits the Decision draft Tool more than once", async () => {
     const provider = await startOfflineProvider("duplicate-tool");
     const configDir = await createTemporaryDirectory();
     const executor = createDecisionTaskExecutor({
@@ -190,7 +190,7 @@ describe("CoreMind AgentRuntimeRunPort", () => {
     ["provider-timeout", "Provider 超时"],
     ["contradictory-domain-draft", "相互矛盾的领域草稿"],
     ["invalid-decision-draft", "违反 ChoiceMind 合同的 Decision 草稿"]
-  ] as const)("fails closed for %s（%s）", async (scenario, _description) => {
+  ] as const)("Gate D: fails closed for %s（%s）", async (scenario, _description) => {
     const provider = await startOfflineProvider(scenario);
     const configDir = await createTemporaryDirectory();
     const executor = createDecisionTaskExecutor({
@@ -213,7 +213,7 @@ describe("CoreMind AgentRuntimeRunPort", () => {
     expect(JSON.stringify(result)).not.toContain("provider-private-sentinel");
   });
 
-  it("passes only the dedicated ChoiceMind Provider credential into CoreMind", async () => {
+  it("Gate D: passes only the dedicated ChoiceMind Provider credential into CoreMind", async () => {
     let createOptions: Parameters<typeof CoreMindRuntime.create>[0] | undefined;
     vi.spyOn(CoreMindRuntime, "create").mockImplementation(async (options) => {
       createOptions = options;
@@ -239,7 +239,7 @@ describe("CoreMind AgentRuntimeRunPort", () => {
     expect(createOptions?.env?.CHOICEMIND_COREMIND_PROVIDER_API_KEY).toBe("choice-key");
   });
 
-  it("serves BUY_IF_PRICE and NEED_MORE_INFO through the Web, API and Orchestrator HTTP seams", async () => {
+  it("Gate E: serves BUY_IF_PRICE and NEED_MORE_INFO through the Web, API and Orchestrator HTTP seams", async () => {
     const provider = await startOfflineProvider();
     const configDir = await createTemporaryDirectory();
     const orchestratorApp = buildOrchestratorApp({
@@ -296,10 +296,10 @@ describe("CoreMind AgentRuntimeRunPort", () => {
     });
   });
 
-  it("returns a framework-neutral Runtime failure through the Orchestrator HTTP seam", async () => {
+  it("Gate E: returns a framework-neutral Runtime failure through the Web, API and Orchestrator HTTP seams", async () => {
     const provider = await startOfflineProvider("provider-error");
     const configDir = await createTemporaryDirectory();
-    const app = buildOrchestratorApp({
+    const orchestratorApp = buildOrchestratorApp({
       decisionTaskExecutor: createDecisionTaskExecutor({
         runtime: createCoreMindAgentRuntimeAdapter({
           providerBaseUrl: provider.baseUrl,
@@ -308,18 +308,27 @@ describe("CoreMind AgentRuntimeRunPort", () => {
         })
       })
     });
-    openApps.push(app);
-
-    const response = await app.inject({
-      method: "POST",
-      url: "/internal/v1/decision-tasks:execute",
-      payload: buildCoreMindCommand("coremind-http-runtime-failure")
+    openApps.push(orchestratorApp);
+    const orchestratorUrl = await orchestratorApp.listen({ host: "127.0.0.1", port: 0 });
+    const apiApp = buildApiApp({
+      decisionOrchestrator: createHttpDecisionOrchestratorAdapter({
+        baseUrl: orchestratorUrl
+      })
     });
-    const body = response.json();
+    openApps.push(apiApp);
+    process.env.CHOICEMIND_API_URL = await apiApp.listen({ host: "127.0.0.1", port: 0 });
+    const { POST: executeDecisionTaskViaWeb } = (await import(webDecisionRouteModule)) as {
+      POST: (request: Request) => Promise<Response>;
+    };
 
-    expect(response.statusCode).toBe(502);
+    const response = await executeDecisionTaskViaWeb(
+      createWebDecisionRequest(buildCoreMindCommand("coremind-http-runtime-failure"))
+    );
+    const body = await response.json();
+
+    expect(response.status).toBe(502);
     expectRuntimeFailure(body);
-    expect(response.body).not.toContain("provider-private-sentinel");
+    expect(JSON.stringify(body)).not.toContain("provider-private-sentinel");
   });
 });
 
