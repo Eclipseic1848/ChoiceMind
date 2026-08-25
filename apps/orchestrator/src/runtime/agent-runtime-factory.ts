@@ -1,5 +1,6 @@
-import type { AgentRuntimeRunPort } from "./port.js";
+import type { AgentRuntimePort } from "./port.js";
 import type { EgressGuard } from "@choicemind/security";
+import type { RuntimeRecoveryStore } from "@choicemind/task-persistence";
 import { createCoreMindAgentRuntimeAdapter } from "./coremind-agent-runtime-adapter.js";
 import { createFakeAgentRuntimeAdapter } from "./fake-agent-runtime-adapter.js";
 
@@ -8,11 +9,23 @@ type AgentRuntimeFactoryOptions = Readonly<{
   cwd?: string;
   configDir?: string;
   egressGuard?: EgressGuard;
+  recoveryStore?: Pick<
+    RuntimeRecoveryStore,
+    | "putRawSnapshot"
+    | "loadRawSnapshot"
+    | "saveRecoveryFacts"
+    | "loadRecoveryFacts"
+    | "recordRuntimeRunning"
+    | "claimRuntimeResume"
+    | "completeRuntimeControl"
+    | "claimRuntimeCancel"
+    | "isRuntimeCancelled"
+  >;
 }>;
 
 export function createAgentRuntimeAdapter(
   options: AgentRuntimeFactoryOptions = {}
-): AgentRuntimeRunPort {
+): AgentRuntimePort {
   const env = options.env ?? process.env;
   const runtime = env.CHOICEMIND_RUNTIME ?? "fake";
 
@@ -40,6 +53,7 @@ export function createAgentRuntimeAdapter(
     providerBaseUrl,
     model,
     egressGuard: options.egressGuard,
+    ...(options.recoveryStore === undefined ? {} : { recoveryStore: options.recoveryStore }),
     ...(options.configDir === undefined ? {} : { configDir: options.configDir }),
     ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
     ...(env.CHOICEMIND_COREMIND_PROVIDER_API_KEY === undefined

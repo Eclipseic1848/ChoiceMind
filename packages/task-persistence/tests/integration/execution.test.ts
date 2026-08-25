@@ -62,6 +62,7 @@ describe("PersistentDecisionTaskModule execution", () => {
         status: "CLAIMED",
         operationId,
         agentRunId: accepted.agentRunId,
+        ownerUserId: "test-owner",
         command
       }
     ]);

@@ -39,6 +39,25 @@ const app = buildApiApp({
     append: async (record) => decisionTaskPersistence.appendAuditRecord(record)
   },
   decisionTaskPersistence,
+  decisionTaskRuntimeControl: {
+    requestResume: async (input) =>
+      decisionTaskPersistence.requestRuntimeResume({
+        controlRequestId: input.controlRequestId,
+        decisionTaskId: input.decisionTaskId,
+        ownerUserId: input.actor.userId,
+        runtimeSnapshotId: input.runtimeSnapshotId,
+        correlationId: input.correlationId,
+        egressConfirmation: input.egressConfirmation
+      }),
+    requestCancel: async (input) =>
+      decisionTaskPersistence.requestRuntimeCancel({
+        controlRequestId: input.controlRequestId,
+        decisionTaskId: input.decisionTaskId,
+        ownerUserId: input.actor.userId,
+        cancellationId: input.cancellationId,
+        correlationId: input.correlationId
+      })
+  },
   healthUrls: {
     "data-worker": process.env.DATA_WORKER_HEALTH_URL ?? "http://127.0.0.1:3300/health/live",
     orchestrator: process.env.ORCHESTRATOR_HEALTH_URL ?? "http://127.0.0.1:3200/health/live",

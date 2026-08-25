@@ -1,9 +1,16 @@
 import type {
   DecisionTaskResultV1,
   ExecuteDecisionTaskCommandV1,
-  FailedDecisionTaskResultV1
+  FailedDecisionTaskResultV1,
+  EffectReceiptV1,
+  RuntimeSnapshotV1,
+  RuntimeControlErrorV1
 } from "@choicemind/contracts/decision/v1";
-import { finalizeSuccessfulDecisionTaskResultV1 } from "@choicemind/contracts/decision/v1";
+import {
+  decodeRuntimePausedOutcomeV1,
+  finalizeSuccessfulDecisionTaskResultV1,
+  type RuntimePausedOutcomeV1
+} from "@choicemind/contracts/decision/v1";
 
 import type {
   AgentRuntimeRunPort,
@@ -34,13 +41,23 @@ export interface PersistentDecisionTaskExecutor extends DecisionTaskExecutor {
     command: ExecuteDecisionTaskCommandV1,
     context: DecisionTaskExecutionContext
   ): Promise<DecisionTaskExecutionOutcome>;
+  resumePersistent(
+    command: ExecuteDecisionTaskCommandV1,
+    recovery: Readonly<{
+      snapshot: RuntimeSnapshotV1;
+      effectReceipts: readonly EffectReceiptV1[];
+    }>,
+    context: DecisionTaskExecutionContext
+  ): Promise<DecisionTaskExecutionOutcome>;
 }
 
 export type DecisionTaskExecutionOutcome =
   | Extract<DecisionTaskResultV1, Readonly<{ taskStatus: unknown }>>
+  | RuntimePausedOutcomeV1
   | Readonly<{
       state: "FAILED_RETRYABLE" | "FAILED_FINAL" | "PARTIAL";
       summary: string;
+      runtimeControlError?: RuntimeControlErrorV1;
     }>;
 
 type DecisionTaskExecutionAttempt = Readonly<{
@@ -69,6 +86,62 @@ export function createDecisionTaskExecutor(
       return executeAttempt(command, context, true).then(
         (attempt) => attempt.persistentOutcome
       );
+    },
+    async resumePersistent(command, recovery, context) {
+      if (options.runtime.resume === undefined) {
+        return { state: "FAILED_FINAL", summary: "Agent Runtime 不支持恢复" };
+      }
+      try {
+        const result = await options.runtime.resume(
+          {
+            contractVersion: "1.0",
+            decisionTaskId: command.requirementRevision.decisionTaskId,
+            agentRunId: context.agentRunId,
+            requirementRevision: command.requirementRevision,
+            snapshot: recovery.snapshot,
+            effectReceipts: recovery.effectReceipts
+          },
+          toRuntimeSecurityContext(context)
+        );
+        if (!result.ok) {
+          return {
+            state:
+              result.code === "RUNTIME_RESUME_IN_PROGRESS"
+                ? "FAILED_RETRYABLE"
+                : "FAILED_FINAL",
+            summary: result.message,
+            runtimeControlError: { code: result.code, message: result.message }
+          };
+        }
+        if (result.outcome === undefined) {
+          return {
+            state: "FAILED_RETRYABLE",
+            summary: "Runtime 恢复状态缺少可持久化结果",
+            runtimeControlError: {
+              code: "RUNTIME_RESULT_UNAVAILABLE",
+              message: "Runtime 恢复状态缺少可持久化结果"
+            }
+          };
+        }
+        const pausedOutcome = decodeRuntimePausedOutcomeV1(result.outcome);
+        if (pausedOutcome.ok) return pausedOutcome.value;
+        if (isExplicitRuntimeOutcome(result.outcome)) return result.outcome;
+        return finalizeRuntimeOutput(command, context.agentRunId, result.outcome)
+          .persistentOutcome;
+      } catch (error) {
+        return {
+          state: "FAILED_RETRYABLE",
+          summary: isPersistenceUnavailable(error)
+            ? "Runtime 恢复事实暂时无法持久化"
+            : "Runtime 恢复执行暂时失败",
+          runtimeControlError: isPersistenceUnavailable(error)
+            ? {
+                code: "PERSISTENCE_UNAVAILABLE",
+                message: "Runtime 恢复事实暂时无法持久化"
+              }
+            : { code: "RUNTIME_FAILED", message: "Runtime 恢复执行暂时失败" }
+        };
+      }
     }
   };
 
@@ -150,6 +223,14 @@ export function createDecisionTaskExecutor(
         ? options.runtime.runPersistent(runtimeCommand, securityContext)
         : options.runtime.run(runtimeCommand, securityContext));
 
+      const pausedOutcome = decodeRuntimePausedOutcomeV1(runtimeOutput);
+      if (pausedOutcome.ok) {
+        return {
+          result: createRuntimeFailedResult(decisionTaskId, agentRunId),
+          persistentOutcome: pausedOutcome.value
+        };
+      }
+
       if (isExplicitRuntimeOutcome(runtimeOutput)) {
         return {
           result: createRuntimeFailedResult(
@@ -163,55 +244,22 @@ export function createDecisionTaskExecutor(
         };
       }
 
-      if (
-        !isRecord(runtimeOutput) ||
-        !Array.isArray(runtimeOutput.runEvents) ||
-        !Array.isArray(runtimeOutput.candidates) ||
-        !Array.isArray(runtimeOutput.claims) ||
-        !Array.isArray(runtimeOutput.evidence) ||
-        !Array.isArray(runtimeOutput.claimEvidenceLinks) ||
-        !isRecord(runtimeOutput.decision)
-      ) {
-        return createFailedExecutionAttempt(decisionTaskId, agentRunId);
+      return finalizeRuntimeOutput(command, agentRunId, runtimeOutput);
+    } catch (error) {
+      if (forPersistence && isPersistenceUnavailable(error)) {
+        const persistentOutcome = {
+          state: "FAILED_RETRYABLE",
+          summary: "Runtime 恢复事实暂时无法持久化"
+        } as const;
+        return {
+          result: createRuntimeFailedResult(
+            decisionTaskId,
+            agentRunId,
+            "SAME_EXECUTION_ONLY"
+          ),
+          persistentOutcome
+        };
       }
-
-      const completedEvent = runtimeOutput.runEvents[runtimeOutput.runEvents.length - 1];
-
-      if (!isRecord(completedEvent)) {
-        return createFailedExecutionAttempt(decisionTaskId, agentRunId);
-      }
-
-      const result = {
-        contractType: "decision-task-result",
-        contractVersion: "1.0",
-        ok: true,
-        taskStatus: {
-          contractType: "decision-task-status",
-          contractVersion: "1.0",
-          decisionTaskId,
-          agentRunId,
-          state: "COMPLETED",
-          terminal: true,
-          latestEventSequence: completedEvent.sequence,
-          decisionRevisionId: runtimeOutput.decision.decisionRevisionId,
-          updatedAt: completedEvent.occurredAt
-        },
-        runEvents: runtimeOutput.runEvents,
-        bundle: {
-          requirementRevision: command.requirementRevision,
-          candidates: runtimeOutput.candidates,
-          claims: runtimeOutput.claims,
-          evidence: runtimeOutput.evidence,
-          claimEvidenceLinks: runtimeOutput.claimEvidenceLinks,
-          decision: runtimeOutput.decision
-        }
-      };
-      const decoded = finalizeSuccessfulDecisionTaskResultV1(result);
-
-      return decoded.ok
-        ? { result: decoded.value, persistentOutcome: decoded.value }
-        : createFailedExecutionAttempt(decisionTaskId, agentRunId);
-    } catch {
       return createFailedExecutionAttempt(decisionTaskId, agentRunId);
     }
   }
@@ -239,6 +287,61 @@ function toRuntimeSecurityContext(
 
 function isRetryableOutcome(outcome: DecisionTaskExecutionOutcome): boolean {
   return "state" in outcome && outcome.state === "FAILED_RETRYABLE";
+}
+
+function finalizeRuntimeOutput(
+  command: ExecuteDecisionTaskCommandV1,
+  agentRunId: string,
+  runtimeOutput: unknown
+): DecisionTaskExecutionAttempt {
+  const decisionTaskId = command.requirementRevision.decisionTaskId;
+  if (
+    !isRecord(runtimeOutput) ||
+    !Array.isArray(runtimeOutput.runEvents) ||
+    !Array.isArray(runtimeOutput.candidates) ||
+    !Array.isArray(runtimeOutput.claims) ||
+    !Array.isArray(runtimeOutput.evidence) ||
+    !Array.isArray(runtimeOutput.claimEvidenceLinks) ||
+    !isRecord(runtimeOutput.decision)
+  ) {
+    return createFailedExecutionAttempt(decisionTaskId, agentRunId);
+  }
+
+  const completedEvent = runtimeOutput.runEvents[runtimeOutput.runEvents.length - 1];
+  if (!isRecord(completedEvent)) {
+    return createFailedExecutionAttempt(decisionTaskId, agentRunId);
+  }
+
+  const result = {
+    contractType: "decision-task-result",
+    contractVersion: "1.0",
+    ok: true,
+    taskStatus: {
+      contractType: "decision-task-status",
+      contractVersion: "1.0",
+      decisionTaskId,
+      agentRunId,
+      state: "COMPLETED",
+      terminal: true,
+      latestEventSequence: completedEvent.sequence,
+      decisionRevisionId: runtimeOutput.decision.decisionRevisionId,
+      updatedAt: completedEvent.occurredAt
+    },
+    runEvents: runtimeOutput.runEvents,
+    bundle: {
+      requirementRevision: command.requirementRevision,
+      candidates: runtimeOutput.candidates,
+      claims: runtimeOutput.claims,
+      evidence: runtimeOutput.evidence,
+      claimEvidenceLinks: runtimeOutput.claimEvidenceLinks,
+      decision: runtimeOutput.decision
+    }
+  };
+  const decoded = finalizeSuccessfulDecisionTaskResultV1(result);
+
+  return decoded.ok
+    ? { result: decoded.value, persistentOutcome: decoded.value }
+    : createFailedExecutionAttempt(decisionTaskId, agentRunId);
 }
 
 function createFailedExecutionAttempt(
@@ -357,4 +460,8 @@ function compareCanonicalKeys(left: string, right: string): number {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isPersistenceUnavailable(value: unknown): boolean {
+  return isRecord(value) && value.code === "PERSISTENCE_UNAVAILABLE";
 }

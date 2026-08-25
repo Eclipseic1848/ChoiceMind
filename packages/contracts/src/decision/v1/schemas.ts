@@ -3,8 +3,16 @@ import * as z from "zod";
 import type {
   DecisionTaskResultV1,
   DecisionTaskSnapshotV1,
+  CheckpointRefV1,
+  EffectReceiptV1,
   ExecuteDecisionTaskCommandV1,
-  PersistedRunEventV1
+  PersistedRunEventV1,
+  RuntimePausedOutcomeV1,
+  RuntimeResumeRequestV1,
+  RuntimeCancelRequestV1,
+  RuntimeControlStatusV1,
+  RuntimeRecoveryPermissionV1,
+  RuntimeSnapshotV1
 } from "./index.js";
 import { isPersistedRunEventCursorV1 } from "./cursor.js";
 
@@ -296,6 +304,127 @@ export const persistedRunEventSchema = z.strictObject({
   event: runEventSchema
 });
 
+export const checkpointRefSchema = z.strictObject({
+  ...contractHeader,
+  contractType: z.literal("checkpoint-ref"),
+  checkpointId: z.string().min(1),
+  decisionTaskId: z.string().min(1),
+  agentRunId: z.string().min(1),
+  sequence: z.number().int().positive(),
+  persistedAt: utcTimestampSchema
+});
+
+const rawRuntimeSnapshotRefSchema = z
+  .strictObject({
+    algorithm: z.literal("sha256"),
+    digest: z.string().regex(/^[0-9a-f]{64}$/),
+    objectKey: z.string().min(1)
+  })
+  .refine(
+    (value) => value.objectKey === `runtime-snapshots/sha256/${value.digest}`,
+    { path: ["objectKey"] }
+  );
+
+export const runtimeSnapshotSchema = z.strictObject({
+  ...contractHeader,
+  contractType: z.literal("runtime-snapshot"),
+  snapshotId: z.string().min(1),
+  decisionTaskId: z.string().min(1),
+  agentRunId: z.string().min(1),
+  taskState: taskStateSchema,
+  resumable: z.boolean(),
+  runtimeProtocol: z.strictObject({
+    name: z.literal("agent-runtime-protocol"),
+    version: z.literal("1")
+  }),
+  rawSnapshot: rawRuntimeSnapshotRefSchema,
+  checkpoint: checkpointRefSchema,
+  capturedAt: utcTimestampSchema
+});
+
+export const effectReceiptSchema = z.strictObject({
+  ...contractHeader,
+  contractType: z.literal("effect-receipt"),
+  effectReceiptId: z.string().min(1),
+  decisionTaskId: z.string().min(1),
+  agentRunId: z.string().min(1),
+  checkpointId: z.string().min(1),
+  effectId: z.string().min(1),
+  state: z.enum(["not_started", "started", "committed", "unknown"]),
+  recordedAt: utcTimestampSchema
+});
+
+export const runtimeRecoveryPermissionSchema = z.strictObject({
+  ...contractHeader,
+  contractType: z.literal("runtime-recovery-permission"),
+  decisionTaskId: z.string().min(1),
+  agentRunId: z.string().min(1),
+  snapshotId: z.string().min(1),
+  decision: z.enum(["RESUME_ALLOWED", "RESUME_DENIED", "MANUAL_VERIFICATION_REQUIRED"]),
+  reason: z.enum([
+    "SAFE_TO_RESUME",
+    "TASK_NOT_PAUSED",
+    "SNAPSHOT_NOT_RESUMABLE",
+    "EFFECT_STATUS_UNSAFE",
+    "RECOVERY_FACTS_INVALID"
+  ])
+});
+
+export const runtimePausedOutcomeSchema = z.strictObject({
+  ...contractHeader,
+  contractType: z.literal("runtime-paused-outcome"),
+  state: z.enum([
+    "PAUSED_USER",
+    "PAUSED_PERMISSION",
+    "PAUSED_SOURCE_LOGIN",
+    "PAUSED_LIMIT"
+  ]),
+  summary: meaningfulTextSchema,
+  snapshot: runtimeSnapshotSchema,
+  effectReceipts: z.array(effectReceiptSchema),
+  runEvents: z.array(runEventSchema).min(1)
+});
+
+export const runtimeResumeRequestSchema = z.strictObject({
+  ...contractHeader,
+  contractType: z.literal("runtime-resume-request"),
+  controlRequestId: z.string().min(1),
+  runtimeSnapshotId: z.string().min(1)
+});
+
+export const runtimeCancelRequestSchema = z.strictObject({
+  ...contractHeader,
+  contractType: z.literal("runtime-cancel-request"),
+  controlRequestId: z.string().min(1),
+  cancellationId: z.string().min(1)
+});
+
+export const runtimeControlStatusSchema = z.strictObject({
+  ...contractHeader,
+  contractType: z.literal("runtime-control-status"),
+  controlRequestId: z.string().min(1),
+  decisionTaskId: z.string().min(1),
+  agentRunId: z.string().min(1),
+  action: z.enum(["RESUME", "CANCEL"]),
+  state: z.enum(["ACCEPTED", "RUNNING", "COMPLETED", "FAILED"]),
+  error: z
+    .strictObject({
+      code: z.enum([
+        "RUNTIME_SNAPSHOT_INVALID",
+        "RUNTIME_PROTOCOL_UNSUPPORTED",
+        "RUNTIME_RESUME_DENIED",
+        "RUNTIME_RESUME_IN_PROGRESS",
+        "RUNTIME_FAILED",
+        "RUNTIME_CANCEL_RACE",
+        "PERSISTENCE_UNAVAILABLE",
+        "RUNTIME_RESULT_UNAVAILABLE"
+      ]),
+      message: meaningfulTextSchema
+    })
+    .optional(),
+  updatedAt: utcTimestampSchema
+});
+
 const completedTaskStatusSchema = z.strictObject({
   ...contractHeader,
   contractType: z.literal("decision-task-status"),
@@ -428,7 +557,32 @@ export const decisionTaskSnapshotSchema = z.discriminatedUnion("state", [
     state: z.literal("FAILED_FINAL"),
     terminal: z.literal(true)
   }),
-  z.strictObject({ ...decisionTaskSnapshotShape, state: z.literal("PARTIAL") })
+  z.strictObject({ ...decisionTaskSnapshotShape, state: z.literal("PARTIAL") }),
+  z.strictObject({
+    ...decisionTaskSnapshotShape,
+    state: z.literal("CANCELLED"),
+    terminal: z.literal(true)
+  }),
+  z.strictObject({
+    ...decisionTaskSnapshotShape,
+    state: z.literal("PAUSED_USER"),
+    runtimeSnapshotId: z.string().min(1)
+  }),
+  z.strictObject({
+    ...decisionTaskSnapshotShape,
+    state: z.literal("PAUSED_PERMISSION"),
+    runtimeSnapshotId: z.string().min(1)
+  }),
+  z.strictObject({
+    ...decisionTaskSnapshotShape,
+    state: z.literal("PAUSED_SOURCE_LOGIN"),
+    runtimeSnapshotId: z.string().min(1)
+  }),
+  z.strictObject({
+    ...decisionTaskSnapshotShape,
+    state: z.literal("PAUSED_LIMIT"),
+    runtimeSnapshotId: z.string().min(1)
+  })
 ]);
 
 export const decisionTaskResultSchema = z.union([
@@ -469,7 +623,20 @@ const schemaContractConsistency: readonly [
   Assert<
     IsExact<z.output<typeof decisionTaskResultSchema>, DeepMutable<DecisionTaskResultV1>>
   >,
-  Assert<IsExact<z.output<typeof persistedRunEventSchema>, DeepMutable<PersistedRunEventV1>>>
-] = [true, true, true, true];
+  Assert<IsExact<z.output<typeof persistedRunEventSchema>, DeepMutable<PersistedRunEventV1>>>,
+  Assert<IsExact<z.output<typeof runtimeSnapshotSchema>, DeepMutable<RuntimeSnapshotV1>>>,
+  Assert<IsExact<z.output<typeof effectReceiptSchema>, DeepMutable<EffectReceiptV1>>>,
+  Assert<IsExact<z.output<typeof checkpointRefSchema>, DeepMutable<CheckpointRefV1>>>,
+  Assert<
+    IsExact<
+      z.output<typeof runtimeRecoveryPermissionSchema>,
+      DeepMutable<RuntimeRecoveryPermissionV1>
+    >
+  >,
+  Assert<IsExact<z.output<typeof runtimePausedOutcomeSchema>, DeepMutable<RuntimePausedOutcomeV1>>>
+  ,Assert<IsExact<z.output<typeof runtimeResumeRequestSchema>, DeepMutable<RuntimeResumeRequestV1>>>
+  ,Assert<IsExact<z.output<typeof runtimeCancelRequestSchema>, DeepMutable<RuntimeCancelRequestV1>>>
+  ,Assert<IsExact<z.output<typeof runtimeControlStatusSchema>, DeepMutable<RuntimeControlStatusV1>>>
+] = [true, true, true, true, true, true, true, true, true, true, true, true];
 
 void schemaContractConsistency;

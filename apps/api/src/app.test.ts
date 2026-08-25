@@ -1277,6 +1277,129 @@ describe("GET /api/v1/decision-tasks/:decisionTaskId/events", () => {
   });
 });
 
+describe("POST /api/v1/decision-tasks/:decisionTaskId/resume", () => {
+  it("以服务端 Principal 和显式恢复请求创建 owner-bound 控制操作", async () => {
+    const requests: unknown[] = [];
+    const app = buildApiApp({
+      decisionTaskRuntimeControl: {
+        async requestResume(input) {
+          requests.push(input);
+          return {
+            contractType: "runtime-control-status",
+            contractVersion: "1.0",
+            controlRequestId: "control-resume-1",
+            decisionTaskId: "task-resume-1",
+            agentRunId: "run-resume-1",
+            action: "RESUME",
+            state: "ACCEPTED",
+            updatedAt: "2026-08-24T20:00:00.000Z"
+          };
+        },
+        async requestCancel() {
+          throw new Error("不应调用取消入口");
+        }
+      },
+      now: () => new Date("2026-08-24T20:00:00.000Z")
+    });
+    openApps.push(app);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/v1/decision-tasks/task-resume-1/resume",
+      headers: {
+        authorization: "Bearer token-user-a",
+        "x-correlation-id": "correlation-resume-1"
+      },
+      payload: {
+        contractType: "runtime-resume-request",
+        contractVersion: "1.0",
+        controlRequestId: "control-resume-1",
+        runtimeSnapshotId: "snapshot-resume-1"
+      }
+    });
+
+    expect(response.statusCode).toBe(202);
+    expect(response.json()).toEqual({
+      contractType: "runtime-control-status",
+      contractVersion: "1.0",
+      controlRequestId: "control-resume-1",
+      decisionTaskId: "task-resume-1",
+      agentRunId: "run-resume-1",
+      action: "RESUME",
+      state: "ACCEPTED",
+      updatedAt: "2026-08-24T20:00:00.000Z"
+    });
+    expect(requests).toEqual([
+      {
+        actor: { principalId: "principal-user-a", role: "USER", userId: "user-a" },
+        controlRequestId: "control-resume-1",
+        decisionTaskId: "task-resume-1",
+        runtimeSnapshotId: "snapshot-resume-1",
+        correlationId: "correlation-resume-1",
+        egressConfirmation: {
+          operationId: "control-resume-1",
+          userId: "user-a"
+        }
+      }
+    ]);
+  });
+});
+
+describe("POST /api/v1/decision-tasks/:decisionTaskId/cancel", () => {
+  it("只用服务端 Principal 创建 owner-bound 取消操作", async () => {
+    const requests: unknown[] = [];
+    const app = buildApiApp({
+      decisionTaskRuntimeControl: {
+        async requestResume() {
+          throw new Error("不应调用恢复入口");
+        },
+        async requestCancel(input) {
+          requests.push(input);
+          return {
+            contractType: "runtime-control-status",
+            contractVersion: "1.0",
+            controlRequestId: "control-cancel-1",
+            decisionTaskId: "task-cancel-1",
+            agentRunId: "run-cancel-1",
+            action: "CANCEL",
+            state: "COMPLETED",
+            updatedAt: "2026-08-24T20:00:00.000Z"
+          };
+        }
+      },
+      now: () => new Date("2026-08-24T20:00:00.000Z")
+    });
+    openApps.push(app);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/v1/decision-tasks/task-cancel-1/cancel",
+      headers: {
+        authorization: "Bearer token-user-a",
+        "x-correlation-id": "correlation-cancel-1"
+      },
+      payload: {
+        contractType: "runtime-cancel-request",
+        contractVersion: "1.0",
+        controlRequestId: "control-cancel-1",
+        cancellationId: "cancel-1"
+      }
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ action: "CANCEL", state: "COMPLETED" });
+    expect(requests).toEqual([
+      {
+        actor: { principalId: "principal-user-a", role: "USER", userId: "user-a" },
+        controlRequestId: "control-cancel-1",
+        decisionTaskId: "task-cancel-1",
+        cancellationId: "cancel-1",
+        correlationId: "correlation-cancel-1"
+      }
+    ]);
+  });
+});
+
 function buildPersistedFailureResult(decisionTaskId: string) {
   return {
     contractType: "decision-task-result" as const,

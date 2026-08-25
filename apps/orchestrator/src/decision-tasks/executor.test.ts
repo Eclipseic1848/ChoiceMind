@@ -1273,6 +1273,164 @@ describe("DecisionTaskExecutor.execute", () => {
 });
 
 describe("DecisionTaskExecutor.executePersistent", () => {
+  it("把 Runtime 恢复完成结果转换为现有持久任务结果", async () => {
+    const command = buildRuntimeBoundaryCommand("persistent-resume");
+    const fakeRuntime = createFakeAgentRuntimeAdapter();
+    const runtimeOutput = await fakeRuntime.run({
+      contractVersion: "1.0",
+      decisionTaskId: command.requirementRevision.decisionTaskId,
+      agentRunId: "agent-run-persistent-resume",
+      requirementRevision: command.requirementRevision
+    });
+    const executor = createDecisionTaskExecutor({
+      runtime: {
+        run: fakeRuntime.run,
+        async resume() {
+          return {
+            ok: true,
+            changed: true,
+            state: "COMPLETED" as const,
+            runEvents: runtimeOutput.runEvents,
+            outcome: runtimeOutput
+          };
+        }
+      }
+    });
+    const snapshot = {
+      contractType: "runtime-snapshot" as const,
+      contractVersion: "1.0" as const,
+      snapshotId: "snapshot-persistent-resume",
+      decisionTaskId: command.requirementRevision.decisionTaskId,
+      agentRunId: "agent-run-persistent-resume",
+      taskState: "PAUSED_PERMISSION" as const,
+      resumable: true,
+      runtimeProtocol: { name: "agent-runtime-protocol" as const, version: "1" as const },
+      rawSnapshot: {
+        algorithm: "sha256" as const,
+        digest: "a".repeat(64),
+        objectKey: `runtime-snapshots/sha256/${"a".repeat(64)}`
+      },
+      checkpoint: {
+        contractType: "checkpoint-ref" as const,
+        contractVersion: "1.0" as const,
+        checkpointId: "checkpoint-persistent-resume",
+        decisionTaskId: command.requirementRevision.decisionTaskId,
+        agentRunId: "agent-run-persistent-resume",
+        sequence: 1,
+        persistedAt: "2026-08-24T12:00:00.000Z"
+      },
+      capturedAt: "2026-08-24T12:00:00.000Z"
+    };
+
+    await expect(
+      executor.resumePersistent(
+        command,
+        { snapshot, effectReceipts: [] },
+        {
+          agentRunId: "agent-run-persistent-resume",
+          userId: "owner-1",
+          operationId: "control-resume-1",
+          correlationId: "correlation-resume-1",
+          egressConfirmation: { operationId: "control-resume-1", userId: "owner-1" }
+        }
+      )
+    ).resolves.toMatchObject({
+      ok: true,
+      taskStatus: { state: "COMPLETED", terminal: true },
+      bundle: { requirementRevision: command.requirementRevision }
+    });
+  });
+
+  it("保留 Runtime 恢复失败的框架中立错误", async () => {
+    const command = buildRuntimeBoundaryCommand("persistent-resume-error");
+    const executor = createDecisionTaskExecutor({
+      runtime: {
+        async run() {
+          throw new Error("不应调用 run");
+        },
+        async resume() {
+          return {
+            ok: false,
+            code: "RUNTIME_SNAPSHOT_INVALID" as const,
+            message: "权威 Runtime 快照不合法"
+          };
+        }
+      }
+    });
+
+    await expect(
+      executor.resumePersistent(
+        command,
+        {
+          snapshot: {
+            contractType: "runtime-snapshot",
+            contractVersion: "1.0",
+            snapshotId: "snapshot-error",
+            decisionTaskId: command.requirementRevision.decisionTaskId,
+            agentRunId: "agent-run-error",
+            taskState: "PAUSED_PERMISSION",
+            resumable: true,
+            runtimeProtocol: { name: "agent-runtime-protocol", version: "1" },
+            rawSnapshot: {
+              algorithm: "sha256",
+              digest: "b".repeat(64),
+              objectKey: `runtime-snapshots/sha256/${"b".repeat(64)}`
+            },
+            checkpoint: {
+              contractType: "checkpoint-ref",
+              contractVersion: "1.0",
+              checkpointId: "checkpoint-error",
+              decisionTaskId: command.requirementRevision.decisionTaskId,
+              agentRunId: "agent-run-error",
+              sequence: 1,
+              persistedAt: "2026-08-24T12:00:00.000Z"
+            },
+            capturedAt: "2026-08-24T12:00:00.000Z"
+          },
+          effectReceipts: []
+        },
+        {
+          agentRunId: "agent-run-error",
+          userId: "owner-1",
+          operationId: "control-error",
+          correlationId: "correlation-error",
+          egressConfirmation: { operationId: "control-error", userId: "owner-1" }
+        }
+      )
+    ).resolves.toEqual({
+      state: "FAILED_FINAL",
+      summary: "权威 Runtime 快照不合法",
+      runtimeControlError: {
+        code: "RUNTIME_SNAPSHOT_INVALID",
+        message: "权威 Runtime 快照不合法"
+      }
+    });
+  });
+
+  it("把 Runtime 恢复事实持久化故障保留为可重试失败", async () => {
+    const executor = createDecisionTaskExecutor({
+      runtime: {
+        async run() {
+          throw new Error("不应调用非持久执行");
+        },
+        async runPersistent() {
+          throw Object.assign(new Error("恢复事实存储不可用"), {
+            code: "PERSISTENCE_UNAVAILABLE"
+          });
+        }
+      }
+    });
+
+    await expect(
+      executor.executePersistent(buildRuntimeBoundaryCommand("recovery-store-down"), {
+        agentRunId: "agent-run-recovery-store-down"
+      })
+    ).resolves.toEqual({
+      state: "FAILED_RETRYABLE",
+      summary: "Runtime 恢复事实暂时无法持久化"
+    });
+  });
+
   it.each([
     ["FAILED_RETRYABLE", "上游暂时不可用，允许重试同一执行"],
     ["FAILED_FINAL", "输入无法形成安全执行"],

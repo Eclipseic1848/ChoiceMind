@@ -4,9 +4,12 @@ import {
   openOutboxPublisher,
   openPersistentDecisionTaskModule,
   openPersistentDecisionTaskWorker,
+  openRuntimeRecoveryStore,
   type OutboxPublisher,
   type PersistentDecisionTaskModule,
-  type PersistentDecisionTaskWorker
+  type PersistentDecisionTaskWorker,
+  type PersistentDecisionTaskOutcome,
+  type RuntimeRecoveryStore
 } from "@choicemind/task-persistence";
 import { randomUUID } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -16,7 +19,10 @@ import { createFakeAgentRuntimeAdapter } from "../../src/runtime/fake-agent-runt
 import { resetPersistentDecisionTaskTestData } from "../../../../packages/task-persistence/tests/integration/support.js";
 
 const openModules: Array<
-  PersistentDecisionTaskModule | OutboxPublisher | PersistentDecisionTaskWorker
+  | PersistentDecisionTaskModule
+  | OutboxPublisher
+  | PersistentDecisionTaskWorker
+  | RuntimeRecoveryStore
 > = [];
 
 beforeEach(async () => {
@@ -496,6 +502,158 @@ describe("Persistent Decision Task Worker", () => {
     });
   });
 
+  it("优先领取恢复请求并通过同一完成事务同步任务状态", async () => {
+    const databaseUrl = requireEnvironment("CHOICEMIND_TEST_DATABASE_URL");
+    const redisUrl = requireEnvironment("CHOICEMIND_TEST_REDIS_URL");
+    const suffix = randomUUID();
+    const streamName = `choicemind:test:worker-resume:${suffix}`;
+    const consumerGroup = `choicemind-test-resume-${suffix}`;
+    const command = buildCommand(suffix);
+    const taskModule = await openPersistentDecisionTaskModule({ databaseUrl });
+    const recoveryStore = await openRuntimeRecoveryStore({ databaseUrl });
+    const publisher = await openOutboxPublisher({ databaseUrl, redisUrl, streamName });
+    openModules.push(taskModule, recoveryStore, publisher);
+    const accepted = await taskModule.submit(command, "test-owner");
+    expect(await publisher.runOnce()).toMatchObject({ published: 1 });
+    const operationId = await readPublishedOperationId(redisUrl, streamName);
+    const initialClaim = await taskModule.claimNext(operationId, `initial-${suffix}`, 30_000);
+    if (initialClaim.status !== "CLAIMED") throw new Error("初始任务未被领取");
+    const rawSnapshot = await recoveryStore.putRawSnapshot({
+      schemaVersion: 1,
+      runId: `coremind-${suffix}`,
+      operation: { state: "paused", transitionSequence: 1 },
+      resumable: true
+    });
+    const snapshot = {
+      contractType: "runtime-snapshot" as const,
+      contractVersion: "1.0" as const,
+      snapshotId: `snapshot-${rawSnapshot.digest}`,
+      decisionTaskId: command.requirementRevision.decisionTaskId,
+      agentRunId: accepted.agentRunId,
+      taskState: "PAUSED_PERMISSION" as const,
+      resumable: true,
+      runtimeProtocol: { name: "agent-runtime-protocol" as const, version: "1" as const },
+      rawSnapshot,
+      checkpoint: {
+        contractType: "checkpoint-ref" as const,
+        contractVersion: "1.0" as const,
+        checkpointId: `checkpoint-${suffix}`,
+        decisionTaskId: command.requirementRevision.decisionTaskId,
+        agentRunId: accepted.agentRunId,
+        sequence: 1,
+        persistedAt: "2026-08-24T12:00:00.000Z"
+      },
+      capturedAt: "2026-08-24T12:00:00.000Z"
+    };
+    const pausedOutcome = {
+      contractType: "runtime-paused-outcome" as const,
+      contractVersion: "1.0" as const,
+      state: "PAUSED_PERMISSION" as const,
+      summary: "等待必要权限",
+      snapshot,
+      effectReceipts: [],
+      runEvents: [
+        {
+          contractType: "run-event" as const,
+          contractVersion: "1.0" as const,
+          eventId: `event-paused-${suffix}`,
+          decisionTaskId: command.requirementRevision.decisionTaskId,
+          agentRunId: accepted.agentRunId,
+          sequence: 1,
+          occurredAt: "2026-08-24T12:00:00.000Z",
+          eventType: "TASK_STATE_CHANGED" as const,
+          taskState: "PAUSED_PERMISSION" as const,
+          summary: "等待必要权限",
+          synthetic: true
+        }
+      ]
+    };
+    await recoveryStore.saveRecoveryFacts(snapshot, []);
+    await taskModule.complete(operationId, `initial-${suffix}`, pausedOutcome);
+    await taskModule.requestRuntimeResume({
+      controlRequestId: `control-${suffix}`,
+      decisionTaskId: command.requirementRevision.decisionTaskId,
+      ownerUserId: "test-owner",
+      runtimeSnapshotId: snapshot.snapshotId,
+      correlationId: `correlation-${suffix}`,
+      egressConfirmation: { operationId: `control-${suffix}`, userId: "test-owner" }
+    });
+    let runtimeControlOutcome: PersistentDecisionTaskOutcome = pausedOutcome;
+    const worker = await openPersistentDecisionTaskWorker({
+      databaseUrl,
+      redisUrl,
+      streamName,
+      consumerGroup,
+      workerId: `resume-worker-${suffix}`,
+      readBlockMs: 10,
+      async execute() {
+        throw new Error("恢复请求不应进入普通执行入口");
+      },
+      async executeRuntimeControl(claim) {
+        expect(claim).toMatchObject({
+          ownerUserId: "test-owner",
+          command
+        });
+        return runtimeControlOutcome;
+      }
+    });
+    openModules.push(worker);
+
+    expect(await worker.runOnce()).toEqual({ acknowledged: 0, executed: 1, received: 0 });
+    await expect(
+      taskModule.requestRuntimeResume({
+        controlRequestId: `control-${suffix}`,
+        decisionTaskId: command.requirementRevision.decisionTaskId,
+        ownerUserId: "test-owner",
+        runtimeSnapshotId: snapshot.snapshotId,
+        correlationId: `correlation-${suffix}`,
+        egressConfirmation: { operationId: `control-${suffix}`, userId: "test-owner" }
+      })
+    ).resolves.toMatchObject({ state: "COMPLETED" });
+    await expect(
+      taskModule.get(command.requirementRevision.decisionTaskId, "test-owner")
+    ).resolves.toMatchObject({ state: "PAUSED_PERMISSION", terminal: false });
+    runtimeControlOutcome = {
+      state: "FAILED_FINAL",
+      summary: "权威 Runtime 快照不合法",
+      runtimeControlError: {
+        code: "RUNTIME_SNAPSHOT_INVALID",
+        message: "权威 Runtime 快照不合法"
+      }
+    };
+    await taskModule.requestRuntimeResume({
+      controlRequestId: `control-failed-${suffix}`,
+      decisionTaskId: command.requirementRevision.decisionTaskId,
+      ownerUserId: "test-owner",
+      runtimeSnapshotId: snapshot.snapshotId,
+      correlationId: `correlation-failed-${suffix}`,
+      egressConfirmation: {
+        operationId: `control-failed-${suffix}`,
+        userId: "test-owner"
+      }
+    });
+    expect(await worker.runOnce()).toEqual({ acknowledged: 0, executed: 1, received: 0 });
+    await expect(
+      taskModule.requestRuntimeResume({
+        controlRequestId: `control-failed-${suffix}`,
+        decisionTaskId: command.requirementRevision.decisionTaskId,
+        ownerUserId: "test-owner",
+        runtimeSnapshotId: snapshot.snapshotId,
+        correlationId: `correlation-failed-${suffix}`,
+        egressConfirmation: {
+          operationId: `control-failed-${suffix}`,
+          userId: "test-owner"
+        }
+      })
+    ).resolves.toMatchObject({
+      state: "FAILED",
+      error: {
+        code: "RUNTIME_SNAPSHOT_INVALID",
+        message: "权威 Runtime 快照不合法"
+      }
+    });
+  });
+
   it("acknowledges a malformed transport message without stopping the Worker", async () => {
     const databaseUrl = requireEnvironment("CHOICEMIND_TEST_DATABASE_URL");
     const redisUrl = requireEnvironment("CHOICEMIND_TEST_REDIS_URL");
@@ -602,6 +760,19 @@ async function duplicatePublishedMessage(redisUrl: string, streamName: string): 
     }
 
     await redis.xAdd(streamName, "*", message);
+  } finally {
+    await redis.close();
+  }
+}
+
+async function readPublishedOperationId(redisUrl: string, streamName: string): Promise<string> {
+  const redis = createClient({ url: redisUrl });
+  redis.on("error", () => undefined);
+  await redis.connect();
+  try {
+    const operationId = (await redis.xRange(streamName, "-", "+"))[0]?.message.operationId;
+    if (operationId === undefined) throw new Error("Publisher 未产生 operationId");
+    return operationId;
   } finally {
     await redis.close();
   }
