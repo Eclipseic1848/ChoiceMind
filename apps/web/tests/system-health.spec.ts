@@ -1,6 +1,18 @@
-import { createServer, type Server } from "node:http";
+import { createServer, request as requestHttp, type Server } from "node:http";
+import { randomUUID } from "node:crypto";
 
 import { expect, test } from "@playwright/test";
+import { decodeDecisionTaskResultV1 } from "@choicemind/contracts/decision/v1";
+import { buildApiApp } from "../../api/src/app.js";
+import { createDecisionTaskExecutor } from "../../orchestrator/src/decision-tasks/executor.js";
+import { buildSyntheticLaptopRunOutput } from "../../orchestrator/src/runtime/synthetic-laptop-fixture.js";
+import {
+  openOutboxPublisher,
+  openPersistentDecisionTaskModule,
+  openPersistentDecisionTaskWorker,
+  openRuntimeRecoveryStore
+} from "../../../packages/task-persistence/src/index.js";
+import { resetPersistentDecisionTaskTestData } from "../../../packages/task-persistence/tests/integration/support.js";
 
 let apiServer: Server;
 let decisionResponseStatus = 200;
@@ -8,6 +20,12 @@ const sseRecoveryRunId = "agent-run-web-sse-recovery";
 const sseRecoveryTaskId = "task-web-sse-recovery";
 let sseRecoveryCursors: Array<string | null> = [];
 let decisionAuthorizationHeaders: Array<string | undefined> = [];
+let runtimeControlRequests: Array<{
+  authorization: string | undefined;
+  body: Record<string, unknown>;
+  url: string;
+}> = [];
+let verticalApiUrl: string | undefined;
 
 test.describe.configure({ mode: "serial" });
 
@@ -15,10 +33,28 @@ test.beforeEach(() => {
   decisionResponseStatus = 200;
   sseRecoveryCursors = [];
   decisionAuthorizationHeaders = [];
+  runtimeControlRequests = [];
 });
 
 test.beforeAll(async () => {
-  apiServer = createServer((request, response) => {
+  apiServer = createServer(async (request, response) => {
+    if (
+      verticalApiUrl !== undefined &&
+      request.url?.startsWith("/api/v1/decision-tasks")
+    ) {
+      const upstream = requestHttp(
+        new URL(request.url, verticalApiUrl),
+        { headers: request.headers, method: request.method },
+        (upstreamResponse) => {
+          response.writeHead(upstreamResponse.statusCode ?? 502, upstreamResponse.headers);
+          upstreamResponse.pipe(response);
+        }
+      );
+      upstream.on("error", () => response.writeHead(502).end());
+      request.pipe(upstream);
+      return;
+    }
+
     if (request.url?.startsWith("/api/v1/decision-tasks")) {
       decisionAuthorizationHeaders.push(request.headers.authorization);
     }
@@ -44,6 +80,34 @@ test.beforeAll(async () => {
       response.setHeader("content-type", "application/json; charset=utf-8");
       response.statusCode = decisionResponseStatus;
       response.end(JSON.stringify(buildSyntheticDecisionResult()));
+      return;
+    }
+
+    const runtimeControlMatch = request.url?.match(
+      /^\/api\/v1\/decision-tasks\/task-web-proxy-control\/(resume|cancel)$/
+    );
+    if (request.method === "POST" && runtimeControlMatch !== undefined && runtimeControlMatch !== null) {
+      const body = JSON.parse(await readRequestBody(request)) as Record<string, unknown>;
+      const action = runtimeControlMatch[1] === "resume" ? "RESUME" : "CANCEL";
+      runtimeControlRequests.push({
+        authorization: request.headers.authorization,
+        body,
+        url: request.url ?? ""
+      });
+      response.statusCode = action === "RESUME" ? 202 : 200;
+      response.setHeader("content-type", "application/json; charset=utf-8");
+      response.end(
+        JSON.stringify({
+          contractType: "runtime-control-status",
+          contractVersion: "1.0",
+          controlRequestId: body.controlRequestId,
+          decisionTaskId: "task-web-proxy-control",
+          agentRunId: "agent-run-web-proxy-control",
+          action,
+          state: action === "RESUME" ? "ACCEPTED" : "COMPLETED",
+          updatedAt: "2026-08-24T03:10:00.000Z"
+        })
+      );
       return;
     }
 
@@ -306,6 +370,428 @@ test("reconnects after SSE is temporarily unavailable and replays the recovered 
   );
 });
 
+test("shows a paused reason and sends owner-controlled resume and cancel commands", async ({
+  page
+}) => {
+  const taskId = "task-web-runtime-control";
+  const runId = "agent-run-web-runtime-control";
+  const runtimeSnapshotId = "snapshot-web-runtime-control";
+  let resumeBody: Record<string, unknown> | undefined;
+  let cancelBody: Record<string, unknown> | undefined;
+  let releaseOldPausedEvent: (() => void) | undefined;
+  const oldPausedEventGate = new Promise<void>((resolve) => {
+    releaseOldPausedEvent = resolve;
+  });
+
+  await page.route(`**/api/decision-tasks/${taskId}/events`, async (route) => {
+    const event = buildPersistedEvent({
+      cursor: "401",
+      eventId: "event-web-runtime-control",
+      runId,
+      sequence: 1,
+      summary: "副作用状态需要人工核验",
+      taskId
+    });
+    event.event.taskState = "PAUSED_PERMISSION";
+    await oldPausedEventGate;
+    await route.fulfill({
+      status: 200,
+      contentType: "text/event-stream; charset=utf-8",
+      body: `id: 401\ndata: ${JSON.stringify(event)}\n\n`
+    });
+  });
+  await page.route(`**/api/decision-tasks/${taskId}/resume`, async (route) => {
+    resumeBody = route.request().postDataJSON() as Record<string, unknown>;
+    await route.fulfill({
+      status: 202,
+      contentType: "application/json; charset=utf-8",
+      body: JSON.stringify({
+        contractType: "runtime-control-status",
+        contractVersion: "1.0",
+        controlRequestId: resumeBody.controlRequestId,
+        decisionTaskId: taskId,
+        agentRunId: runId,
+        action: "RESUME",
+        state: "ACCEPTED",
+        updatedAt: "2026-08-24T03:00:00.000Z"
+      })
+    });
+  });
+  await page.route(`**/api/decision-tasks/${taskId}/cancel`, async (route) => {
+    cancelBody = route.request().postDataJSON() as Record<string, unknown>;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json; charset=utf-8",
+      body: JSON.stringify({
+        contractType: "runtime-control-status",
+        contractVersion: "1.0",
+        controlRequestId: cancelBody.controlRequestId,
+        decisionTaskId: taskId,
+        agentRunId: runId,
+        action: "CANCEL",
+        state: "COMPLETED",
+        updatedAt: "2026-08-24T03:00:01.000Z"
+      })
+    });
+  });
+  await page.route(`**/api/decision-tasks/${taskId}`, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json; charset=utf-8",
+      body: JSON.stringify({
+        contractType: "decision-task-snapshot",
+        contractVersion: "1.0",
+        executionRequestId: "exec-web-runtime-control",
+        decisionTaskId: taskId,
+        agentRunId: runId,
+        state: "PAUSED_PERMISSION",
+        terminal: false,
+        runtimeSnapshotId,
+        updatedAt: "2026-08-24T02:59:00.000Z"
+      })
+    });
+  });
+
+  await page.goto(`/?decisionTaskId=${taskId}`);
+
+  await page.getByRole("button", { name: "安全恢复" }).click();
+  await expect(page.getByText("恢复中")).toBeVisible();
+  await expect(page.getByRole("button", { name: "正在恢复" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "取消任务" })).toBeDisabled();
+  releaseOldPausedEvent?.();
+  await expect(page.getByText("副作用状态需要人工核验")).toBeVisible();
+  await expect(page.getByText("恢复中")).toBeVisible();
+  await expect(page.getByRole("button", { name: "正在恢复" })).toBeDisabled();
+  expect(resumeBody).toMatchObject({
+    contractType: "runtime-resume-request",
+    contractVersion: "1.0",
+    runtimeSnapshotId
+  });
+  expect(Object.keys(resumeBody ?? {}).sort()).toEqual([
+    "contractType",
+    "contractVersion",
+    "controlRequestId",
+    "runtimeSnapshotId"
+  ]);
+
+  await page.reload();
+  await page.getByRole("button", { name: "取消任务" }).click();
+  await expect(page.getByText("取消完成")).toBeVisible();
+  expect(cancelBody).toMatchObject({
+    contractType: "runtime-cancel-request",
+    contractVersion: "1.0"
+  });
+  expect(Object.keys(cancelBody ?? {}).sort()).toEqual([
+    "cancellationId",
+    "contractType",
+    "contractVersion",
+    "controlRequestId"
+  ]);
+});
+
+test("proxies strict runtime controls with server-owned authorization", async ({ page }) => {
+  await page.goto("/");
+  const responses = await page.evaluate(async () => {
+    const resume = await fetch("/api/decision-tasks/task-web-proxy-control/resume", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        contractType: "runtime-resume-request",
+        contractVersion: "1.0",
+        controlRequestId: "control-web-proxy-resume",
+        runtimeSnapshotId: "snapshot-web-proxy"
+      })
+    });
+    const cancel = await fetch("/api/decision-tasks/task-web-proxy-control/cancel", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        contractType: "runtime-cancel-request",
+        contractVersion: "1.0",
+        controlRequestId: "control-web-proxy-cancel",
+        cancellationId: "cancel-web-proxy"
+      })
+    });
+
+    return [
+      { body: await resume.json(), status: resume.status },
+      { body: await cancel.json(), status: cancel.status }
+    ];
+  });
+
+  expect(responses).toMatchObject([
+    { body: { action: "RESUME", state: "ACCEPTED" }, status: 202 },
+    { body: { action: "CANCEL", state: "COMPLETED" }, status: 200 }
+  ]);
+  expect(runtimeControlRequests).toEqual([
+    {
+      authorization: "Bearer web-test-token",
+      body: {
+        contractType: "runtime-resume-request",
+        contractVersion: "1.0",
+        controlRequestId: "control-web-proxy-resume",
+        runtimeSnapshotId: "snapshot-web-proxy"
+      },
+      url: "/api/v1/decision-tasks/task-web-proxy-control/resume"
+    },
+    {
+      authorization: "Bearer web-test-token",
+      body: {
+        contractType: "runtime-cancel-request",
+        contractVersion: "1.0",
+        controlRequestId: "control-web-proxy-cancel",
+        cancellationId: "cancel-web-proxy"
+      },
+      url: "/api/v1/decision-tasks/task-web-proxy-control/cancel"
+    }
+  ]);
+});
+
+test("replays one local browser-to-runtime recovery through real Postgres and Redis", async ({
+  page
+}) => {
+  const databaseUrl = process.env.CHOICEMIND_TEST_DATABASE_URL;
+  const redisUrl = process.env.CHOICEMIND_TEST_REDIS_URL;
+  test.skip(
+    databaseUrl === undefined || redisUrl === undefined,
+    "需要显式隔离的 PostgreSQL 和 Redis 资源"
+  );
+  if (databaseUrl === undefined || redisUrl === undefined) return;
+
+  await resetPersistentDecisionTaskTestData(databaseUrl);
+  const suffix = randomUUID();
+  const streamName = `choicemind:test:web-runtime-recovery:${suffix}`;
+  const consumerGroup = `choicemind-test-web-runtime-recovery-${suffix}`;
+  const taskModule = await openPersistentDecisionTaskModule({ databaseUrl });
+  const recoveryStore = await openRuntimeRecoveryStore({ databaseUrl });
+  const publisher = await openOutboxPublisher({ databaseUrl, redisUrl, streamName });
+  let correspondingToolCalls = 0;
+  const executor = createDecisionTaskExecutor({
+    runtime: {
+      async run() {
+        throw new Error("纵向恢复测试不应调用普通 Runtime 入口");
+      },
+      async resume(command) {
+         const committed = command.effectReceipts.find(
+           (receipt) => receipt.state === "committed"
+         );
+         if (committed === undefined) {
+           correspondingToolCalls += 1;
+           throw new Error("纵向恢复测试必须包含 committed 结果");
+         }
+        const reused = await recoveryStore.loadEffectResult(committed.result);
+        if (reused === undefined) {
+          throw new Error("纵向恢复测试的权威结果不可用");
+        }
+        return {
+          ok: true,
+          changed: true,
+          state: "COMPLETED",
+          runEvents: [],
+          outcome: reused as ReturnType<typeof buildSyntheticLaptopRunOutput>
+        };
+      }
+    }
+  });
+  const worker = await openPersistentDecisionTaskWorker({
+    databaseUrl,
+    redisUrl,
+    streamName,
+    consumerGroup,
+    workerId: `web-runtime-recovery-${suffix}`,
+    readBlockMs: 10,
+    async execute(claim) {
+      const command = claim.command;
+      const generatedOutput = buildSyntheticLaptopRunOutput({
+        contractVersion: "1.0",
+        decisionTaskId: command.requirementRevision.decisionTaskId,
+        agentRunId: claim.agentRunId,
+        requirementRevision: command.requirementRevision
+      });
+      const recoveryStartedAt = Date.now();
+      const output = {
+        ...generatedOutput,
+        runEvents: generatedOutput.runEvents
+          .filter(
+            (event) => event.taskState === "CREATED" || event.taskState === "COMPLETED"
+          )
+          .map((event, index) => ({
+            ...event,
+            sequence: index + 1,
+            occurredAt: new Date(recoveryStartedAt + index).toISOString()
+          }))
+      };
+      const rawSnapshot = await recoveryStore.putRawSnapshot({
+        schemaVersion: 1,
+        runId: claim.agentRunId,
+        operation: { state: "paused", transitionSequence: 1 },
+        resumable: true
+      });
+      const checkpointId = `checkpoint-${suffix}`;
+      const snapshot = {
+        contractType: "runtime-snapshot" as const,
+        contractVersion: "1.0" as const,
+        snapshotId: `snapshot-${rawSnapshot.digest}`,
+        decisionTaskId: command.requirementRevision.decisionTaskId,
+        agentRunId: claim.agentRunId,
+        taskState: "PAUSED_PERMISSION" as const,
+        resumable: true,
+        runtimeProtocol: { name: "agent-runtime-protocol" as const, version: "1" as const },
+        rawSnapshot,
+        checkpoint: {
+          contractType: "checkpoint-ref" as const,
+          contractVersion: "1.0" as const,
+          checkpointId,
+          decisionTaskId: command.requirementRevision.decisionTaskId,
+          agentRunId: claim.agentRunId,
+          sequence: 1,
+          persistedAt: "2026-08-24T12:00:00.000Z"
+        },
+        capturedAt: "2026-08-24T12:00:00.000Z"
+      };
+      const result = await recoveryStore.putEffectResult(
+        {
+          decisionTaskId: snapshot.decisionTaskId,
+          agentRunId: snapshot.agentRunId,
+          checkpointId,
+          effectId: `submit-decision-draft-${suffix}`
+        },
+        output
+      );
+      const receipt = {
+        contractType: "effect-receipt" as const,
+        contractVersion: "1.0" as const,
+        effectReceiptId: `receipt-${suffix}`,
+        decisionTaskId: snapshot.decisionTaskId,
+        agentRunId: snapshot.agentRunId,
+        checkpointId,
+        effectId: `submit-decision-draft-${suffix}`,
+        state: "committed" as const,
+        result,
+        recordedAt: "2026-08-24T12:00:00.000Z"
+      };
+      await recoveryStore.saveRecoveryFacts(snapshot, [receipt]);
+      return {
+        contractType: "runtime-paused-outcome",
+        contractVersion: "1.0",
+        state: "PAUSED_PERMISSION",
+        summary: "等待安全恢复",
+        snapshot,
+        effectReceipts: [receipt],
+        runEvents: [
+          {
+            contractType: "run-event",
+            contractVersion: "1.0",
+            eventId: `event-paused-${suffix}`,
+            decisionTaskId: snapshot.decisionTaskId,
+            agentRunId: snapshot.agentRunId,
+            sequence: 1,
+            occurredAt: "2026-08-24T12:00:00.000Z",
+            eventType: "TASK_STATE_CHANGED",
+            taskState: "PAUSED_PERMISSION",
+            summary: "等待安全恢复",
+            synthetic: true
+          }
+        ]
+      };
+    },
+    async executeRuntimeControl(claim) {
+      const outcome = await executor.resumePersistent(
+        claim.command,
+        { snapshot: claim.snapshot, effectReceipts: claim.effectReceipts },
+        {
+          agentRunId: claim.agentRunId,
+          userId: claim.ownerUserId,
+          operationId: claim.controlRequestId,
+          correlationId: claim.correlationId,
+          egressConfirmation: claim.egressConfirmation
+        }
+      );
+      if ("runEvents" in outcome) {
+        const latest = outcome.runEvents.at(-1);
+        if (latest !== undefined) {
+          const visibleOutcome = {
+            ...outcome,
+            runEvents: outcome.runEvents.map((event) =>
+              event === latest
+                ? { ...event, summary: "Runtime 已复用权威副作用结果并完成" }
+              : event
+            )
+          };
+          const decoded = decodeDecisionTaskResultV1(visibleOutcome);
+          if (!decoded.ok) {
+            throw new Error(`纵向恢复结果不符合合同：${JSON.stringify(decoded.issues)}`);
+          }
+          return visibleOutcome;
+        }
+      }
+      return outcome;
+    }
+  });
+  const app = buildApiApp({
+    auditLog: { append: async (record) => taskModule.appendAuditRecord(record) },
+    decisionTaskPersistence: taskModule,
+    decisionTaskRuntimeControl: {
+      requestResume: async (input) =>
+        taskModule.requestRuntimeResume({
+          controlRequestId: input.controlRequestId,
+          decisionTaskId: input.decisionTaskId,
+          ownerUserId: input.actor.userId,
+          runtimeSnapshotId: input.runtimeSnapshotId,
+          correlationId: input.correlationId,
+          egressConfirmation: input.egressConfirmation
+        }),
+      requestCancel: async (input) =>
+        taskModule.requestRuntimeCancel({
+          controlRequestId: input.controlRequestId,
+          decisionTaskId: input.decisionTaskId,
+          ownerUserId: input.actor.userId,
+          cancellationId: input.cancellationId,
+          correlationId: input.correlationId
+        })
+    },
+    identityResolver: {
+      async resolve(authorization) {
+        return authorization === "Bearer web-test-token"
+          ? { principalId: "principal-web-test", role: "USER", userId: "web-test-user" }
+          : undefined;
+      }
+    }
+  });
+
+  try {
+    verticalApiUrl = await app.listen({ host: "127.0.0.1", port: 0 });
+    await page.goto("/");
+    await page.getByRole("button", { name: "运行合成决策" }).click();
+    await expect(page).toHaveURL(/decisionTaskId=task-/);
+    await publisher.runOnce();
+    await worker.runOnce();
+    await page.reload();
+    await expect(page.getByRole("button", { name: "安全恢复" })).toBeVisible();
+    await page.getByRole("button", { name: "安全恢复" }).click();
+    await expect(page.getByText("恢复中")).toBeVisible();
+    await worker.runOnce();
+
+    await expect(page.getByText("权威状态：COMPLETED")).toBeVisible();
+    await expect(page.getByText("恢复中")).not.toBeVisible();
+    await expect(
+      page.getByRole("region", { name: "任务进度" }).getByText("Runtime 已复用权威副作用结果并完成")
+    ).toBeVisible();
+    expect(correspondingToolCalls).toBe(0);
+  } finally {
+    verticalApiUrl = undefined;
+    await page.close().catch(() => undefined);
+    app.server.closeAllConnections();
+    await Promise.allSettled([
+      app.close(),
+      worker.close(),
+      publisher.close(),
+      recoveryStore.close(),
+      taskModule.close()
+    ]);
+  }
+});
+
 test("does not label a task observation failure as a business task failure", async ({ page }) => {
   const taskId = "task-web-observation-unavailable";
 
@@ -495,6 +981,16 @@ async function closeApiServer() {
   await new Promise<void>((resolve, reject) => {
     apiServer.close((error) => (error === undefined ? resolve() : reject(error)));
   });
+}
+
+async function readRequestBody(request: import("node:http").IncomingMessage): Promise<string> {
+  const chunks: Buffer[] = [];
+
+  for await (const chunk of request) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+
+  return Buffer.concat(chunks).toString("utf8");
 }
 
 function buildSyntheticDecisionResult() {

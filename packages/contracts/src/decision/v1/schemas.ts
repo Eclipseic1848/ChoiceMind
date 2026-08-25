@@ -342,7 +342,7 @@ export const runtimeSnapshotSchema = z.strictObject({
   capturedAt: utcTimestampSchema
 });
 
-export const effectReceiptSchema = z.strictObject({
+const effectReceiptBaseShape = {
   ...contractHeader,
   contractType: z.literal("effect-receipt"),
   effectReceiptId: z.string().min(1),
@@ -350,9 +350,50 @@ export const effectReceiptSchema = z.strictObject({
   agentRunId: z.string().min(1),
   checkpointId: z.string().min(1),
   effectId: z.string().min(1),
-  state: z.enum(["not_started", "started", "committed", "unknown"]),
   recordedAt: utcTimestampSchema
-});
+};
+
+const effectResultRefSchema = z
+  .strictObject({
+    algorithm: z.literal("sha256"),
+    digest: z.string().regex(/^[0-9a-f]{64}$/),
+    objectKey: z.string().min(1),
+    decisionTaskId: z.string().min(1),
+    agentRunId: z.string().min(1),
+    checkpointId: z.string().min(1),
+    effectId: z.string().min(1)
+  })
+  .refine((value) => value.objectKey === `effect-results/sha256/${value.digest}`, {
+    path: ["objectKey"]
+  });
+
+export const effectReceiptSchema = z
+  .discriminatedUnion("state", [
+    z.strictObject({
+      ...effectReceiptBaseShape,
+      state: z.enum(["not_started", "started", "unknown"])
+    }),
+    z.strictObject({
+      ...effectReceiptBaseShape,
+      state: z.literal("committed"),
+      result: effectResultRefSchema
+    })
+  ])
+  .superRefine((receipt, context) => {
+    if (
+      receipt.state === "committed" &&
+      (receipt.result.decisionTaskId !== receipt.decisionTaskId ||
+        receipt.result.agentRunId !== receipt.agentRunId ||
+        receipt.result.checkpointId !== receipt.checkpointId ||
+        receipt.result.effectId !== receipt.effectId)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["result"],
+        message: "副作用结果引用必须绑定同一任务、运行、检查点和副作用"
+      });
+    }
+  });
 
 export const runtimeRecoveryPermissionSchema = z.strictObject({
   ...contractHeader,
@@ -366,6 +407,8 @@ export const runtimeRecoveryPermissionSchema = z.strictObject({
     "TASK_NOT_PAUSED",
     "SNAPSHOT_NOT_RESUMABLE",
     "EFFECT_STATUS_UNSAFE",
+    "EFFECT_RESULT_UNAVAILABLE",
+    "EFFECT_RESULT_INVALID",
     "RECOVERY_FACTS_INVALID"
   ])
 });

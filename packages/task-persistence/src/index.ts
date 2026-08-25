@@ -14,6 +14,7 @@ import {
   type DecisionTaskStateV1,
   type ExecuteDecisionTaskCommandV1,
   type EffectReceiptV1,
+  type EffectResultRefV1,
   type PersistedRunEventV1,
   type RawRuntimeSnapshotRefV1,
   type RuntimeSnapshotV1,
@@ -58,6 +59,15 @@ export class PersistenceUnavailableError extends Error {
   constructor() {
     super("持久任务存储暂时不可用");
     this.name = "PersistenceUnavailableError";
+  }
+}
+
+export class EffectResultIntegrityError extends Error {
+  readonly code = "EFFECT_RESULT_INVALID";
+
+  constructor() {
+    super("副作用结果完整性校验失败");
+    this.name = "EffectResultIntegrityError";
   }
 }
 
@@ -228,6 +238,8 @@ export type RuntimeControlRequestClaim =
 export type RuntimeRecoveryStore = Readonly<{
   putRawSnapshot(payload: unknown): Promise<RawRuntimeSnapshotRefV1>;
   loadRawSnapshot(reference: RawRuntimeSnapshotRefV1): Promise<unknown | undefined>;
+  putEffectResult(identity: EffectResultIdentityV1, payload: unknown): Promise<EffectResultRefV1>;
+  loadEffectResult(reference: EffectResultRefV1): Promise<unknown | undefined>;
   saveRecoveryFacts(
     snapshot: RuntimeSnapshotV1,
     effectReceipts: readonly EffectReceiptV1[]
@@ -266,6 +278,13 @@ export type RuntimeRecoveryStore = Readonly<{
   isRuntimeCancelled(agentRunId: string): Promise<boolean>;
   appendEgressRecord(record: EgressRecord): Promise<void>;
   close(): Promise<void>;
+}>;
+
+export type EffectResultIdentityV1 = Readonly<{
+  decisionTaskId: string;
+  agentRunId: string;
+  checkpointId: string;
+  effectId: string;
 }>;
 
 export type RuntimeControlState =
@@ -497,6 +516,154 @@ export async function openRuntimeRecoveryStore(
         throw new PersistenceUnavailableError();
       }
     },
+    async putEffectResult(identity, payload) {
+      assertOpen(closed);
+      if (
+        identity.decisionTaskId.length === 0 ||
+        identity.agentRunId.length === 0 ||
+        identity.checkpointId.length === 0 ||
+        identity.effectId.length === 0
+      ) {
+        throw new PersistenceUnavailableError();
+      }
+      const canonicalPayload = canonicalizeJsonV1(payload);
+      const digest = createHash("sha256").update(canonicalPayload, "utf8").digest("hex");
+      const objectKey = `effect-results/sha256/${digest}`;
+      let client: PoolClient | undefined;
+      let transactionStarted = false;
+
+      try {
+        client = await pool.connect();
+        await client.query("BEGIN");
+        transactionStarted = true;
+        await client.query(
+          `INSERT INTO runtime_effect_result_objects (
+             digest, object_key, result_payload, created_at
+           ) VALUES ($1, $2, $3::jsonb, $4)
+           ON CONFLICT (digest) DO NOTHING`,
+          [digest, objectKey, canonicalPayload, now()]
+        );
+        const storedObject = await client.query<{
+          object_key: string;
+          result_payload: unknown;
+        }>(
+          `SELECT object_key, result_payload
+           FROM runtime_effect_result_objects
+           WHERE digest = $1`,
+          [digest]
+        );
+        const object = storedObject.rows[0];
+        if (
+          object === undefined ||
+          object.object_key !== objectKey ||
+          canonicalizeJsonV1(object.result_payload) !== canonicalPayload
+        ) {
+          throw new PersistenceUnavailableError();
+        }
+        await client.query(
+          `INSERT INTO runtime_effect_result_bindings (
+             decision_task_id, agent_run_id, checkpoint_id, effect_id,
+             digest, object_key, created_at
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+           ON CONFLICT (decision_task_id, agent_run_id, checkpoint_id, effect_id) DO NOTHING`,
+          [
+            identity.decisionTaskId,
+            identity.agentRunId,
+            identity.checkpointId,
+            identity.effectId,
+            digest,
+            objectKey,
+            now()
+          ]
+        );
+        const storedBinding = await client.query<{ digest: string; object_key: string }>(
+          `SELECT digest, object_key
+           FROM runtime_effect_result_bindings
+           WHERE decision_task_id = $1
+             AND agent_run_id = $2
+             AND checkpoint_id = $3
+             AND effect_id = $4`,
+          [
+            identity.decisionTaskId,
+            identity.agentRunId,
+            identity.checkpointId,
+            identity.effectId
+          ]
+        );
+        if (
+          storedBinding.rows[0]?.digest !== digest ||
+          storedBinding.rows[0]?.object_key !== objectKey
+        ) {
+          throw new PersistenceUnavailableError();
+        }
+        await client.query("COMMIT");
+        transactionStarted = false;
+        return { algorithm: "sha256", digest, objectKey, ...identity };
+      } catch (error) {
+        if (transactionStarted && client !== undefined) {
+          await client.query("ROLLBACK");
+        }
+        if (error instanceof PersistenceUnavailableError) {
+          throw error;
+        }
+        throw new PersistenceUnavailableError();
+      } finally {
+        client?.release();
+      }
+    },
+    async loadEffectResult(reference) {
+      assertOpen(closed);
+      if (
+        reference.algorithm !== "sha256" ||
+        !/^[0-9a-f]{64}$/.test(reference.digest) ||
+        reference.objectKey !== `effect-results/sha256/${reference.digest}`
+      ) {
+        throw new PersistenceUnavailableError();
+      }
+
+      try {
+        const result = await pool.query<{ result_payload: unknown }>(
+          `SELECT object.result_payload
+           FROM runtime_effect_result_bindings AS binding
+           INNER JOIN runtime_effect_result_objects AS object
+             ON object.digest = binding.digest
+            AND object.object_key = binding.object_key
+           WHERE binding.decision_task_id = $1
+             AND binding.agent_run_id = $2
+             AND binding.checkpoint_id = $3
+             AND binding.effect_id = $4
+             AND binding.digest = $5
+             AND binding.object_key = $6`,
+          [
+            reference.decisionTaskId,
+            reference.agentRunId,
+            reference.checkpointId,
+            reference.effectId,
+            reference.digest,
+            reference.objectKey
+          ]
+        );
+        const payload = result.rows[0]?.result_payload;
+        if (payload === undefined) {
+          return undefined;
+        }
+        const digest = createHash("sha256")
+          .update(canonicalizeJsonV1(payload), "utf8")
+          .digest("hex");
+        if (digest !== reference.digest) {
+          throw new EffectResultIntegrityError();
+        }
+        return payload;
+      } catch (error) {
+        if (
+          error instanceof PersistenceUnavailableError ||
+          error instanceof EffectResultIntegrityError
+        ) {
+          throw error;
+        }
+        throw new PersistenceUnavailableError();
+      }
+    },
     async saveRecoveryFacts(snapshot, effectReceipts) {
       assertOpen(closed);
       const decodedSnapshot = decodeRuntimeSnapshotV1(snapshot);
@@ -554,6 +721,31 @@ export async function openRuntimeRecoveryStore(
           throw new PersistenceUnavailableError();
         }
         for (const receipt of effectReceipts) {
+          if (receipt.state === "committed") {
+            const resultBinding = await client.query<{ present: boolean }>(
+              `SELECT EXISTS (
+                 SELECT 1
+                 FROM runtime_effect_result_bindings
+                 WHERE decision_task_id = $1
+                   AND agent_run_id = $2
+                   AND checkpoint_id = $3
+                   AND effect_id = $4
+                   AND digest = $5
+                   AND object_key = $6
+               ) AS present`,
+              [
+                receipt.result.decisionTaskId,
+                receipt.result.agentRunId,
+                receipt.result.checkpointId,
+                receipt.result.effectId,
+                receipt.result.digest,
+                receipt.result.objectKey
+              ]
+            );
+            if (!resultBinding.rows[0]?.present) {
+              throw new PersistenceUnavailableError();
+            }
+          }
           await client.query(
             `INSERT INTO runtime_effect_receipts (
                effect_receipt_id, snapshot_id, receipt_payload, created_at
@@ -942,6 +1134,9 @@ function isUnknownRecord(value: unknown): value is Record<string, unknown> {
 function runtimeControlErrorFromOutcome(
   outcome: PersistentDecisionTaskOutcome
 ): RuntimeControlErrorV1 | undefined {
+  if (isRuntimePausedOutcome(outcome)) {
+    return { code: "RUNTIME_RESUME_DENIED", message: outcome.summary };
+  }
   if ("runtimeControlError" in outcome && outcome.runtimeControlError !== undefined) {
     return outcome.runtimeControlError;
   }
@@ -1538,6 +1733,27 @@ export async function openPersistentDecisionTaskModule(
               })
             ]
           );
+          if (recoveryPermission.decision === "MANUAL_VERIFICATION_REQUIRED") {
+            const existingEvents = await loadRunEvents(
+              client,
+              row.decision_task_id,
+              row.agent_run_id
+            );
+            const manualVerificationEvent: RunEventV1 = {
+              contractType: "run-event",
+              contractVersion: "1.0",
+              eventId: `event-persistent-${randomUUID()}`,
+              decisionTaskId: row.decision_task_id,
+              agentRunId: row.agent_run_id,
+              sequence: existingEvents.length + 1,
+              occurredAt: claimedAt.toISOString(),
+              eventType: "TASK_STATE_CHANGED",
+              taskState: decodedSnapshot.value.taskState,
+              summary: "副作用状态需要人工核验",
+              synthetic: true
+            };
+            await insertRunEvent(client, manualVerificationEvent, claimedAt);
+          }
           await client.query("COMMIT");
           transactionStarted = false;
           return { status: "EMPTY" };
@@ -2639,7 +2855,17 @@ async function persistResultRunEvents(
     row.agent_run_id
   );
   const persistedStates = new Set(existingEvents.map((event) => event.taskState));
-  const newEvents = outcome.runEvents
+  const recoveredFromPause = existingEvents.some(
+    (event) =>
+      event.taskState === "PAUSED_USER" ||
+      event.taskState === "PAUSED_PERMISSION" ||
+      event.taskState === "PAUSED_SOURCE_LOGIN" ||
+      event.taskState === "PAUSED_LIMIT"
+  );
+  const eventsToPersist = recoveredFromPause
+    ? outcome.runEvents.filter((event) => event.taskState === "COMPLETED")
+    : outcome.runEvents;
+  const newEvents = eventsToPersist
     .filter((event) => !persistedStates.has(event.taskState))
     .map((event, index, events): RunEventV1 => ({
       ...event,
@@ -2647,7 +2873,7 @@ async function persistResultRunEvents(
       decisionTaskId: row.decision_task_id,
       agentRunId: row.agent_run_id,
       sequence: existingEvents.length + index + 1,
-      summary: publicTaskStateSummaries[event.taskState],
+      summary: publicRuntimeEventSummary(event),
       occurredAt:
         index === events.length - 1 ? persistedAt.toISOString() : event.occurredAt
     }));
@@ -2662,14 +2888,27 @@ async function persistResultRunEvents(
     await insertRunEvent(client, event, persistedAt);
   }
 
+  const resultRunEvents = recoveredFromPause
+    ? outcome.runEvents.map((event, index, events): RunEventV1 => ({
+        ...event,
+        sequence: index + 1,
+        summary: publicRuntimeEventSummary(event),
+        occurredAt:
+          index === events.length - 1 ? persistedAt.toISOString() : event.occurredAt
+      }))
+    : runEvents;
+  const resultFinalEvent = resultRunEvents.at(-1);
+  if (resultFinalEvent === undefined) {
+    throw new PersistenceUnavailableError();
+  }
   const canonicalResult = {
     ...outcome,
     taskStatus: {
       ...outcome.taskStatus,
-      latestEventSequence: finalEvent.sequence,
-      updatedAt: finalEvent.occurredAt
+      latestEventSequence: resultFinalEvent.sequence,
+      updatedAt: resultFinalEvent.occurredAt
     },
-    runEvents
+    runEvents: resultRunEvents
   };
 
   return decodePersistedResult(canonicalResult, row);
@@ -2695,15 +2934,17 @@ async function persistPausedRunEvents(
       decisionTaskId: row.decision_task_id,
       agentRunId: row.agent_run_id,
       sequence: existingEvents.length + index + 1,
-      summary: publicTaskStateSummaries[event.taskState],
+      summary: publicRuntimeEventSummary(event),
       occurredAt: persistedAt.toISOString()
     }));
-  const latestPersistedState = existingEvents.at(-1)?.taskState;
+  const latestPersistedEvent = existingEvents.at(-1);
+  const latestPersistedState = latestPersistedEvent?.taskState;
   const latestOutcomeEvent = outcome.runEvents.at(-1);
   if (
     newEvents.length === 0 &&
     latestOutcomeEvent !== undefined &&
-    latestPersistedState !== outcome.state
+    (latestPersistedState !== outcome.state ||
+      latestPersistedEvent?.summary !== publicRuntimeEventSummary(latestOutcomeEvent))
   ) {
     newEvents = [
       {
@@ -2713,7 +2954,7 @@ async function persistPausedRunEvents(
         agentRunId: row.agent_run_id,
         sequence: existingEvents.length + 1,
         taskState: outcome.state,
-        summary: publicTaskStateSummaries[outcome.state],
+        summary: publicRuntimeEventSummary(latestOutcomeEvent),
         occurredAt: persistedAt.toISOString()
       }
     ];
@@ -2731,6 +2972,21 @@ async function persistPausedRunEvents(
     throw new PersistenceUnavailableError();
   }
   return decoded.value;
+}
+
+function publicRuntimeEventSummary(event: RunEventV1): string {
+  const approvedRuntimeSummaries = new Set([
+    "Runtime 已复用权威副作用结果并完成",
+    "副作用状态需要人工核验（EFFECT_STATUS_UNSAFE）",
+    "已提交副作用的权威结果不可用（EFFECT_RESULT_UNAVAILABLE）",
+    "已提交副作用的结果完整性校验失败（EFFECT_RESULT_INVALID）",
+    "已提交副作用的结果合同无效（EFFECT_RESULT_INVALID）",
+    "恢复事实包含冲突的 Decision 草稿结果（EFFECT_RESULT_INVALID）"
+  ]);
+
+  return approvedRuntimeSummaries.has(event.summary)
+    ? event.summary
+    : publicTaskStateSummaries[event.taskState];
 }
 
 function decodePersistedResult(

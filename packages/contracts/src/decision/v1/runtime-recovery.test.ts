@@ -125,7 +125,7 @@ describe("Runtime 恢复合同 v1", () => {
     });
   });
 
-  it.each(["not_started", "started", "committed", "unknown"] as const)(
+  it.each(["not_started", "started", "unknown"] as const)(
     "接受 %s Effect Receipt 权威状态",
     (state) => {
       const receipt = buildEffectReceipt(state);
@@ -133,6 +133,19 @@ describe("Runtime 恢复合同 v1", () => {
       expect(decodeEffectReceiptV1(receipt)).toEqual({ ok: true, value: receipt });
     }
   );
+
+  it("committed 收据必须绑定可校验的内容寻址结果", () => {
+    const { result: _result, ...missingResult } = buildEffectReceipt("committed");
+    expect(decodeEffectReceiptV1(missingResult)).toMatchObject({
+      ok: false,
+      code: "CONTRACT_INVALID",
+      issues: [{ path: "result" }]
+    });
+
+    const receipt = buildEffectReceipt("committed");
+
+    expect(decodeEffectReceiptV1(receipt)).toEqual({ ok: true, value: receipt });
+  });
 
   it("只允许暂停、可恢复且副作用安全的运行原位恢复", () => {
     const permission = evaluateRuntimeRecoveryPermissionV1({
@@ -315,6 +328,20 @@ function buildEffectReceipt(state: "not_started" | "started" | "committed" | "un
     checkpointId: "checkpoint-run-1-3",
     effectId: `provider-call-${state}`,
     state,
-    recordedAt: "2026-08-24T12:00:00.000Z"
+    recordedAt: "2026-08-24T12:00:00.000Z",
+    ...(state === "committed"
+      ? {
+          result: {
+            algorithm: "sha256",
+            digest: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            objectKey:
+              "effect-results/sha256/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            decisionTaskId: "task-1",
+            agentRunId: "run-1",
+            checkpointId: "checkpoint-run-1-3",
+            effectId: "provider-call-committed"
+          }
+        }
+      : {})
   };
 }

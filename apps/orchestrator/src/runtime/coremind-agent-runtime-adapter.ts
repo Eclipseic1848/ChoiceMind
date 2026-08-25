@@ -24,6 +24,8 @@ import {
   type DecisionRevisionV1,
   type EvidenceV1,
   type EffectReceiptV1,
+  type EffectResultRefV1,
+  type RuntimeRecoveryPermissionV1,
   type RuntimeSnapshotV1,
   type RunEventV1
 } from "@choicemind/contracts/decision/v1";
@@ -51,6 +53,8 @@ type CoreMindAgentRuntimeAdapterOptions = Readonly<{
     RuntimeRecoveryStore,
     | "putRawSnapshot"
     | "loadRawSnapshot"
+    | "putEffectResult"
+    | "loadEffectResult"
     | "saveRecoveryFacts"
     | "loadRecoveryFacts"
     | "recordRuntimeRunning"
@@ -87,6 +91,13 @@ type CoreMindRecoveryEnvelopeV1 = Readonly<{
   runStateRecords: readonly RunStateRecord[];
 }>;
 
+type CoreMindEffectResultEnvelopeV1 = Readonly<{
+  effectResultType: "choicemind-decision-draft";
+  effectResultVersion: 1;
+  tool: "submit_decision_draft";
+  draft: CoreMindDecisionDraft;
+}>;
+
 const CORE_MIND_PROVIDER_API_KEY_ENV = "CHOICEMIND_COREMIND_PROVIDER_API_KEY";
 
 export function createCoreMindAgentRuntimeAdapter(
@@ -97,6 +108,7 @@ export function createCoreMindAgentRuntimeAdapter(
   const listeners = new Map<string, Set<(event: RunEventV1) => void>>();
   const eventSequences = new Map<string, number>();
   const rawSnapshots = new Map<string, unknown>();
+  const effectResults = new Map<string, unknown>();
   const recoveryFacts = new Map<
     string,
     Readonly<{ snapshot: RuntimeSnapshotV1; effectReceipts: readonly EffectReceiptV1[] }>
@@ -239,6 +251,66 @@ export function createCoreMindAgentRuntimeAdapter(
         };
       }
 
+      let reusedDraft: CoreMindDecisionDraft | undefined;
+      for (const receipt of authoritativeFacts.effectReceipts) {
+        if (receipt.state !== "committed") {
+          continue;
+        }
+        let effectResult: unknown;
+        try {
+          effectResult = options.recoveryStore
+            ? await options.recoveryStore.loadEffectResult(receipt.result)
+            : effectResults.get(receipt.result.objectKey);
+        } catch (error) {
+          if (isEffectResultIntegrityError(error)) {
+            return buildEffectResultRecoveryDenial(
+              authoritativeFacts.snapshot,
+              "EFFECT_RESULT_INVALID",
+              "已提交副作用的结果完整性校验失败"
+            );
+          }
+          throw error;
+        }
+        if (effectResult === undefined) {
+          return buildEffectResultRecoveryDenial(
+            authoritativeFacts.snapshot,
+            "EFFECT_RESULT_UNAVAILABLE",
+            "已提交副作用的权威结果不可用"
+          );
+        }
+        const digest = createHash("sha256")
+          .update(canonicalizeJsonV1(effectResult), "utf8")
+          .digest("hex");
+        if (digest !== receipt.result.digest) {
+          return buildEffectResultRecoveryDenial(
+            authoritativeFacts.snapshot,
+            "EFFECT_RESULT_INVALID",
+            "已提交副作用的结果完整性校验失败"
+          );
+        }
+        const decodedDraft = decodeCoreMindEffectResult(effectResult);
+        if (!decodedDraft.ok) {
+          return buildEffectResultRecoveryDenial(
+            authoritativeFacts.snapshot,
+            "EFFECT_RESULT_INVALID",
+            "已提交副作用的结果合同无效"
+          );
+        }
+        if (decodedDraft.draft !== undefined) {
+          if (
+            reusedDraft !== undefined &&
+            canonicalizeJsonV1(reusedDraft) !== canonicalizeJsonV1(decodedDraft.draft)
+          ) {
+            return buildEffectResultRecoveryDenial(
+              authoritativeFacts.snapshot,
+              "EFFECT_RESULT_INVALID",
+              "恢复事实包含冲突的 Decision 草稿结果"
+            );
+          }
+          reusedDraft = decodedDraft.draft;
+        }
+      }
+
       const rawEnvelope = options.recoveryStore
         ? await options.recoveryStore.loadRawSnapshot(authoritativeFacts.snapshot.rawSnapshot)
         : rawSnapshots.get(authoritativeFacts.snapshot.rawSnapshot.objectKey);
@@ -321,14 +393,17 @@ export function createCoreMindAgentRuntimeAdapter(
         command,
         securityContext,
         controllerId,
-        envelope
+        envelope,
+        reusedDraft
       );
       if (execution.result.outcome.status === "succeeded") {
         const event = createPublicRunEvent(
           command,
           "COMPLETED",
           "RUNTIME_SUCCEEDED",
-          "Runtime 已从权威快照恢复并完成",
+          reusedDraft === undefined
+            ? "Runtime 已从权威快照恢复并完成"
+            : "Runtime 已复用权威副作用结果并完成",
           execution.completedAt
         );
         await options.recoveryStore?.completeRuntimeControl(
@@ -471,7 +546,8 @@ export function createCoreMindAgentRuntimeAdapter(
       Partial<Pick<AgentRuntimeRunCommandV1, "contractVersion" | "requirementRevision">>,
     securityContext: Parameters<AgentRuntimePort["run"]>[1],
     controllerId: string,
-    recoveryEnvelope?: CoreMindRecoveryEnvelopeV1
+    recoveryEnvelope?: CoreMindRecoveryEnvelopeV1,
+    reusedDraft?: CoreMindDecisionDraft
   ): Promise<
     Readonly<{
       result: RunResult;
@@ -486,7 +562,8 @@ export function createCoreMindAgentRuntimeAdapter(
       }
       const now = options.now ?? (() => new Date().toISOString());
       const createdAt = now();
-      const capture: DraftCapture = { calls: 0 };
+      const capture: DraftCapture =
+        reusedDraft === undefined ? { calls: 0 } : { calls: 1, draft: reusedDraft };
       const config = buildCoreMindConfig(options);
       const tool = createDecisionDraftTool(capture);
       const runStore = createMemoryRunStore(recoveryEnvelope?.runStateRecords ?? []);
@@ -595,9 +672,28 @@ export function createCoreMindAgentRuntimeAdapter(
     );
   }
 
+  function putMemoryEffectResult(
+    identity: Pick<
+      EffectResultRefV1,
+      "decisionTaskId" | "agentRunId" | "checkpointId" | "effectId"
+    >,
+    payload: unknown
+  ): EffectResultRefV1 {
+    const digest = createHash("sha256")
+      .update(canonicalizeJsonV1(payload), "utf8")
+      .digest("hex");
+    const objectKey = `effect-results/sha256/${digest}`;
+    effectResults.set(objectKey, payload);
+    return { algorithm: "sha256", digest, objectKey, ...identity };
+  }
+
   async function buildPausedOutcome(
     command: Pick<AgentRuntimeRunCommandV1, "decisionTaskId" | "agentRunId">,
-    execution: Readonly<{ result: RunResult; runStateRecords: readonly RunStateRecord[] }>
+    execution: Readonly<{
+      result: RunResult;
+      capture: DraftCapture;
+      runStateRecords: readonly RunStateRecord[];
+    }>
   ): Promise<AgentRuntimePausedOutcomeV1> {
     const nativeSnapshot = parseRunSnapshot(execution.result.snapshot);
     if (execution.runStateRecords.length === 0) {
@@ -658,25 +754,50 @@ export function createCoreMindAgentRuntimeAdapter(
       },
       capturedAt: nativeSnapshot.operation.updatedAt
     };
-    const effectReceipts = nativeSnapshot.trace.flatMap((entry): EffectReceiptV1[] => {
+    const effectReceipts: EffectReceiptV1[] = [];
+    for (const entry of nativeSnapshot.trace) {
       if (!isEffectReceiptEvent(entry.event)) {
-        return [];
+        continue;
       }
-
-      return [
-        {
-          contractType: "effect-receipt",
-          contractVersion: "1.0",
-          effectReceiptId: `receipt-${entry.eventId}`,
-          decisionTaskId: command.decisionTaskId,
-          agentRunId: command.agentRunId,
-          checkpointId: checkpoint.checkpointId,
-          effectId: entry.event.idempotencyKey,
-          state: entry.event.status,
-          recordedAt: entry.timestamp
-        }
-      ];
-    });
+      const receiptBase = {
+        contractType: "effect-receipt" as const,
+        contractVersion: "1.0" as const,
+        effectReceiptId: `receipt-${entry.eventId}`,
+        decisionTaskId: command.decisionTaskId,
+        agentRunId: command.agentRunId,
+        checkpointId: checkpoint.checkpointId,
+        effectId: entry.event.idempotencyKey,
+        recordedAt: entry.timestamp
+      };
+      if (entry.event.status !== "committed") {
+        effectReceipts.push({ ...receiptBase, state: entry.event.status });
+        continue;
+      }
+      if (
+        entry.event.tool !== "submit_decision_draft" ||
+        execution.capture.calls !== 1 ||
+        execution.capture.draft === undefined
+      ) {
+        effectReceipts.push({ ...receiptBase, state: "unknown" });
+        continue;
+      }
+      const effectResult: CoreMindEffectResultEnvelopeV1 = {
+        effectResultType: "choicemind-decision-draft",
+        effectResultVersion: 1,
+        tool: "submit_decision_draft",
+        draft: execution.capture.draft
+      };
+      const identity = {
+        decisionTaskId: receiptBase.decisionTaskId,
+        agentRunId: receiptBase.agentRunId,
+        checkpointId: receiptBase.checkpointId,
+        effectId: receiptBase.effectId
+      };
+      const result = options.recoveryStore
+        ? await options.recoveryStore.putEffectResult(identity, effectResult)
+        : putMemoryEffectResult(identity, effectResult);
+      effectReceipts.push({ ...receiptBase, state: "committed", result });
+    }
     const existingEvents = eventHistory.get(command.agentRunId) ?? [];
     const runEvents =
       existingEvents.at(-1)?.taskState === taskState
@@ -987,15 +1108,65 @@ function pausedSummary(state: AgentRuntimePausedOutcomeV1["state"]): string {
   return summaries[state];
 }
 
+function buildEffectResultRecoveryDenial(
+  snapshot: RuntimeSnapshotV1,
+  reason: Extract<
+    RuntimeRecoveryPermissionV1["reason"],
+    "EFFECT_RESULT_UNAVAILABLE" | "EFFECT_RESULT_INVALID"
+  >,
+  message: string
+): AgentRuntimeControlResultV1 {
+  return {
+    ok: false,
+    code: "RUNTIME_RESUME_DENIED",
+    message,
+    recoveryPermission: {
+      contractType: "runtime-recovery-permission",
+      contractVersion: "1.0",
+      decisionTaskId: snapshot.decisionTaskId,
+      agentRunId: snapshot.agentRunId,
+      snapshotId: snapshot.snapshotId,
+      decision: "MANUAL_VERIFICATION_REQUIRED",
+      reason
+    }
+  };
+}
+
+function decodeCoreMindEffectResult(
+  value: unknown
+): Readonly<{ ok: true; draft?: CoreMindDecisionDraft }> | Readonly<{ ok: false }> {
+  if (!isRecord(value) || value.effectResultType !== "choicemind-decision-draft") {
+    return { ok: false };
+  }
+  if (
+    value.effectResultVersion !== 1 ||
+    value.tool !== "submit_decision_draft" ||
+    !isRecord(value.draft)
+  ) {
+    return { ok: false };
+  }
+  try {
+    return { ok: true, draft: assertDecisionDraftEnvelope(value.draft) };
+  } catch {
+    return { ok: false };
+  }
+}
+
+function isEffectResultIntegrityError(error: unknown): boolean {
+  return isRecord(error) && error.code === "EFFECT_RESULT_INVALID";
+}
+
 function isEffectReceiptEvent(event: unknown): event is Readonly<{
   type: "effect_receipt";
   idempotencyKey: string;
+  tool: string;
   status: EffectReceiptV1["state"];
 }> {
   return (
     isRecord(event) &&
     event.type === "effect_receipt" &&
     typeof event.idempotencyKey === "string" &&
+    typeof event.tool === "string" &&
     (event.status === "not_started" ||
       event.status === "started" ||
       event.status === "committed" ||

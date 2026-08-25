@@ -104,6 +104,34 @@ export function createDecisionTaskExecutor(
           toRuntimeSecurityContext(context)
         );
         if (!result.ok) {
+          if (
+            result.recoveryPermission?.decision === "MANUAL_VERIFICATION_REQUIRED" &&
+            isPausedRuntimeState(recovery.snapshot.taskState)
+          ) {
+            return {
+              contractType: "runtime-paused-outcome",
+              contractVersion: "1.0",
+              state: recovery.snapshot.taskState,
+              summary: result.message,
+              snapshot: recovery.snapshot,
+              effectReceipts: recovery.effectReceipts,
+              runEvents: [
+                {
+                  contractType: "run-event",
+                  contractVersion: "1.0",
+                  eventId: `event-runtime-manual-${context.operationId ?? context.agentRunId}`,
+                  decisionTaskId: command.requirementRevision.decisionTaskId,
+                  agentRunId: context.agentRunId,
+                  sequence: 1,
+                  occurredAt: recovery.snapshot.capturedAt,
+                  eventType: "TASK_STATE_CHANGED",
+                  taskState: recovery.snapshot.taskState,
+                  summary: `${result.message}（${result.recoveryPermission.reason}）`,
+                  synthetic: true
+                }
+              ]
+            };
+          }
           return {
             state:
               result.code === "RUNTIME_RESUME_IN_PROGRESS"
@@ -287,6 +315,17 @@ function toRuntimeSecurityContext(
 
 function isRetryableOutcome(outcome: DecisionTaskExecutionOutcome): boolean {
   return "state" in outcome && outcome.state === "FAILED_RETRYABLE";
+}
+
+function isPausedRuntimeState(
+  state: RuntimeSnapshotV1["taskState"]
+): state is RuntimePausedOutcomeV1["state"] {
+  return (
+    state === "PAUSED_USER" ||
+    state === "PAUSED_PERMISSION" ||
+    state === "PAUSED_SOURCE_LOGIN" ||
+    state === "PAUSED_LIMIT"
+  );
 }
 
 function finalizeRuntimeOutput(

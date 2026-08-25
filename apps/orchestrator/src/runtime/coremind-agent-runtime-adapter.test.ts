@@ -823,6 +823,8 @@ function createMemoryRuntimeRecoveryStore(): Pick<
   RuntimeRecoveryStore,
   | "putRawSnapshot"
   | "loadRawSnapshot"
+  | "putEffectResult"
+  | "loadEffectResult"
   | "saveRecoveryFacts"
   | "loadRecoveryFacts"
   | "recordRuntimeRunning"
@@ -832,6 +834,7 @@ function createMemoryRuntimeRecoveryStore(): Pick<
   | "isRuntimeCancelled"
 > {
   const objects = new Map<string, unknown>();
+  const effectResults = new Map<string, unknown>();
   const facts = new Map<
     string,
     Parameters<RuntimeRecoveryStore["saveRecoveryFacts"]>
@@ -858,6 +861,17 @@ function createMemoryRuntimeRecoveryStore(): Pick<
     },
     async loadRawSnapshot(reference) {
       return structuredClone(objects.get(reference.objectKey));
+    },
+    async putEffectResult(identity, payload) {
+      const digest = createHash("sha256")
+        .update(canonicalizeJsonV1(payload), "utf8")
+        .digest("hex");
+      const objectKey = `effect-results/sha256/${digest}`;
+      effectResults.set(objectKey, structuredClone(payload));
+      return { algorithm: "sha256", digest, objectKey, ...identity };
+    },
+    async loadEffectResult(reference) {
+      return structuredClone(effectResults.get(reference.objectKey));
     },
     async saveRecoveryFacts(snapshot, effectReceipts) {
       facts.set(snapshot.snapshotId, [snapshot, effectReceipts]);

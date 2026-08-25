@@ -186,6 +186,10 @@ _Avoid_: UI 状态、可变缓存
 记录一次外部副作用处于 `not_started`、`started`、`committed` 或 `unknown` 的权威收据。
 _Avoid_: 第三方恰好一次保证、普通日志
 
+**Effect Result**:
+ChoiceMind 对已提交副作用结果保存的不可变、内容寻址对象；引用必须绑定 Decision Task、Agent Run、Checkpoint 和 Effect 身份，并在恢复前校验 SHA-256 摘要。它是 Runtime 恢复事实，不是消费决策中的 Evidence，也不证明第三方只执行或只计费一次。
+_Avoid_: 第三方结果缓存、Evidence、绝对零重复调用、零重复计费保证
+
 **Checkpoint**:
 Agent Run 可以引用的持久执行位置；它本身不证明运行可以安全恢复。
 _Avoid_: 恢复许可、成功状态

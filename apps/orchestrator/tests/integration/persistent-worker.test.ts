@@ -609,7 +609,10 @@ describe("Persistent Decision Task Worker", () => {
         correlationId: `correlation-${suffix}`,
         egressConfirmation: { operationId: `control-${suffix}`, userId: "test-owner" }
       })
-    ).resolves.toMatchObject({ state: "COMPLETED" });
+    ).resolves.toMatchObject({
+      state: "FAILED",
+      error: { code: "RUNTIME_RESUME_DENIED", message: "等待必要权限" }
+    });
     await expect(
       taskModule.get(command.requirementRevision.decisionTaskId, "test-owner")
     ).resolves.toMatchObject({ state: "PAUSED_PERMISSION", terminal: false });
