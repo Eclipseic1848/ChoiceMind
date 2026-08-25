@@ -1,0 +1,165 @@
+import { describe, expect, it } from "vitest";
+
+import {
+	decodeLocalServiceRequestV1,
+	decodeLocalServiceResultV1,
+} from "./index.js";
+
+describe("本地服务 v1 合同", () => {
+	it.each([
+		{
+			port: "MODEL_PROVIDER",
+			input: {
+				messages: [{ role: "user", content: "只回答：CHOICEMIND_OK" }],
+				maxOutputTokens: 32,
+			},
+		},
+		{
+			port: "EMBEDDING_PROVIDER",
+			input: { texts: ["ChoiceMind 固定嵌入样本"] },
+		},
+		{
+			port: "RERANKER",
+			input: {
+				query: "哪个候选满足条件？",
+				documents: [
+					{ documentId: "candidate-a", text: "候选 A 满足条件" },
+					{ documentId: "candidate-b", text: "候选 B 不满足条件" },
+				],
+				topK: 2,
+			},
+		},
+		{
+			port: "DOCUMENT_PARSER",
+			input: {
+				document: {
+					mediaType: "application/pdf",
+					dataBase64: "JVBERi0xLjQ=",
+				},
+			},
+		},
+		{
+			port: "ASR",
+			input: {
+				audio: { mediaType: "audio/wav", dataBase64: "UklGRg==" },
+				language: "zh-CN",
+			},
+		},
+	])("接受 $port 的版本化请求", ({ port, input }) => {
+		expect(
+			decodeLocalServiceRequestV1({
+				contractType: "local-service-request",
+				contractVersion: "1.0",
+				requestId: `request-${port.toLowerCase()}`,
+				port,
+				input,
+			}),
+		).toMatchObject({ ok: true, value: { port } });
+	});
+
+	it.each([
+		{
+			port: "MODEL_PROVIDER",
+			output: { model: "Qwen3.8-27B", text: "CHOICEMIND_OK" },
+		},
+		{
+			port: "EMBEDDING_PROVIDER",
+			output: {
+				model: "Qwen3-Embedding-4B",
+				dimensions: 3,
+				vectors: [[0.1, 0.2, 0.3]],
+			},
+		},
+		{
+			port: "RERANKER",
+			output: {
+				model: "Qwen3-Reranker-4B",
+				rankings: [
+					{ documentId: "candidate-a", score: 0.9 },
+					{ documentId: "candidate-b", score: 0.1 },
+				],
+			},
+		},
+		{
+			port: "DOCUMENT_PARSER",
+			output: { parser: "MinerU-3.4.4", text: "ChoiceMind", pageCount: 1 },
+		},
+		{
+			port: "ASR",
+			output: { model: "local-asr", text: "ChoiceMind", language: "zh-CN" },
+		},
+	])("接受 $port 的版本化成功结果", ({ port, output }) => {
+		expect(
+			decodeLocalServiceResultV1({
+				contractType: "local-service-result",
+				contractVersion: "1.0",
+				requestId: `request-${port.toLowerCase()}`,
+				port,
+				ok: true,
+				output,
+			}),
+		).toMatchObject({ ok: true, value: { port, ok: true } });
+	});
+
+	it.each([
+		["TIMEOUT", "TRANSPORT", true],
+		["CONNECTION_FAILED", "TRANSPORT", true],
+		["INVALID_RESPONSE", "PROTOCOL", false],
+		["CAPABILITY_LIMIT_EXCEEDED", "CAPABILITY", false],
+	] as const)("接受稳定错误码 %s", (code, category, retryable) => {
+		expect(
+			decodeLocalServiceResultV1({
+				contractType: "local-service-result",
+				contractVersion: "1.0",
+				requestId: "request-error",
+				port: "MODEL_PROVIDER",
+				ok: false,
+				error: {
+					code,
+					category,
+					message: "固定错误信息",
+					retryable,
+				},
+			}),
+		).toMatchObject({ ok: true, value: { ok: false, error: { code } } });
+	});
+
+	it("显式拒绝不支持的合同版本", () => {
+		expect(
+			decodeLocalServiceRequestV1({
+				contractType: "local-service-request",
+				contractVersion: "2.0",
+				requestId: "request-version",
+				port: "MODEL_PROVIDER",
+				input: {},
+			}),
+		).toEqual({
+			ok: false,
+			code: "CONTRACT_VERSION_UNSUPPORTED",
+			issues: [{ path: "contractVersion", message: "合同版本不受支持" }],
+		});
+	});
+
+	it("以稳定字段路径拒绝嵌入向量维度不一致", () => {
+		expect(
+			decodeLocalServiceResultV1({
+				contractType: "local-service-result",
+				contractVersion: "1.0",
+				requestId: "request-invalid-vector",
+				port: "EMBEDDING_PROVIDER",
+				ok: true,
+				output: {
+					model: "Qwen3-Embedding-4B",
+					dimensions: 3,
+					vectors: [[0.1, 0.2]],
+				},
+			}),
+		).toMatchObject({
+			ok: false,
+			code: "CONTRACT_INVALID",
+			issues: [
+				{ path: "output.vectors.0", message: "向量维度必须与 dimensions 一致" },
+			],
+		});
+	});
+});
