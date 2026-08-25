@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -6,10 +7,18 @@ import path from "node:path";
 import { CoreMindRuntime } from "coremind-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createEgressGuard, type EgressRecord } from "@choicemind/security";
+import type {
+  RuntimeControlState,
+  RuntimeRecoveryStore
+} from "@choicemind/task-persistence";
 
 import { buildOrchestratorApp } from "../app.js";
 import { createDecisionTaskExecutor } from "../decision-tasks/executor.js";
-import type { ExecuteDecisionTaskCommandV1 } from "@choicemind/contracts/decision/v1";
+import {
+  canonicalizeJsonV1,
+  type ExecuteDecisionTaskCommandV1,
+  type RunEventV1
+} from "@choicemind/contracts/decision/v1";
 import { buildSyntheticLaptopRunOutput } from "./synthetic-laptop-fixture.js";
 import type { AgentRuntimeRunPort } from "./port.js";
 import {
@@ -108,6 +117,86 @@ describe("CoreMind AgentRuntimeRunPort", () => {
         state: "STARTED"
       })
     ]);
+  });
+
+  it("真实 CoreMind HTTP/RunStore 可由新 Adapter 实例纵向恢复且不伪造完成", async () => {
+    const provider = await startOfflineProvider();
+    const firstConfigDir = await createTemporaryDirectory();
+    const resumedConfigDir = await createTemporaryDirectory();
+    const recoveryStore = createMemoryRuntimeRecoveryStore();
+    const command = buildCoreMindCommand("coremind-real-resume");
+    const runtimeCommand = {
+      contractVersion: "1.0" as const,
+      decisionTaskId: command.requirementRevision.decisionTaskId,
+      agentRunId: "agent-run-coremind-real-resume",
+      requirementRevision: command.requirementRevision
+    };
+    const operationId = command.executionRequestId;
+    const securityContext = {
+      userId: "user-coremind-real-resume",
+      operationId,
+      correlationId: operationId,
+      egressConfirmation: { operationId, userId: "user-coremind-real-resume" }
+    };
+    const baseOptions = {
+      providerBaseUrl: provider.baseUrl,
+      model: "offline-model",
+      permissionsMode: "ask" as const,
+      egressGuard: createEgressGuard({
+        appendRecord: async () => undefined,
+        nextId: () => `egress-real-resume-${provider.requests.length}`,
+        now: () => new Date("2026-08-24T00:32:00.000Z")
+      }),
+      recoveryStore
+    };
+    const firstAdapter = createRawCoreMindAgentRuntimeAdapter({
+      ...baseOptions,
+      configDir: firstConfigDir
+    });
+
+    const paused = await firstAdapter.runPersistent?.(runtimeCommand, securityContext);
+    if (paused === undefined || !("snapshot" in paused)) {
+      throw new Error("真实 CoreMind 首轮必须形成暂停快照");
+    }
+    expect(paused).toMatchObject({
+      state: "PAUSED_PERMISSION",
+      snapshot: { resumable: true },
+      effectReceipts: [expect.objectContaining({ state: "not_started" })]
+    });
+
+    const resumedAdapter = createRawCoreMindAgentRuntimeAdapter({
+      ...baseOptions,
+      configDir: resumedConfigDir,
+      approveTool: async () => "allow"
+    });
+    const resumed = await resumedAdapter.resume(
+      {
+        contractVersion: "1.0",
+        decisionTaskId: runtimeCommand.decisionTaskId,
+        agentRunId: runtimeCommand.agentRunId,
+        snapshot: paused.snapshot,
+        effectReceipts: paused.effectReceipts
+      },
+      securityContext
+    );
+
+    if (!resumed.ok) {
+      throw new Error(JSON.stringify(resumed));
+    }
+    expect(resumed).toMatchObject({
+      ok: true,
+      changed: true,
+      state: "PAUSED_PERMISSION"
+    });
+    if (resumed.ok) {
+      expect(resumed.runEvents.at(-1)).toMatchObject({
+        taskState: "PAUSED_PERMISSION"
+      });
+      expect(resumed.runEvents).not.toContainEqual(
+        expect.objectContaining({ taskState: "COMPLETED" })
+      );
+    }
+    expect(provider.requests.length).toBeGreaterThanOrEqual(3);
   });
 
   it("Gate D: runs through the public CoreMind HTTP/SSE and Tool path before finalizing a Decision", async () => {
@@ -726,6 +815,159 @@ function createCoreMindAgentRuntimeAdapter(
         correlationId: operationId,
         egressConfirmation: { operationId, userId: "user-coremind-test" }
       });
+    }
+  };
+}
+
+function createMemoryRuntimeRecoveryStore(): Pick<
+  RuntimeRecoveryStore,
+  | "putRawSnapshot"
+  | "loadRawSnapshot"
+  | "saveRecoveryFacts"
+  | "loadRecoveryFacts"
+  | "recordRuntimeRunning"
+  | "claimRuntimeResume"
+  | "completeRuntimeControl"
+  | "claimRuntimeCancel"
+  | "isRuntimeCancelled"
+> {
+  const objects = new Map<string, unknown>();
+  const facts = new Map<
+    string,
+    Parameters<RuntimeRecoveryStore["saveRecoveryFacts"]>
+  >();
+  const controls = new Map<
+    string,
+    {
+      snapshotId?: string;
+      state: RuntimeControlState;
+      runEvents: readonly RunEventV1[];
+      controllerId?: string;
+      leaseExpiresAt?: number;
+    }
+  >();
+
+  return {
+    async putRawSnapshot(payload) {
+      const digest = createHash("sha256")
+        .update(canonicalizeJsonV1(payload), "utf8")
+        .digest("hex");
+      const objectKey = `runtime-snapshots/sha256/${digest}`;
+      objects.set(objectKey, structuredClone(payload));
+      return { algorithm: "sha256", digest, objectKey };
+    },
+    async loadRawSnapshot(reference) {
+      return structuredClone(objects.get(reference.objectKey));
+    },
+    async saveRecoveryFacts(snapshot, effectReceipts) {
+      facts.set(snapshot.snapshotId, [snapshot, effectReceipts]);
+      const current = controls.get(snapshot.agentRunId);
+      if (current?.state === "RUNNING" && current.snapshotId === undefined) {
+        current.snapshotId = snapshot.snapshotId;
+      } else if (current === undefined || current.state.startsWith("PAUSED_")) {
+        controls.set(snapshot.agentRunId, {
+          snapshotId: snapshot.snapshotId,
+          state: snapshot.taskState as RuntimeControlState,
+          runEvents: []
+        });
+      }
+    },
+    async loadRecoveryFacts(snapshotId) {
+      const stored = facts.get(snapshotId);
+      return stored === undefined
+        ? undefined
+        : { snapshot: stored[0], effectReceipts: stored[1] };
+    },
+    async recordRuntimeRunning(agentRunId, controllerId, leaseDurationMs) {
+      const current = controls.get(agentRunId);
+      if (
+        current === undefined ||
+        (current.state === "RUNNING" &&
+          current.snapshotId === undefined &&
+          (current.controllerId === controllerId ||
+            (current.leaseExpiresAt ?? 0) < Date.now()))
+      ) {
+        controls.set(agentRunId, {
+          state: "RUNNING",
+          runEvents: [],
+          controllerId,
+          leaseExpiresAt: Date.now() + leaseDurationMs
+        });
+      }
+    },
+    async claimRuntimeResume(agentRunId, snapshotId, controllerId, leaseDurationMs) {
+      const current = controls.get(agentRunId);
+      if (current === undefined || current.snapshotId !== snapshotId) {
+        return { status: "DENIED", state: current?.state ?? "FAILED", runEvents: [] };
+      }
+      if (current.state === "RUNNING") {
+        if (current.controllerId !== controllerId && (current.leaseExpiresAt ?? 0) >= Date.now()) {
+          return { status: "BUSY", state: current.state, runEvents: current.runEvents };
+        }
+        if (current.controllerId === controllerId) {
+          return { status: "UNCHANGED", state: current.state, runEvents: current.runEvents };
+        }
+      }
+      if (current.state === "COMPLETED") {
+        return { status: "UNCHANGED", state: current.state, runEvents: current.runEvents };
+      }
+      if (current.state !== "RUNNING" && !current.state.startsWith("PAUSED_")) {
+        return { status: "DENIED", state: current.state, runEvents: current.runEvents };
+      }
+      current.state = "RUNNING";
+      current.runEvents = [];
+      current.controllerId = controllerId;
+      current.leaseExpiresAt = Date.now() + leaseDurationMs;
+      return { status: "ACQUIRED", state: "RUNNING", runEvents: [] };
+    },
+    async completeRuntimeControl(
+      agentRunId,
+      controllerId,
+      expectedSnapshotId,
+      nextSnapshotId,
+      state,
+      runEvents
+    ) {
+      const current = controls.get(agentRunId);
+      if (
+        current?.state !== "RUNNING" ||
+        current.controllerId !== controllerId ||
+        current.snapshotId !== expectedSnapshotId
+      ) {
+        if (
+          current?.state === state &&
+          current.snapshotId === nextSnapshotId &&
+          canonicalizeJsonV1(current.runEvents) === canonicalizeJsonV1(runEvents)
+        ) {
+          return;
+        }
+        throw new Error("测试 Runtime 控制 CAS 失败");
+      }
+      controls.set(agentRunId, {
+        ...(nextSnapshotId === undefined ? {} : { snapshotId: nextSnapshotId }),
+        state,
+        runEvents
+      });
+    },
+    async claimRuntimeCancel(agentRunId, _cancellationId, runEvents) {
+      const current = controls.get(agentRunId);
+      if (current === undefined) {
+        return { status: "DENIED", state: "FAILED", runEvents: [] };
+      }
+      if (current.state === "CANCELLED") {
+        return { status: "UNCHANGED", state: "CANCELLED", runEvents: current.runEvents };
+      }
+      if (current.state === "COMPLETED" || current.state === "FAILED") {
+        return { status: "DENIED", state: current.state, runEvents: current.runEvents };
+      }
+      current.state = "CANCELLED";
+      current.runEvents = runEvents;
+      delete current.controllerId;
+      delete current.leaseExpiresAt;
+      return { status: "ACQUIRED", state: "CANCELLED", runEvents };
+    },
+    async isRuntimeCancelled(agentRunId) {
+      return controls.get(agentRunId)?.state === "CANCELLED";
     }
   };
 }

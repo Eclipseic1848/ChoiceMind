@@ -8,14 +8,17 @@ import {
   decodeDecisionTaskSnapshotV1,
   decodeExecuteDecisionTaskCommandV1,
   decodePersistedRunEventV1,
+  decodeRuntimeResumeRequestV1,
+  decodeRuntimeCancelRequestV1,
   getDecisionTaskResultHttpStatusV1,
   isPersistedRunEventCursorV1
 } from "@choicemind/contracts/decision/v1";
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyReply } from "fastify";
 
 import type { AuditLogPort, AuditRecord } from "../security/audit.js";
 import type { DecisionTaskEventNotificationsPort } from "./event-notifications-port.js";
 import type { DecisionTaskPersistencePort } from "./persistence-port.js";
+import type { DecisionTaskRuntimeControlPort } from "./runtime-control-port.js";
 import type { IdentityResolver } from "../security/identity.js";
 
 export function registerDecisionTaskRoutes(
@@ -25,7 +28,8 @@ export function registerDecisionTaskRoutes(
   eventNotifications: DecisionTaskEventNotificationsPort | undefined,
   eventPollIntervalMs: number,
   identityResolver: IdentityResolver | undefined,
-  auditLog: AuditLogPort | undefined
+  auditLog: AuditLogPort | undefined,
+  runtimeControl: DecisionTaskRuntimeControlPort | undefined
 ) {
   app.post("/api/v1/decision-tasks:execute", async (request, reply) => {
     const principal = await identityResolver?.resolve(request.headers.authorization);
@@ -353,6 +357,151 @@ export function registerDecisionTaskRoutes(
       }
     }
   );
+
+  app.post<{ Params: { decisionTaskId: string } }>(
+    "/api/v1/decision-tasks/:decisionTaskId/resume",
+    async (request, reply) => {
+      const principal = await identityResolver?.resolve(request.headers.authorization);
+      if (principal === undefined) {
+        return sendAuthenticationRequired(reply, now);
+      }
+      if (runtimeControl === undefined) {
+        return reply.code(503).send({
+          ok: false,
+          error: {
+            code: "PERSISTENCE_UNAVAILABLE",
+            category: "STORAGE",
+            retryMode: "SAME_EXECUTION_ONLY",
+            occurredAt: now().toISOString()
+          }
+        });
+      }
+      const decoded = decodeRuntimeResumeRequestV1(request.body);
+      if (!decoded.ok) {
+        return sendRuntimeControlContractRejected(reply, decoded, now);
+      }
+      const correlationId = getCorrelationId(request.headers["x-correlation-id"], request.id);
+      let status: Awaited<ReturnType<DecisionTaskRuntimeControlPort["requestResume"]>>;
+      try {
+        status = await runtimeControl.requestResume({
+          actor: principal,
+          controlRequestId: decoded.value.controlRequestId,
+          decisionTaskId: request.params.decisionTaskId,
+          runtimeSnapshotId: decoded.value.runtimeSnapshotId,
+          correlationId,
+          egressConfirmation: {
+            operationId: decoded.value.controlRequestId,
+            userId: principal.userId
+          }
+        });
+      } catch (error) {
+        return sendRuntimeControlError(reply, error, now);
+      }
+      if (status === undefined) {
+        return reply.code(404).send(
+          createDecisionTaskNotFoundResultV1({
+            errorId: "error-decision-task-not-found",
+            occurredAt: now().toISOString()
+          })
+        );
+      }
+      await appendDecisionTaskAudit(auditLog, {
+        actor: principal,
+        action: "DECISION_TASK_RESUME",
+        decisionTaskId: request.params.decisionTaskId,
+        result: "ALLOWED",
+        correlationId
+      });
+      return reply.code(202).send(status);
+    }
+  );
+
+  app.post<{ Params: { decisionTaskId: string } }>(
+    "/api/v1/decision-tasks/:decisionTaskId/cancel",
+    async (request, reply) => {
+      const principal = await identityResolver?.resolve(request.headers.authorization);
+      if (principal === undefined) return sendAuthenticationRequired(reply, now);
+      if (runtimeControl === undefined) {
+        return sendRuntimeControlError(
+          reply,
+          Object.assign(new Error("Runtime Control 不可用"), { code: "PERSISTENCE_UNAVAILABLE" }),
+          now
+        );
+      }
+      const decoded = decodeRuntimeCancelRequestV1(request.body);
+      if (!decoded.ok) return sendRuntimeControlContractRejected(reply, decoded, now);
+      const correlationId = getCorrelationId(request.headers["x-correlation-id"], request.id);
+      let status: Awaited<ReturnType<DecisionTaskRuntimeControlPort["requestCancel"]>>;
+      try {
+        status = await runtimeControl.requestCancel({
+          actor: principal,
+          controlRequestId: decoded.value.controlRequestId,
+          decisionTaskId: request.params.decisionTaskId,
+          cancellationId: decoded.value.cancellationId,
+          correlationId
+        });
+      } catch (error) {
+        return sendRuntimeControlError(reply, error, now);
+      }
+      if (status === undefined) {
+        return reply.code(404).send(
+          createDecisionTaskNotFoundResultV1({
+            errorId: "error-decision-task-not-found",
+            occurredAt: now().toISOString()
+          })
+        );
+      }
+      await appendDecisionTaskAudit(auditLog, {
+        actor: principal,
+        action: "DECISION_TASK_CANCEL",
+        decisionTaskId: request.params.decisionTaskId,
+        result: "ALLOWED",
+        correlationId
+      });
+      return reply.code(200).send(status);
+    }
+  );
+}
+
+function sendRuntimeControlContractRejected(
+  reply: FastifyReply,
+  decoded: Readonly<{
+    code: "CONTRACT_INVALID" | "CONTRACT_VERSION_UNSUPPORTED";
+    issues: readonly Readonly<{ path: string; message: string }>[];
+  }>,
+  now: () => Date
+) {
+  const result = createContractRejectedDecisionTaskResultV1({
+    errorId: "error-runtime-control-contract-rejected",
+    code: decoded.code,
+    issues: decoded.issues,
+    occurredAt: now().toISOString()
+  });
+  return reply.code(getDecisionTaskResultHttpStatusV1(result)).send(result);
+}
+
+function sendRuntimeControlError(reply: FastifyReply, error: unknown, now: () => Date) {
+  if (hasErrorCode(error, "PERSISTENCE_UNAVAILABLE")) {
+    return reply.code(503).send(
+      createPersistenceUnavailableResultV1({
+        errorId: "error-runtime-control-persistence-unavailable",
+        occurredAt: now().toISOString()
+      })
+    );
+  }
+  return reply.code(409).send({
+    ok: false,
+    error: {
+      code: hasErrorCode(error, "RUNTIME_RESUME_DENIED")
+        ? "RUNTIME_RESUME_DENIED"
+        : hasErrorCode(error, "RUNTIME_CANCEL_RACE")
+          ? "RUNTIME_CANCEL_RACE"
+          : "RUNTIME_CONTROL_REJECTED",
+      category: "RUNTIME",
+      retryMode: "NONE",
+      occurredAt: now().toISOString()
+    }
+  });
 }
 
 async function waitForNextEvent(

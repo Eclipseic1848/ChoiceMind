@@ -16,6 +16,15 @@ export const persistentDecisionTaskOwnerMigrationVersion = "0008_decision_task_o
 export const persistentAuditLogMigrationVersion = "0009_audit_log";
 export const persistentCredentialVaultMigrationVersion = "0010_credential_vault";
 export const persistentEgressRecordMigrationVersion = "0011_egress_record";
+export const persistentRuntimeRecoveryMigrationVersion = "0012_runtime_recovery";
+export const persistentPausedRuntimeMigrationVersion = "0013_paused_runtime_state";
+export const persistentRuntimeControlMigrationVersion = "0014_runtime_control_state";
+export const persistentRuntimeControlLeaseMigrationVersion =
+  "0015_runtime_control_lease";
+export const persistentRuntimeControlRequestMigrationVersion =
+  "0016_runtime_control_request";
+export const persistentRuntimeCancellationMigrationVersion =
+  "0017_runtime_cancellation";
 
 export async function migratePersistentDecisionTasks(client: PoolClient): Promise<void> {
   await client.query("BEGIN");
@@ -406,6 +415,206 @@ export async function migratePersistentDecisionTasks(client: PoolClient): Promis
       await client.query(
         `INSERT INTO decision_task_schema_migrations (version) VALUES ($1)`,
         [persistentEgressRecordMigrationVersion]
+      );
+    }
+    const runtimeRecoveryMigration = await client.query<{ applied: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM decision_task_schema_migrations WHERE version = $1
+       ) AS applied`,
+      [persistentRuntimeRecoveryMigrationVersion]
+    );
+    if (!runtimeRecoveryMigration.rows[0]?.applied) {
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS runtime_snapshot_objects (
+          digest text PRIMARY KEY CHECK (digest ~ '^[0-9a-f]{64}$'),
+          object_key text NOT NULL UNIQUE,
+          snapshot_payload jsonb NOT NULL,
+          created_at timestamptz NOT NULL
+        )
+      `);
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS runtime_recovery_facts (
+          snapshot_id text PRIMARY KEY,
+          decision_task_id text NOT NULL,
+          agent_run_id text NOT NULL,
+          raw_snapshot_digest text NOT NULL REFERENCES runtime_snapshot_objects(digest),
+          snapshot_payload jsonb NOT NULL,
+          created_at timestamptz NOT NULL
+        )
+      `);
+      await client.query(`
+        CREATE INDEX IF NOT EXISTS runtime_recovery_facts_agent_run_lookup
+        ON runtime_recovery_facts (agent_run_id, created_at DESC)
+      `);
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS runtime_effect_receipts (
+          effect_receipt_id text PRIMARY KEY,
+          snapshot_id text NOT NULL REFERENCES runtime_recovery_facts(snapshot_id),
+          receipt_payload jsonb NOT NULL,
+          created_at timestamptz NOT NULL
+        )
+      `);
+      await client.query(`
+        CREATE INDEX IF NOT EXISTS runtime_effect_receipts_snapshot_lookup
+        ON runtime_effect_receipts (snapshot_id, effect_receipt_id)
+      `);
+      await client.query(
+        `INSERT INTO decision_task_schema_migrations (version) VALUES ($1)`,
+        [persistentRuntimeRecoveryMigrationVersion]
+      );
+    }
+    const pausedRuntimeMigration = await client.query<{ applied: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM decision_task_schema_migrations WHERE version = $1
+       ) AS applied`,
+      [persistentPausedRuntimeMigrationVersion]
+    );
+    if (!pausedRuntimeMigration.rows[0]?.applied) {
+      await client.query(`
+        ALTER TABLE agent_run_operations
+        DROP CONSTRAINT IF EXISTS agent_run_operations_state_check
+      `);
+      await client.query(`
+        ALTER TABLE agent_run_operations
+        ADD CONSTRAINT agent_run_operations_state_check
+        CHECK (
+          state IN (
+            'ACCEPTED', 'RUNNING', 'COMPLETED', 'FAILED_RETRYABLE',
+            'FAILED_FINAL', 'PARTIAL', 'PAUSED_USER', 'PAUSED_PERMISSION',
+            'PAUSED_SOURCE_LOGIN', 'PAUSED_LIMIT'
+          )
+        )
+      `);
+      await client.query(
+        `INSERT INTO decision_task_schema_migrations (version) VALUES ($1)`,
+        [persistentPausedRuntimeMigrationVersion]
+      );
+    }
+    const runtimeControlMigration = await client.query<{ applied: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM decision_task_schema_migrations WHERE version = $1
+       ) AS applied`,
+      [persistentRuntimeControlMigrationVersion]
+    );
+    if (!runtimeControlMigration.rows[0]?.applied) {
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS runtime_control_states (
+          agent_run_id text PRIMARY KEY,
+          snapshot_id text REFERENCES runtime_recovery_facts(snapshot_id),
+          state text NOT NULL CHECK (
+            state IN (
+              'RUNNING', 'PAUSED_USER', 'PAUSED_PERMISSION',
+              'PAUSED_SOURCE_LOGIN', 'PAUSED_LIMIT', 'COMPLETED',
+              'CANCELLED', 'FAILED'
+            )
+          ),
+          cancellation_id text,
+          event_payload jsonb NOT NULL DEFAULT '[]'::jsonb,
+          updated_at timestamptz NOT NULL
+        )
+      `);
+      await client.query(
+        `INSERT INTO decision_task_schema_migrations (version) VALUES ($1)`,
+        [persistentRuntimeControlMigrationVersion]
+      );
+    }
+    const runtimeControlLeaseMigration = await client.query<{ applied: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM decision_task_schema_migrations WHERE version = $1
+       ) AS applied`,
+      [persistentRuntimeControlLeaseMigrationVersion]
+    );
+    if (!runtimeControlLeaseMigration.rows[0]?.applied) {
+      await client.query(`
+        ALTER TABLE runtime_control_states
+        ADD COLUMN IF NOT EXISTS controller_id text,
+        ADD COLUMN IF NOT EXISTS lease_expires_at timestamptz
+      `);
+      await client.query(
+        `INSERT INTO decision_task_schema_migrations (version) VALUES ($1)`,
+        [persistentRuntimeControlLeaseMigrationVersion]
+      );
+    }
+    const runtimeControlRequestMigration = await client.query<{ applied: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM decision_task_schema_migrations WHERE version = $1
+       ) AS applied`,
+      [persistentRuntimeControlRequestMigrationVersion]
+    );
+    if (!runtimeControlRequestMigration.rows[0]?.applied) {
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS runtime_control_requests (
+          control_request_id text PRIMARY KEY,
+          operation_id uuid NOT NULL REFERENCES agent_run_operations(operation_id),
+          decision_task_id text NOT NULL,
+          agent_run_id text NOT NULL REFERENCES decision_task_agent_runs(agent_run_id),
+          owner_user_id text NOT NULL,
+          action text NOT NULL CHECK (action IN ('RESUME', 'CANCEL')),
+          runtime_snapshot_id text REFERENCES runtime_recovery_facts(snapshot_id),
+          cancellation_id text,
+          correlation_id text NOT NULL,
+          confirmation_operation_id text,
+          confirmation_user_id text,
+          state text NOT NULL CHECK (
+            state IN ('ACCEPTED', 'RUNNING', 'COMPLETED', 'FAILED')
+          ),
+          worker_id text,
+          lease_expires_at timestamptz,
+          result_payload jsonb,
+          created_at timestamptz NOT NULL,
+          updated_at timestamptz NOT NULL,
+          CHECK (
+            (
+              action = 'RESUME'
+              AND runtime_snapshot_id IS NOT NULL
+              AND cancellation_id IS NULL
+              AND confirmation_operation_id = control_request_id
+              AND confirmation_user_id = owner_user_id
+            )
+            OR (
+              action = 'CANCEL'
+              AND runtime_snapshot_id IS NULL
+              AND cancellation_id IS NOT NULL
+              AND confirmation_operation_id IS NULL
+              AND confirmation_user_id IS NULL
+            )
+          )
+        )
+      `);
+      await client.query(`
+        CREATE INDEX IF NOT EXISTS runtime_control_requests_claim_lookup
+        ON runtime_control_requests (state, lease_expires_at, created_at)
+      `);
+      await client.query(
+        `INSERT INTO decision_task_schema_migrations (version) VALUES ($1)`,
+        [persistentRuntimeControlRequestMigrationVersion]
+      );
+    }
+    const runtimeCancellationMigration = await client.query<{ applied: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM decision_task_schema_migrations WHERE version = $1
+       ) AS applied`,
+      [persistentRuntimeCancellationMigrationVersion]
+    );
+    if (!runtimeCancellationMigration.rows[0]?.applied) {
+      await client.query(`
+        ALTER TABLE agent_run_operations
+        DROP CONSTRAINT IF EXISTS agent_run_operations_state_check
+      `);
+      await client.query(`
+        ALTER TABLE agent_run_operations
+        ADD CONSTRAINT agent_run_operations_state_check
+        CHECK (
+          state IN (
+            'ACCEPTED', 'RUNNING', 'COMPLETED', 'FAILED_RETRYABLE',
+            'FAILED_FINAL', 'PARTIAL', 'PAUSED_USER', 'PAUSED_PERMISSION',
+            'PAUSED_SOURCE_LOGIN', 'PAUSED_LIMIT', 'CANCELLED'
+          )
+        )
+      `);
+      await client.query(
+        `INSERT INTO decision_task_schema_migrations (version) VALUES ($1)`,
+        [persistentRuntimeCancellationMigrationVersion]
       );
     }
     await client.query("COMMIT");

@@ -6,6 +6,7 @@ import {
 
 import type { DecisionTaskEventNotificationsPort } from "./decision-tasks/event-notifications-port.js";
 import type { DecisionTaskPersistencePort } from "./decision-tasks/persistence-port.js";
+import type { DecisionTaskRuntimeControlPort } from "./decision-tasks/runtime-control-port.js";
 import { registerDecisionTaskRoutes } from "./decision-tasks/routes.js";
 import type { AuditLogPort } from "./security/audit.js";
 import type { IdentityResolver } from "./security/identity.js";
@@ -24,6 +25,7 @@ export type ApiAppOptions = {
   decisionTaskEventNotifications?: DecisionTaskEventNotificationsPort;
   decisionTaskEventPollIntervalMs?: number;
   decisionTaskPersistence?: DecisionTaskPersistencePort;
+  decisionTaskRuntimeControl?: DecisionTaskRuntimeControlPort;
   healthUrls?: Record<DependencyService, string>;
   identityResolver?: IdentityResolver;
   now?: () => Date;
@@ -127,7 +129,8 @@ export function buildApiApp(options: ApiAppOptions = {}) {
     options.decisionTaskEventNotifications,
     options.decisionTaskEventPollIntervalMs ?? 1_000,
     options.identityResolver,
-    options.auditLog
+    options.auditLog,
+    options.decisionTaskRuntimeControl
   );
 
   return app;
