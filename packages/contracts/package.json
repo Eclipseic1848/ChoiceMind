@@ -7,6 +7,10 @@
     "./decision/v1": {
       "types": "./src/decision/v1/index.ts",
       "default": "./dist/decision/v1/index.js"
+    },
+    "./local-services/v1": {
+      "types": "./src/local-services/v1/index.ts",
+      "default": "./dist/local-services/v1/index.js"
     }
   },
   "scripts": {
