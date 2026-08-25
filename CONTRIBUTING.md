@@ -42,6 +42,9 @@ fnm exec --using=22.22.1 -- pnpm.cmd verify
 - PR 应尽量小而完整；不要混入 `.artifacts/`、本地 handoff、真实凭据或与目标无关的用户文件。
 - 如有真实 Provider、外部模型或收费服务调用，必须在执行前说明目标、连接、出站数据和费用边界，并取得明确授权。
 - 对公共合同或安全边界的变更，应提供失败样例和回归证据。
+- 受保护路由必须使用服务端派生的 Principal 和对象所有权检查；不得信任请求正文、查询参数或浏览器自报的 User ID 与角色。
+- 凭据只能通过 CredentialVault 的受控接口保存和使用；访问或变更必须先形成审计事实，Secret 不得进入返回值、异常、RunEvent 或日志。
+- 外部访问必须先经过 RiskPolicy 与 EgressGuard；EgressRecord 只记录必要元数据，不得保存请求正文、响应内容或 Secret。
 
 ## Phase 完成同步门禁
 
