@@ -8,7 +8,8 @@ export default defineConfig({
   webServer: {
     command: "pnpm dev",
     env: {
-      CHOICEMIND_API_URL: "http://127.0.0.1:3199"
+      CHOICEMIND_API_URL: "http://127.0.0.1:3199",
+      CHOICEMIND_API_AUTHORIZATION: "Bearer web-test-token"
     },
     reuseExistingServer: false,
     timeout: 60_000,

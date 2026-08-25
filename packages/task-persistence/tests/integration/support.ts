@@ -18,7 +18,7 @@ export async function resetPersistentDecisionTaskTestData(databaseUrl: string): 
     );
     await client.query("DROP FUNCTION IF EXISTS test_reject_run_event_notification_insert()");
     await client.query(
-      "TRUNCATE decision_task_run_event_notifications, decision_task_run_events, decision_task_agent_runs, outbox_messages, agent_run_operations, decision_task_submissions"
+      "TRUNCATE egress_records, encrypted_credentials, audit_records, decision_task_run_event_notifications, decision_task_run_events, decision_task_agent_runs, outbox_messages, agent_run_operations, decision_task_submissions"
     );
   } finally {
     await client.end();

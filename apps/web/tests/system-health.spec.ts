@@ -7,16 +7,22 @@ let decisionResponseStatus = 200;
 const sseRecoveryRunId = "agent-run-web-sse-recovery";
 const sseRecoveryTaskId = "task-web-sse-recovery";
 let sseRecoveryCursors: Array<string | null> = [];
+let decisionAuthorizationHeaders: Array<string | undefined> = [];
 
 test.describe.configure({ mode: "serial" });
 
 test.beforeEach(() => {
   decisionResponseStatus = 200;
   sseRecoveryCursors = [];
+  decisionAuthorizationHeaders = [];
 });
 
 test.beforeAll(async () => {
   apiServer = createServer((request, response) => {
+    if (request.url?.startsWith("/api/v1/decision-tasks")) {
+      decisionAuthorizationHeaders.push(request.headers.authorization);
+    }
+
     if (request.url === "/api/v1/system/health") {
       response.setHeader("content-type", "application/json; charset=utf-8");
       response.end(
@@ -119,6 +125,13 @@ test("shows a reviewable decision with conditions, risk and synthetic evidence",
   await expect(page.getByText("核验实际到手价", { exact: true })).toBeVisible();
   await expect(page.getByText("合成观测价为 7699 元", { exact: true })).toBeVisible();
   await expect(page.getByText("2026-08-19T12:00:00.000Z").first()).toBeVisible();
+});
+
+test("forwards the server-owned synthetic authorization to the API", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "运行合成决策" }).click();
+
+  await expect.poll(() => decisionAuthorizationHeaders[0]).toBe("Bearer web-test-token");
 });
 
 test("stores the accepted task in the URL and restores persisted events after refresh", async ({

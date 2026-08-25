@@ -32,7 +32,7 @@ describe("PersistentDecisionTaskModule events", () => {
     });
     openModules.push(firstModule);
 
-    const accepted = await firstModule.submit(command);
+    const accepted = await firstModule.submit(command, "test-owner");
     await firstModule.close();
     openModules.splice(openModules.indexOf(firstModule), 1);
 
@@ -41,7 +41,7 @@ describe("PersistentDecisionTaskModule events", () => {
     });
     openModules.push(reopenedModule);
 
-    expect(await reopenedModule.listEvents(accepted.decisionTaskId)).toEqual([
+    expect(await reopenedModule.listEvents(accepted.decisionTaskId, "test-owner")).toEqual([
       {
         contractType: "persisted-run-event",
         contractVersion: "1.0",
@@ -70,12 +70,14 @@ describe("PersistentDecisionTaskModule events", () => {
     openModules.push(taskModule);
 
     const [first, second] = await Promise.all([
-      taskModule.submit(command),
-      taskModule.submit(command)
+      taskModule.submit(command, "test-owner"),
+      taskModule.submit(command, "test-owner")
     ]);
 
     expect(second).toEqual(first);
-    expect(await taskModule.listEvents(command.requirementRevision.decisionTaskId)).toMatchObject([
+    expect(
+      await taskModule.listEvents(command.requirementRevision.decisionTaskId, "test-owner")
+    ).toMatchObject([
       { event: { sequence: 1, taskState: "CREATED" } }
     ]);
   });
@@ -95,7 +97,7 @@ describe("PersistentDecisionTaskModule events", () => {
       streamName
     });
     openModules.push(taskModule, publisher);
-    const accepted = await taskModule.submit(buildCommand(suffix));
+    const accepted = await taskModule.submit(buildCommand(suffix), "test-owner");
     expect(await publisher.runOnce()).toMatchObject({ published: 1 });
     const operationId = await readPublishedOperationId(redisUrl, streamName);
 
@@ -103,7 +105,7 @@ describe("PersistentDecisionTaskModule events", () => {
       status: "CLAIMED"
     });
 
-    expect(await taskModule.listEvents(accepted.decisionTaskId)).toMatchObject([
+    expect(await taskModule.listEvents(accepted.decisionTaskId, "test-owner")).toMatchObject([
       { event: { sequence: 1, taskState: "CREATED" } },
       {
         event: {
@@ -134,7 +136,7 @@ describe("PersistentDecisionTaskModule events", () => {
       streamName
     });
     openModules.push(taskModule, publisher);
-    const accepted = await taskModule.submit(buildCommand(suffix));
+    const accepted = await taskModule.submit(buildCommand(suffix), "test-owner");
     expect(await publisher.runOnce()).toMatchObject({ published: 1 });
     const operationId = await readPublishedOperationId(redisUrl, streamName);
     expect(await taskModule.claimNext(operationId, "worker-events-terminal", 30_000)).toMatchObject(
@@ -142,7 +144,7 @@ describe("PersistentDecisionTaskModule events", () => {
         status: "CLAIMED"
       }
     );
-    const runningEvents = await taskModule.listEvents(accepted.decisionTaskId);
+    const runningEvents = await taskModule.listEvents(accepted.decisionTaskId, "test-owner");
     const runningCursor = runningEvents[1]?.cursor;
 
     expect(runningCursor).toMatch(/^[1-9]\d*$/);
@@ -156,7 +158,9 @@ describe("PersistentDecisionTaskModule events", () => {
       snapshot: { state: "FAILED_FINAL" }
     });
 
-    expect(await taskModule.listEvents(accepted.decisionTaskId, runningCursor)).toMatchObject([
+    expect(
+      await taskModule.listEvents(accepted.decisionTaskId, "test-owner", runningCursor)
+    ).toMatchObject([
       {
         event: {
           decisionTaskId: accepted.decisionTaskId,
@@ -180,7 +184,7 @@ describe("PersistentDecisionTaskModule events", () => {
     const publisher = await openOutboxPublisher({ databaseUrl, redisUrl, streamName });
     openModules.push(taskModule, publisher);
     const command = buildCommand(suffix);
-    await taskModule.submit(command);
+    await taskModule.submit(command, "test-owner");
     await publisher.runOnce();
     const operationId = await readPublishedOperationId(redisUrl, streamName);
     await taskModule.claimNext(operationId, "worker-events-concurrent", 30_000);
@@ -200,7 +204,9 @@ describe("PersistentDecisionTaskModule events", () => {
       "COMMITTED",
       "NOT_COMPLETABLE"
     ]);
-    expect(await taskModule.listEvents(command.requirementRevision.decisionTaskId)).toMatchObject([
+    expect(
+      await taskModule.listEvents(command.requirementRevision.decisionTaskId, "test-owner")
+    ).toMatchObject([
       { event: { sequence: 1, taskState: "CREATED" } },
       { event: { sequence: 2, taskState: "UNDERSTANDING" } },
       { event: { sequence: 3, taskState: "FAILED" } }
@@ -216,7 +222,7 @@ describe("PersistentDecisionTaskModule events", () => {
     const publisher = await openOutboxPublisher({ databaseUrl, redisUrl, streamName });
     openModules.push(taskModule, publisher);
     const command = buildCommand(suffix);
-    await taskModule.submit(command);
+    await taskModule.submit(command, "test-owner");
     await publisher.runOnce();
     const operationId = await readPublishedOperationId(redisUrl, streamName);
     await taskModule.claimNext(operationId, "worker-events-rollback", 30_000);
@@ -228,11 +234,15 @@ describe("PersistentDecisionTaskModule events", () => {
         summary: "该终态必须回滚"
       })
     ).rejects.toMatchObject({ code: "PERSISTENCE_UNAVAILABLE" });
-    expect(await taskModule.get(command.requirementRevision.decisionTaskId)).toMatchObject({
+    expect(
+      await taskModule.get(command.requirementRevision.decisionTaskId, "test-owner")
+    ).toMatchObject({
       state: "RUNNING",
       terminal: false
     });
-    expect(await taskModule.listEvents(command.requirementRevision.decisionTaskId)).toMatchObject([
+    expect(
+      await taskModule.listEvents(command.requirementRevision.decisionTaskId, "test-owner")
+    ).toMatchObject([
       { event: { sequence: 1, taskState: "CREATED" } },
       { event: { sequence: 2, taskState: "UNDERSTANDING" } }
     ]);

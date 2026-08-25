@@ -1,4 +1,5 @@
 import type { AgentRuntimeRunPort } from "./port.js";
+import type { EgressGuard } from "@choicemind/security";
 import { createCoreMindAgentRuntimeAdapter } from "./coremind-agent-runtime-adapter.js";
 import { createFakeAgentRuntimeAdapter } from "./fake-agent-runtime-adapter.js";
 
@@ -6,6 +7,7 @@ type AgentRuntimeFactoryOptions = Readonly<{
   env?: NodeJS.ProcessEnv;
   cwd?: string;
   configDir?: string;
+  egressGuard?: EgressGuard;
 }>;
 
 export function createAgentRuntimeAdapter(
@@ -30,10 +32,14 @@ export function createAgentRuntimeAdapter(
   if (model === undefined || model.trim() === "") {
     throw new Error("CoreMind Runtime 缺少 CHOICEMIND_COREMIND_MODEL");
   }
+  if (options.egressGuard === undefined) {
+    throw new Error("CoreMind Runtime 缺少服务端 EgressGuard");
+  }
 
   return createCoreMindAgentRuntimeAdapter({
     providerBaseUrl,
     model,
+    egressGuard: options.egressGuard,
     ...(options.configDir === undefined ? {} : { configDir: options.configDir }),
     ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
     ...(env.CHOICEMIND_COREMIND_PROVIDER_API_KEY === undefined

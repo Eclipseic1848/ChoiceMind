@@ -10,6 +10,10 @@ $acceptancePassword = [guid]::NewGuid().ToString("N")
 $env:CHOICEMIND_POSTGRES_PASSWORD = $acceptancePassword
 $env:CHOICEMIND_DATABASE_URL =
   "postgresql://choicemind:$acceptancePassword@postgres:5432/choicemind"
+$env:CHOICEMIND_SYNTHETIC_USER_TOKEN = [guid]::NewGuid().ToString("N")
+$env:CHOICEMIND_SYNTHETIC_OTHER_USER_TOKEN = [guid]::NewGuid().ToString("N")
+$apiHeaders = @{ Authorization = "Bearer $env:CHOICEMIND_SYNTHETIC_USER_TOKEN" }
+$otherApiHeaders = @{ Authorization = "Bearer $env:CHOICEMIND_SYNTHETIC_OTHER_USER_TOKEN" }
 $started = $false
 $acceptanceFailed = $false
 $webBaseUrl = "http://127.0.0.1:3000"
@@ -86,6 +90,7 @@ function Submit-Task {
     -UseBasicParsing `
     -Method Post `
     -Uri "$BaseUrl$path" `
+    -Headers $apiHeaders `
     -ContentType "application/json; charset=utf-8" `
     -Body ($body | ConvertTo-Json -Depth 10 -Compress) `
     -TimeoutSec 15
@@ -330,6 +335,25 @@ try {
   $events = @(Read-SseEvents -DecisionTaskId $normal.decisionTaskId)
   Assert-EventHistory -Events $events -DecisionTaskId $normal.decisionTaskId
 
+  $otherTaskRead = Invoke-WebRequest `
+    -UseBasicParsing `
+    -SkipHttpErrorCheck `
+    -Uri "$apiBaseUrl/api/v1/decision-tasks/$($normal.decisionTaskId)" `
+    -Headers $otherApiHeaders `
+    -TimeoutSec 15
+  $otherEventRead = Invoke-WebRequest `
+    -UseBasicParsing `
+    -SkipHttpErrorCheck `
+    -Uri "$apiBaseUrl/api/v1/decision-tasks/$($normal.decisionTaskId)/events" `
+    -Headers $otherApiHeaders `
+    -TimeoutSec 15
+
+  if ($otherTaskRead.StatusCode -ne 404 -or $otherEventRead.StatusCode -ne 404) {
+    throw "第二个测试用户能够读取第一个用户的任务或事件"
+  }
+
+  Write-Output "USER_ISOLATION=PASS:TASK=404:EVENTS=404"
+
   if ($normalResult.runEvents.Count -ne $events.Count) {
     throw "终态结果与持久 SSE 事件数量不一致"
   }
@@ -441,6 +465,7 @@ try {
     -SkipHttpErrorCheck `
     -Method Post `
     -Uri "$apiBaseUrl/api/v1/decision-tasks:execute" `
+    -Headers $apiHeaders `
     -ContentType "application/json; charset=utf-8" `
     -Body ($outageBody | ConvertTo-Json -Depth 10 -Compress) `
     -TimeoutSec 15
@@ -457,6 +482,7 @@ try {
     -UseBasicParsing `
     -SkipHttpErrorCheck `
     -Uri "$apiBaseUrl/api/v1/decision-tasks/$($normal.decisionTaskId)" `
+    -Headers $apiHeaders `
     -TimeoutSec 15
 
   if ($readFailure.StatusCode -ne 503) {
@@ -519,4 +545,6 @@ finally {
 
   $env:CHOICEMIND_POSTGRES_PASSWORD = $null
   $env:CHOICEMIND_DATABASE_URL = $null
+  $env:CHOICEMIND_SYNTHETIC_USER_TOKEN = $null
+  $env:CHOICEMIND_SYNTHETIC_OTHER_USER_TOKEN = $null
 }

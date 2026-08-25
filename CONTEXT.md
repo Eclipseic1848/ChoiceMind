@@ -190,6 +190,28 @@ _Avoid_: 第三方恰好一次保证、普通日志
 Agent Run 可以引用的持久执行位置；它本身不证明运行可以安全恢复。
 _Avoid_: 恢复许可、成功状态
 
+## 身份、安全与外传
+
+**Principal**:
+由 ChoiceMind 服务端根据受信任身份配置解析出的当前行为主体，包含 User 身份和角色；客户端提交的用户 ID 或角色不能成为 Principal。
+_Avoid_: 请求自报身份、客户端角色、共享账号
+
+**Credential Vault**:
+保存并受控使用 Source Credential 或 Provider Credential 的安全边界；凭据状态可以被观察，但明文不能被序列化、记录或作为调用结果逸出。
+_Avoid_: 明文配置、通用键值存储、可打印 Secret
+
+**Risk Policy**:
+在外部访问发生前，对具体 Principal 和操作给出的权威 `ALLOW`、`DENY` 或 `REQUIRE_CONFIRMATION` 判定；调用方不能覆盖其结果。
+_Avoid_: UI 提示、调用方自报许可、事后风险标签
+
+**Egress Record**:
+在一次获准外部访问开始前持久化的最小元数据记录，只描述主体、操作、目标来源、方法、判定和关联标识，不保存请求正文、响应内容或 Secret。
+_Avoid_: HTTP 转储、Provider 响应、包含 Secret 的调试日志
+
+**Audit Record**:
+对受保护对象的一次访问或变更形成的不可变审计事实，至少包含主体、动作、对象、结果和关联标识。
+_Avoid_: 普通应用日志、缺少主体的事件、可覆盖的操作历史
+
 ## 用户控制的数据
 
 **Memory Item**:

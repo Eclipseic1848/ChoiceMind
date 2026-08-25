@@ -13,17 +13,27 @@ import {
 } from "@choicemind/contracts/decision/v1";
 import type { FastifyInstance } from "fastify";
 
+import type { AuditLogPort, AuditRecord } from "../security/audit.js";
 import type { DecisionTaskEventNotificationsPort } from "./event-notifications-port.js";
 import type { DecisionTaskPersistencePort } from "./persistence-port.js";
+import type { IdentityResolver } from "../security/identity.js";
 
 export function registerDecisionTaskRoutes(
   app: FastifyInstance,
   persistence: DecisionTaskPersistencePort | undefined,
   now: () => Date,
   eventNotifications: DecisionTaskEventNotificationsPort | undefined,
-  eventPollIntervalMs: number
+  eventPollIntervalMs: number,
+  identityResolver: IdentityResolver | undefined,
+  auditLog: AuditLogPort | undefined
 ) {
   app.post("/api/v1/decision-tasks:execute", async (request, reply) => {
+    const principal = await identityResolver?.resolve(request.headers.authorization);
+
+    if (principal === undefined) {
+      return sendAuthenticationRequired(reply, now);
+    }
+
     const decoded = decodeExecuteDecisionTaskCommandV1(request.body);
 
     if (!decoded.ok) {
@@ -50,7 +60,9 @@ export function registerDecisionTaskRoutes(
     let decodedSnapshot: ReturnType<typeof decodeDecisionTaskSnapshotV1>;
 
     try {
-      decodedSnapshot = decodeDecisionTaskSnapshotV1(await persistence.submit(decoded.value));
+      decodedSnapshot = decodeDecisionTaskSnapshotV1(
+        await persistence.submit(decoded.value, principal.userId)
+      );
     } catch (error) {
       if (hasErrorCode(error, "IDEMPOTENCY_CONFLICT")) {
         return reply.code(409).send(
@@ -87,6 +99,13 @@ export function registerDecisionTaskRoutes(
       return reply.code(getDecisionTaskResultHttpStatusV1(result)).send(result);
     }
 
+    await appendDecisionTaskAudit(auditLog, {
+      actor: principal,
+      action: "DECISION_TASK_SUBMIT",
+      decisionTaskId: decodedSnapshot.value.decisionTaskId,
+      result: "ALLOWED",
+      correlationId: getCorrelationId(request.headers["x-correlation-id"], request.id)
+    });
     return reply.code(202).send(decodedSnapshot.value);
   });
 
@@ -104,10 +123,23 @@ export function registerDecisionTaskRoutes(
           );
       }
 
+      const principal = await identityResolver?.resolve(request.headers.authorization);
+
+      if (principal === undefined) {
+        return sendAuthenticationRequired(reply, now);
+      }
+
       try {
-        const persistedTask = await persistence.get(request.params.decisionTaskId);
+        const persistedTask = await persistence.get(request.params.decisionTaskId, principal.userId);
 
         if (persistedTask === undefined) {
+          await appendDecisionTaskAudit(auditLog, {
+            actor: principal,
+            action: "DECISION_TASK_READ",
+            decisionTaskId: request.params.decisionTaskId,
+            result: "NOT_FOUND",
+            correlationId: getCorrelationId(request.headers["x-correlation-id"], request.id)
+          });
           return reply.code(404).send(
             createDecisionTaskNotFoundResultV1({
               errorId: "error-decision-task-not-found",
@@ -133,6 +165,13 @@ export function registerDecisionTaskRoutes(
             );
           }
 
+          await appendDecisionTaskAudit(auditLog, {
+            actor: principal,
+            action: "DECISION_TASK_READ",
+            decisionTaskId: request.params.decisionTaskId,
+            result: "ALLOWED",
+            correlationId: getCorrelationId(request.headers["x-correlation-id"], request.id)
+          });
           return reply.code(200).send(decodedResult.value);
         }
 
@@ -152,6 +191,13 @@ export function registerDecisionTaskRoutes(
             );
         }
 
+        await appendDecisionTaskAudit(auditLog, {
+          actor: principal,
+          action: "DECISION_TASK_READ",
+          decisionTaskId: request.params.decisionTaskId,
+          result: "ALLOWED",
+          correlationId: getCorrelationId(request.headers["x-correlation-id"], request.id)
+        });
         return reply.code(200).send(decodedSnapshot.value);
       } catch (error) {
         if (hasErrorCode(error, "PERSISTENCE_UNAVAILABLE")) {
@@ -189,6 +235,11 @@ export function registerDecisionTaskRoutes(
 
       const decisionTaskId = request.params.decisionTaskId;
       const lastEventId = request.headers["last-event-id"];
+      const principal = await identityResolver?.resolve(request.headers.authorization);
+
+      if (principal === undefined) {
+        return sendAuthenticationRequired(reply, now);
+      }
 
       if (!isValidLastEventId(lastEventId)) {
         const result = createContractRejectedDecisionTaskResultV1({
@@ -207,9 +258,16 @@ export function registerDecisionTaskRoutes(
       }
 
       try {
-        const task = await persistence.get(decisionTaskId);
+        const task = await persistence.get(decisionTaskId, principal.userId);
 
         if (task === undefined) {
+          await appendDecisionTaskAudit(auditLog, {
+            actor: principal,
+            action: "DECISION_TASK_EVENTS_READ",
+            decisionTaskId,
+            result: "NOT_FOUND",
+            correlationId: getCorrelationId(request.headers["x-correlation-id"], request.id)
+          });
           return reply.code(404).send(
             createDecisionTaskNotFoundResultV1({
               errorId: "error-decision-task-not-found",
@@ -219,7 +277,14 @@ export function registerDecisionTaskRoutes(
         }
 
         let cursor = typeof lastEventId === "string" ? lastEventId : undefined;
-        const initialEvents = await persistence.listEvents(decisionTaskId, cursor);
+        const initialEvents = await persistence.listEvents(decisionTaskId, principal.userId, cursor);
+        await appendDecisionTaskAudit(auditLog, {
+          actor: principal,
+          action: "DECISION_TASK_EVENTS_READ",
+          decisionTaskId,
+          result: "ALLOWED",
+          correlationId: getCorrelationId(request.headers["x-correlation-id"], request.id)
+        });
         let closed = false;
         reply.hijack();
         reply.raw.writeHead(200, {
@@ -248,7 +313,7 @@ export function registerDecisionTaskRoutes(
             break;
           }
 
-          const events = await persistence.listEvents(decisionTaskId, cursor);
+          const events = await persistence.listEvents(decisionTaskId, principal.userId, cursor);
 
           if (events.length === 0) {
             reply.raw.write(": heartbeat\n\n");
@@ -375,4 +440,42 @@ function hasErrorCode(error: unknown, code: string): boolean {
     "code" in error &&
     error.code === code
   );
+}
+
+function getCorrelationId(value: string | string[] | undefined, fallback: string): string {
+  return typeof value === "string" && value.length > 0 ? value : fallback;
+}
+
+async function appendDecisionTaskAudit(
+  auditLog: AuditLogPort | undefined,
+  input: Readonly<{
+    actor: AuditRecord["actor"];
+    action: AuditRecord["action"];
+    decisionTaskId: string;
+    result: AuditRecord["result"];
+    correlationId: string;
+  }>
+): Promise<void> {
+  await auditLog?.append({
+    actor: input.actor,
+    action: input.action,
+    object: { id: input.decisionTaskId, type: "DECISION_TASK" },
+    result: input.result,
+    correlationId: input.correlationId
+  });
+}
+
+function sendAuthenticationRequired(
+  reply: import("fastify").FastifyReply,
+  now: () => Date
+) {
+  return reply.code(401).send({
+    ok: false,
+    error: {
+      code: "AUTHENTICATION_REQUIRED",
+      category: "AUTHORIZATION",
+      retryMode: "NONE",
+      occurredAt: now().toISOString()
+    }
+  });
 }

@@ -46,7 +46,7 @@ describe("PersistentDecisionTaskModule execution", () => {
     });
     const publisher = await openOutboxPublisher({ databaseUrl, redisUrl, streamName });
     openModules.push(taskModule, publisher);
-    const accepted = await taskModule.submit(command);
+    const accepted = await taskModule.submit(command, "test-owner");
     expect(await publisher.runOnce()).toMatchObject({ published: 1 });
     const operationId = await readPublishedOperationId(redisUrl, streamName);
 
@@ -80,7 +80,7 @@ describe("PersistentDecisionTaskModule execution", () => {
     });
     const publisher = await openOutboxPublisher({ databaseUrl, redisUrl, streamName });
     openModules.push(taskModule, publisher);
-    const accepted = await taskModule.submit(command);
+    const accepted = await taskModule.submit(command, "test-owner");
     expect(await publisher.runOnce()).toMatchObject({ published: 1 });
     const operationId = await readPublishedOperationId(redisUrl, streamName);
     const firstWorkerId = `worker-retryable-a-${suffix}`;
@@ -100,7 +100,7 @@ describe("PersistentDecisionTaskModule execution", () => {
         terminal: false
       }
     });
-    expect(await taskModule.get(command.requirementRevision.decisionTaskId)).toEqual({
+    expect(await taskModule.get(command.requirementRevision.decisionTaskId, "test-owner")).toEqual({
       ...accepted,
       state: "FAILED_RETRYABLE",
       terminal: false,
@@ -123,7 +123,7 @@ describe("PersistentDecisionTaskModule execution", () => {
     });
     const publisher = await openOutboxPublisher({ databaseUrl, redisUrl, streamName });
     openModules.push(taskModule, publisher);
-    const accepted = await taskModule.submit(command);
+    const accepted = await taskModule.submit(command, "test-owner");
     expect(await publisher.runOnce()).toMatchObject({ published: 1 });
     const operationId = await readPublishedOperationId(redisUrl, streamName);
     const workerId = `worker-final-${suffix}`;
@@ -143,7 +143,7 @@ describe("PersistentDecisionTaskModule execution", () => {
         terminal: true
       }
     });
-    expect(await taskModule.get(command.requirementRevision.decisionTaskId)).toEqual({
+    expect(await taskModule.get(command.requirementRevision.decisionTaskId, "test-owner")).toEqual({
       ...accepted,
       state: "FAILED_FINAL",
       terminal: true,
@@ -166,7 +166,7 @@ describe("PersistentDecisionTaskModule execution", () => {
     });
     const publisher = await openOutboxPublisher({ databaseUrl, redisUrl, streamName });
     openModules.push(taskModule, publisher);
-    const accepted = await taskModule.submit(command);
+    const accepted = await taskModule.submit(command, "test-owner");
     expect(await publisher.runOnce()).toMatchObject({ published: 1 });
     const operationId = await readPublishedOperationId(redisUrl, streamName);
     const workerId = `worker-partial-${suffix}`;
@@ -186,7 +186,7 @@ describe("PersistentDecisionTaskModule execution", () => {
         terminal: false
       }
     });
-    expect(await taskModule.get(command.requirementRevision.decisionTaskId)).toEqual({
+    expect(await taskModule.get(command.requirementRevision.decisionTaskId, "test-owner")).toEqual({
       ...accepted,
       state: "PARTIAL",
       terminal: false,

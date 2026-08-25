@@ -7,6 +7,8 @@ import {
   getDecisionTaskResultHttpStatusV1
 } from "@choicemind/contracts/decision/v1";
 
+import { addChoiceMindApiAuthorization } from "../../../../server-api-authorization";
+
 export async function POST(request: Request) {
   let requestBody: unknown;
 
@@ -42,7 +44,9 @@ export async function POST(request: Request) {
   try {
     const response = await fetch(`${apiUrl}/api/v1/decision-tasks:execute`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: addChoiceMindApiAuthorization(
+        new Headers({ "content-type": "application/json" })
+      ),
       body: JSON.stringify(decodedCommand.value),
       cache: "no-store",
       signal: AbortSignal.timeout(15_000)

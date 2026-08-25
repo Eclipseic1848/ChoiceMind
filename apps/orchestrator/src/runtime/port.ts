@@ -33,9 +33,20 @@ export type AgentRuntimePersistentRunResultV1 =
   | AgentRuntimeRunOutputV1
   | AgentRuntimeNonSuccessfulOutcomeV1;
 
+export type AgentRuntimeSecurityContext = Readonly<{
+  userId: string;
+  operationId: string;
+  correlationId: string;
+  egressConfirmation: Readonly<{ operationId: string; userId: string }>;
+}>;
+
 export interface AgentRuntimeRunPort {
-  run(command: AgentRuntimeRunCommandV1): Promise<AgentRuntimeRunOutputV1>;
+  run(
+    command: AgentRuntimeRunCommandV1,
+    securityContext?: AgentRuntimeSecurityContext
+  ): Promise<AgentRuntimeRunOutputV1>;
   runPersistent?(
-    command: AgentRuntimeRunCommandV1
+    command: AgentRuntimeRunCommandV1,
+    securityContext?: AgentRuntimeSecurityContext
   ): Promise<AgentRuntimePersistentRunResultV1>;
 }

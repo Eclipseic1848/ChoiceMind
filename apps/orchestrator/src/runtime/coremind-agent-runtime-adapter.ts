@@ -5,6 +5,7 @@ import {
   type CoreMindConfig,
   type CoreMindToolDefinition
 } from "coremind-ai";
+import type { EgressGuard } from "@choicemind/security";
 import type {
   CandidateV1,
   ClaimEvidenceLinkV1,
@@ -26,6 +27,7 @@ type CoreMindAgentRuntimeAdapterOptions = Readonly<{
   configDir?: string;
   cwd?: string;
   apiKey?: string;
+  egressGuard: EgressGuard;
   runTimeoutMs?: number;
   now?: () => string;
 }>;
@@ -51,26 +53,44 @@ export function createCoreMindAgentRuntimeAdapter(
   validateProviderOptions(options);
 
   return {
-    async run(command) {
+    async run(command, securityContext) {
+      if (securityContext === undefined) {
+        throw new Error("CoreMind Provider 外传缺少服务端安全上下文");
+      }
       const now = options.now ?? (() => new Date().toISOString());
       const createdAt = now();
       const capture: DraftCapture = { calls: 0 };
       const config = buildCoreMindConfig(options);
       const tool = createDecisionDraftTool(capture);
-      const runtime = await CoreMindRuntime.create({
-        config,
-        configDir: options.configDir ?? options.cwd ?? process.cwd(),
-        cwd: options.cwd ?? process.cwd(),
-        initialPrompt: JSON.stringify(command),
-        toolDefinitions: [tool],
-        maxSteps: 2,
-        stepTimeoutMs: options.runTimeoutMs ?? 10_000,
-        env: {
-          [CORE_MIND_PROVIDER_API_KEY_ENV]:
-            options.apiKey ?? process.env[CORE_MIND_PROVIDER_API_KEY_ENV] ?? "offline"
+      const egress = await options.egressGuard.execute({
+        userId: securityContext.userId,
+        operationId: securityContext.operationId,
+        operation: "INVOKE_PROVIDER",
+        confirmation: securityContext.egressConfirmation,
+        correlationId: securityContext.correlationId,
+        destinationUrl: options.providerBaseUrl,
+        method: "POST",
+        perform: async () => {
+          const runtime = await CoreMindRuntime.create({
+            config,
+            configDir: options.configDir ?? options.cwd ?? process.cwd(),
+            cwd: options.cwd ?? process.cwd(),
+            initialPrompt: JSON.stringify(command),
+            toolDefinitions: [tool],
+            maxSteps: 2,
+            stepTimeoutMs: options.runTimeoutMs ?? 10_000,
+            env: {
+              [CORE_MIND_PROVIDER_API_KEY_ENV]:
+                options.apiKey ?? process.env[CORE_MIND_PROVIDER_API_KEY_ENV] ?? "offline"
+            }
+          });
+          return runtime.run();
         }
       });
-      const result = await runtime.run();
+      if (egress.status !== "COMPLETED") {
+        throw new Error(`CoreMind Provider 外传策略未允许：${egress.status}`);
+      }
+      const result = egress.value;
 
       if (result.outcome.status !== "succeeded" || capture.calls !== 1 || capture.draft === undefined) {
         throw new Error("CoreMind 未完成一次有效的 Decision 草稿 Tool 提交");
@@ -78,8 +98,8 @@ export function createCoreMindAgentRuntimeAdapter(
 
       return buildRuntimeOutput(command, capture.draft, createdAt, now());
     },
-    async runPersistent(command) {
-      return this.run(command);
+    async runPersistent(command, securityContext) {
+      return this.run(command, securityContext);
     }
   };
 }

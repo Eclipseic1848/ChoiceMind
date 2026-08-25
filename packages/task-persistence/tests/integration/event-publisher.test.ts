@@ -47,8 +47,8 @@ describe("RunEventNotificationPublisher", () => {
     await subscriber.subscribe(channelName, (message) => resolveNotification?.(message));
 
     try {
-      const accepted = await taskModule.submit(buildCommand(randomUUID()));
-      const persisted = await taskModule.listEvents(accepted.decisionTaskId);
+      const accepted = await taskModule.submit(buildCommand(randomUUID()), "test-owner");
+      const persisted = await taskModule.listEvents(accepted.decisionTaskId, "test-owner");
 
       expect(await publisher.runOnce()).toEqual({
         attempted: 1,
@@ -87,7 +87,7 @@ describe("RunEventNotificationPublisher", () => {
       AbortSignal.timeout(2_000)
     );
 
-    await taskModule.submit(command);
+    await taskModule.submit(command, "test-owner");
     expect(await publisher.runOnce()).toMatchObject({ published: 1 });
 
     await expect(waiting).resolves.toBeUndefined();

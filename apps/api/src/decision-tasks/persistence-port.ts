@@ -11,9 +11,14 @@ type PersistedDecisionTaskResultV1 = Extract<
 >;
 
 export interface DecisionTaskPersistencePort {
-  submit(command: ExecuteDecisionTaskCommandV1): Promise<DecisionTaskSnapshotV1>;
+  submit(command: ExecuteDecisionTaskCommandV1, ownerUserId: string): Promise<DecisionTaskSnapshotV1>;
   get(
-    decisionTaskId: string
+    decisionTaskId: string,
+    ownerUserId: string
   ): Promise<DecisionTaskSnapshotV1 | PersistedDecisionTaskResultV1 | undefined>;
-  listEvents(decisionTaskId: string, afterCursor?: string): Promise<readonly PersistedRunEventV1[]>;
+  listEvents(
+    decisionTaskId: string,
+    ownerUserId: string,
+    afterCursor?: string
+  ): Promise<readonly PersistedRunEventV1[]>;
 }
