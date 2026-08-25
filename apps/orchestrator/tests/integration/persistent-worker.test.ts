@@ -40,7 +40,7 @@ describe("Persistent Decision Task Worker", () => {
     const taskModule = await openPersistentDecisionTaskModule({ databaseUrl });
     const publisher = await openOutboxPublisher({ databaseUrl, redisUrl, streamName });
     openModules.push(taskModule, publisher);
-    const accepted = await taskModule.submit(command);
+    const accepted = await taskModule.submit(command, "test-owner");
     expect(await publisher.runOnce()).toMatchObject({ published: 1 });
     await duplicatePublishedMessage(redisUrl, streamName);
     const sourceRuntime = createFakeAgentRuntimeAdapter();
@@ -99,7 +99,10 @@ describe("Persistent Decision Task Worker", () => {
     expect(batches.reduce((sum, batch) => sum + batch.executed, 0)).toBe(1);
     expect(batches.reduce((sum, batch) => sum + batch.acknowledged, 0)).toBe(1);
     expect(runtimeCalls).toBe(1);
-    const persistedTask = await taskModule.get(command.requirementRevision.decisionTaskId);
+    const persistedTask = await taskModule.get(
+      command.requirementRevision.decisionTaskId,
+      "test-owner"
+    );
     expect(persistedTask).toMatchObject({
       contractType: "decision-task-result",
       contractVersion: "1.0",
@@ -112,7 +115,8 @@ describe("Persistent Decision Task Worker", () => {
       }
     });
     const persistedEvents = await taskModule.listEvents(
-      command.requirementRevision.decisionTaskId
+      command.requirementRevision.decisionTaskId,
+      "test-owner"
     );
     expect(persistedEvents).toHaveLength(9);
     expect(persistedEvents.slice(0, 2)).toMatchObject([
@@ -160,7 +164,7 @@ describe("Persistent Decision Task Worker", () => {
     const taskModule = await openPersistentDecisionTaskModule({ databaseUrl });
     const publisher = await openOutboxPublisher({ databaseUrl, redisUrl, streamName });
     openModules.push(taskModule, publisher);
-    await taskModule.submit(command);
+    await taskModule.submit(command, "test-owner");
     expect(await publisher.runOnce()).toMatchObject({ published: 1 });
     const operationId = await abandonPublishedMessage(
       redisUrl,
@@ -200,7 +204,9 @@ describe("Persistent Decision Task Worker", () => {
       received: 1
     });
     expect(runtimeCalls).toBe(1);
-    expect(await taskModule.get(command.requirementRevision.decisionTaskId)).toMatchObject({
+    expect(
+      await taskModule.get(command.requirementRevision.decisionTaskId, "test-owner")
+    ).toMatchObject({
       ok: true,
       taskStatus: { state: "COMPLETED", terminal: true }
     });
@@ -216,7 +222,7 @@ describe("Persistent Decision Task Worker", () => {
     const taskModule = await openPersistentDecisionTaskModule({ databaseUrl });
     const publisher = await openOutboxPublisher({ databaseUrl, redisUrl, streamName });
     openModules.push(taskModule, publisher);
-    await taskModule.submit(command);
+    await taskModule.submit(command, "test-owner");
     expect(await publisher.runOnce()).toMatchObject({ published: 1 });
     const operationId = await abandonPublishedMessage(
       redisUrl,
@@ -268,7 +274,7 @@ describe("Persistent Decision Task Worker", () => {
     const taskModule = await openPersistentDecisionTaskModule({ databaseUrl });
     const publisher = await openOutboxPublisher({ databaseUrl, redisUrl, streamName });
     openModules.push(taskModule, publisher);
-    await taskModule.submit(command);
+    await taskModule.submit(command, "test-owner");
     expect(await publisher.runOnce()).toMatchObject({ published: 1 });
     let executions = 0;
     const firstWorker = await openPersistentDecisionTaskWorker({
@@ -308,7 +314,9 @@ describe("Persistent Decision Task Worker", () => {
       executed: 1,
       received: 1
     });
-    expect(await taskModule.get(command.requirementRevision.decisionTaskId)).toMatchObject({
+    expect(
+      await taskModule.get(command.requirementRevision.decisionTaskId, "test-owner")
+    ).toMatchObject({
       state: "FAILED_RETRYABLE",
       terminal: false
     });
@@ -318,7 +326,9 @@ describe("Persistent Decision Task Worker", () => {
       received: 1
     });
     expect(executions).toBe(2);
-    expect(await taskModule.get(command.requirementRevision.decisionTaskId)).toMatchObject({
+    expect(
+      await taskModule.get(command.requirementRevision.decisionTaskId, "test-owner")
+    ).toMatchObject({
       state: "FAILED_FINAL",
       terminal: true
     });
@@ -334,7 +344,7 @@ describe("Persistent Decision Task Worker", () => {
     const taskModule = await openPersistentDecisionTaskModule({ databaseUrl });
     const publisher = await openOutboxPublisher({ databaseUrl, redisUrl, streamName });
     openModules.push(taskModule, publisher);
-    const accepted = await taskModule.submit(command);
+    const accepted = await taskModule.submit(command, "test-owner");
     expect(await publisher.runOnce()).toMatchObject({ published: 1 });
     const firstWorker = await openPersistentDecisionTaskWorker({
       databaseUrl,
@@ -370,7 +380,9 @@ describe("Persistent Decision Task Worker", () => {
       executed: 1,
       received: 1
     });
-    expect(await taskModule.get(command.requirementRevision.decisionTaskId)).toMatchObject({
+    expect(
+      await taskModule.get(command.requirementRevision.decisionTaskId, "test-owner")
+    ).toMatchObject({
       agentRunId: accepted.agentRunId,
       state: "FAILED_RETRYABLE",
       terminal: false
@@ -381,7 +393,10 @@ describe("Persistent Decision Task Worker", () => {
       received: 1
     });
 
-    const persistedTask = await taskModule.get(command.requirementRevision.decisionTaskId);
+    const persistedTask = await taskModule.get(
+      command.requirementRevision.decisionTaskId,
+      "test-owner"
+    );
     expect(persistedTask).toMatchObject({
       contractType: "decision-task-result",
       ok: true,
@@ -391,7 +406,8 @@ describe("Persistent Decision Task Worker", () => {
       }
     });
     const persistedEvents = await taskModule.listEvents(
-      command.requirementRevision.decisionTaskId
+      command.requirementRevision.decisionTaskId,
+      "test-owner"
     );
     const retryAgentRunId = persistedEvents[3]?.event.agentRunId;
 
@@ -442,7 +458,7 @@ describe("Persistent Decision Task Worker", () => {
     const taskModule = await openPersistentDecisionTaskModule({ databaseUrl });
     const publisher = await openOutboxPublisher({ databaseUrl, redisUrl, streamName });
     openModules.push(taskModule, publisher);
-    await taskModule.submit(command);
+    await taskModule.submit(command, "test-owner");
     expect(await publisher.runOnce()).toMatchObject({ published: 1 });
     const worker = await openPersistentDecisionTaskWorker({
       databaseUrl,
@@ -466,7 +482,9 @@ describe("Persistent Decision Task Worker", () => {
       executed: 1,
       received: 1
     });
-    expect(await taskModule.get(command.requirementRevision.decisionTaskId)).toMatchObject({
+    expect(
+      await taskModule.get(command.requirementRevision.decisionTaskId, "test-owner")
+    ).toMatchObject({
       contractType: "decision-task-snapshot",
       state: "PARTIAL",
       terminal: false

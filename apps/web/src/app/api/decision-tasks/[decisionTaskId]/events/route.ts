@@ -1,3 +1,5 @@
+import { addChoiceMindApiAuthorization } from "../../../../../server-api-authorization";
+
 type RouteContext = Readonly<{
   params: Promise<Readonly<{ decisionTaskId: string }>>;
 }>;
@@ -8,6 +10,7 @@ export async function GET(request: Request, context: RouteContext) {
   const lastEventId =
     request.headers.get("last-event-id") ?? new URL(request.url).searchParams.get("after");
   const headers = new Headers({ Accept: "text/event-stream" });
+  addChoiceMindApiAuthorization(headers);
 
   if (lastEventId !== null) {
     headers.set("Last-Event-ID", lastEventId);

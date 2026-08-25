@@ -31,6 +31,16 @@ describe("Agent Runtime factory", () => {
         }
       })
     ).toThrow("CHOICEMIND_COREMIND_MODEL");
+
+    expect(() =>
+      createAgentRuntimeAdapter({
+        env: {
+          CHOICEMIND_RUNTIME: "coremind",
+          CHOICEMIND_COREMIND_PROVIDER_BASE_URL: "http://127.0.0.1:1234/v1",
+          CHOICEMIND_COREMIND_MODEL: "offline-model"
+        }
+      })
+    ).toThrow("EgressGuard");
   });
 
   it("fails closed for an unknown runtime instead of silently selecting Fake", () => {

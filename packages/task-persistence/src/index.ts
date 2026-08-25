@@ -11,6 +11,7 @@ import {
   type PersistedRunEventV1,
   type RunEventV1
 } from "@choicemind/contracts/decision/v1";
+import type { EgressRecord, EncryptedCredentialRecord } from "@choicemind/security";
 import { createClient } from "@redis/client";
 import { Pool, type PoolClient } from "pg";
 
@@ -50,11 +51,25 @@ export class PersistenceUnavailableError extends Error {
 }
 
 export type PersistentDecisionTaskModule = Readonly<{
-  submit(command: ExecuteDecisionTaskCommandV1): Promise<DecisionTaskSnapshotV1>;
+  submit(command: ExecuteDecisionTaskCommandV1, ownerUserId: string): Promise<DecisionTaskSnapshotV1>;
   get(
-    decisionTaskId: string
+    decisionTaskId: string,
+    ownerUserId: string
   ): Promise<DecisionTaskSnapshotV1 | PersistedDecisionTaskResultV1 | undefined>;
-  listEvents(decisionTaskId: string, afterCursor?: string): Promise<readonly PersistedRunEventV1[]>;
+  listEvents(
+    decisionTaskId: string,
+    ownerUserId: string,
+    afterCursor?: string
+  ): Promise<readonly PersistedRunEventV1[]>;
+  appendAuditRecord(record: PersistentAuditRecordInput): Promise<void>;
+  listAuditRecords(correlationId: string): Promise<readonly PersistentAuditRecord[]>;
+  saveEncryptedCredential(record: EncryptedCredentialRecord): Promise<void>;
+  loadEncryptedCredential(
+    credentialId: string,
+    ownerUserId: string
+  ): Promise<EncryptedCredentialRecord | undefined>;
+  appendEgressRecord(record: EgressRecord): Promise<void>;
+  listEgressRecords(correlationId: string): Promise<readonly EgressRecord[]>;
   claimNext(
     operationId: string,
     workerId: string,
@@ -67,6 +82,21 @@ export type PersistentDecisionTaskModule = Readonly<{
   ): Promise<DecisionTaskCompletionResult>;
   close(): Promise<void>;
 }>;
+
+export type PersistentAuditRecordInput = Readonly<{
+  actor: Readonly<{
+    principalId: string;
+    role: "USER" | "ADMIN" | "SUPERADMIN";
+    userId: string;
+  }>;
+  action: string;
+  object: Readonly<{ id: string; type: string }>;
+  result: string;
+  correlationId: string;
+}>;
+
+export type PersistentAuditRecord = PersistentAuditRecordInput &
+  Readonly<{ occurredAt: string }>;
 
 export type PersistedDecisionTaskResultV1 = Extract<
   DecisionTaskResultV1,
@@ -147,6 +177,7 @@ type TaskRow = Readonly<{
 type ExistingSubmissionRow = TaskRow &
   Readonly<{
     command_fingerprint: string;
+    owner_user_id: string;
   }>;
 
 type ClaimedOperationRow = Readonly<{
@@ -161,6 +192,43 @@ type ClaimedOperationRow = Readonly<{
 type RunEventRow = Readonly<{
   cursor: string;
   event_payload: unknown;
+}>;
+
+type AuditRecordRow = Readonly<{
+  actor_principal_id: string;
+  actor_user_id: string;
+  actor_role: "USER" | "ADMIN" | "SUPERADMIN";
+  action: string;
+  object_type: string;
+  object_id: string;
+  result: string;
+  correlation_id: string;
+  occurred_at: Date;
+}>;
+
+type EncryptedCredentialRow = Readonly<{
+  owner_user_id: string;
+  credential_id: string;
+  secret_type: EncryptedCredentialRecord["secretType"];
+  encryption_version: EncryptedCredentialRecord["encryptionVersion"];
+  ciphertext: string;
+  ciphertext_iv: string;
+  ciphertext_tag: string;
+  wrapped_data_key: string;
+  wrapped_data_key_iv: string;
+  wrapped_data_key_tag: string;
+}>;
+
+type EgressRecordRow = Readonly<{
+  egress_id: string;
+  user_id: string;
+  operation_id: string;
+  correlation_id: string;
+  destination_origin: string;
+  method: string;
+  policy_version: "p0-v1";
+  state: "STARTED";
+  occurred_at: Date;
 }>;
 
 export async function openPersistentDecisionTaskModule(
@@ -188,13 +256,13 @@ export async function openPersistentDecisionTaskModule(
   let closed = false;
 
   return {
-    async submit(command) {
+    async submit(command, ownerUserId) {
       assertOpen(closed);
       let client: PoolClient | undefined;
 
       try {
         client = await pool.connect();
-        return await submitInTransaction(client, command, now());
+        return await submitInTransaction(client, command, ownerUserId, now());
       } catch (error) {
         if (
           error instanceof IdempotencyConflictError ||
@@ -208,7 +276,7 @@ export async function openPersistentDecisionTaskModule(
         client?.release();
       }
     },
-    async get(decisionTaskId) {
+    async get(decisionTaskId, ownerUserId) {
       assertOpen(closed);
       try {
         const result = await pool.query<TaskRow>(
@@ -223,9 +291,10 @@ export async function openPersistentDecisionTaskModule(
            INNER JOIN decision_task_submissions AS submission
              ON submission.execution_request_id = operation.execution_request_id
            WHERE operation.decision_task_id = $1
+             AND submission.owner_user_id = $2
            ORDER BY operation.created_at DESC
            LIMIT 1`,
-          [decisionTaskId]
+          [decisionTaskId, ownerUserId]
         );
         const row = result.rows[0];
 
@@ -246,17 +315,24 @@ export async function openPersistentDecisionTaskModule(
         throw new PersistenceUnavailableError();
       }
     },
-    async listEvents(decisionTaskId, afterCursor) {
+    async listEvents(decisionTaskId, ownerUserId, afterCursor) {
       assertOpen(closed);
 
       try {
         const result = await pool.query<RunEventRow>(
           `SELECT cursor::text, event_payload
-           FROM decision_task_run_events
-           WHERE decision_task_id = $1
-             AND ($2::bigint IS NULL OR cursor > $2::bigint)
-           ORDER BY cursor ASC`,
-          [decisionTaskId, afterCursor ?? null]
+           FROM decision_task_run_events AS event
+           INNER JOIN decision_task_agent_runs AS agent_run
+             ON agent_run.agent_run_id = event.agent_run_id
+           INNER JOIN agent_run_operations AS operation
+             ON operation.operation_id = agent_run.operation_id
+           INNER JOIN decision_task_submissions AS submission
+             ON submission.execution_request_id = operation.execution_request_id
+           WHERE event.decision_task_id = $1
+             AND submission.owner_user_id = $2
+             AND ($3::bigint IS NULL OR event.cursor > $3::bigint)
+           ORDER BY event.cursor ASC`,
+          [decisionTaskId, ownerUserId, afterCursor ?? null]
         );
 
         return result.rows.map((row) => {
@@ -278,6 +354,185 @@ export async function openPersistentDecisionTaskModule(
           throw error;
         }
 
+        throw new PersistenceUnavailableError();
+      }
+    },
+    async appendAuditRecord(record) {
+      assertOpen(closed);
+
+      try {
+        await pool.query(
+          `INSERT INTO audit_records (
+             audit_record_id, actor_principal_id, actor_user_id, actor_role,
+             action, object_type, object_id, result, correlation_id, occurred_at
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+          [
+            randomUUID(),
+            record.actor.principalId,
+            record.actor.userId,
+            record.actor.role,
+            record.action,
+            record.object.type,
+            record.object.id,
+            record.result,
+            record.correlationId,
+            now()
+          ]
+        );
+      } catch {
+        throw new PersistenceUnavailableError();
+      }
+    },
+    async listAuditRecords(correlationId) {
+      assertOpen(closed);
+
+      try {
+        const result = await pool.query<AuditRecordRow>(
+          `SELECT actor_principal_id, actor_user_id, actor_role, action,
+                  object_type, object_id, result, correlation_id, occurred_at
+           FROM audit_records
+           WHERE correlation_id = $1
+           ORDER BY occurred_at, audit_record_id`,
+          [correlationId]
+        );
+
+        return result.rows.map((row) => ({
+          actor: {
+            principalId: row.actor_principal_id,
+            role: row.actor_role,
+            userId: row.actor_user_id
+          },
+          action: row.action,
+          object: { id: row.object_id, type: row.object_type },
+          result: row.result,
+          correlationId: row.correlation_id,
+          occurredAt: row.occurred_at.toISOString()
+        }));
+      } catch {
+        throw new PersistenceUnavailableError();
+      }
+    },
+    async saveEncryptedCredential(record) {
+      assertOpen(closed);
+
+      try {
+        await pool.query(
+          `INSERT INTO encrypted_credentials (
+             owner_user_id, credential_id, secret_type, encryption_version,
+             ciphertext, ciphertext_iv, ciphertext_tag,
+             wrapped_data_key, wrapped_data_key_iv, wrapped_data_key_tag,
+             created_at, updated_at
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11)
+           ON CONFLICT (owner_user_id, credential_id) DO UPDATE SET
+             secret_type = EXCLUDED.secret_type,
+             encryption_version = EXCLUDED.encryption_version,
+             ciphertext = EXCLUDED.ciphertext,
+             ciphertext_iv = EXCLUDED.ciphertext_iv,
+             ciphertext_tag = EXCLUDED.ciphertext_tag,
+             wrapped_data_key = EXCLUDED.wrapped_data_key,
+             wrapped_data_key_iv = EXCLUDED.wrapped_data_key_iv,
+             wrapped_data_key_tag = EXCLUDED.wrapped_data_key_tag,
+             updated_at = EXCLUDED.updated_at`,
+          [
+            record.ownerUserId,
+            record.credentialId,
+            record.secretType,
+            record.encryptionVersion,
+            record.ciphertext,
+            record.ciphertextIv,
+            record.ciphertextTag,
+            record.wrappedDataKey,
+            record.wrappedDataKeyIv,
+            record.wrappedDataKeyTag,
+            now()
+          ]
+        );
+      } catch {
+        throw new PersistenceUnavailableError();
+      }
+    },
+    async loadEncryptedCredential(credentialId, ownerUserId) {
+      assertOpen(closed);
+
+      try {
+        const result = await pool.query<EncryptedCredentialRow>(
+          `SELECT owner_user_id, credential_id, secret_type, encryption_version,
+                  ciphertext, ciphertext_iv, ciphertext_tag,
+                  wrapped_data_key, wrapped_data_key_iv, wrapped_data_key_tag
+           FROM encrypted_credentials
+           WHERE owner_user_id = $1 AND credential_id = $2`,
+          [ownerUserId, credentialId]
+        );
+        const row = result.rows[0];
+
+        return row === undefined
+          ? undefined
+          : {
+              ownerUserId: row.owner_user_id,
+              credentialId: row.credential_id,
+              secretType: row.secret_type,
+              encryptionVersion: row.encryption_version,
+              ciphertext: row.ciphertext,
+              ciphertextIv: row.ciphertext_iv,
+              ciphertextTag: row.ciphertext_tag,
+              wrappedDataKey: row.wrapped_data_key,
+              wrappedDataKeyIv: row.wrapped_data_key_iv,
+              wrappedDataKeyTag: row.wrapped_data_key_tag
+            };
+      } catch {
+        throw new PersistenceUnavailableError();
+      }
+    },
+    async appendEgressRecord(record) {
+      assertOpen(closed);
+
+      try {
+        await pool.query(
+          `INSERT INTO egress_records (
+             egress_id, user_id, operation_id, correlation_id,
+             destination_origin, method, policy_version, state, occurred_at
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+          [
+            record.egressId,
+            record.userId,
+            record.operationId,
+            record.correlationId,
+            record.destinationOrigin,
+            record.method,
+            record.policyVersion,
+            record.state,
+            record.occurredAt
+          ]
+        );
+      } catch {
+        throw new PersistenceUnavailableError();
+      }
+    },
+    async listEgressRecords(correlationId) {
+      assertOpen(closed);
+
+      try {
+        const result = await pool.query<EgressRecordRow>(
+          `SELECT egress_id, user_id, operation_id, correlation_id,
+                  destination_origin, method, policy_version, state, occurred_at
+           FROM egress_records
+           WHERE correlation_id = $1
+           ORDER BY occurred_at, egress_id`,
+          [correlationId]
+        );
+
+        return result.rows.map((row) => ({
+          egressId: row.egress_id,
+          userId: row.user_id,
+          operationId: row.operation_id,
+          correlationId: row.correlation_id,
+          destinationOrigin: row.destination_origin,
+          method: row.method,
+          policyVersion: row.policy_version,
+          state: row.state,
+          occurredAt: row.occurred_at.toISOString()
+        }));
+      } catch {
         throw new PersistenceUnavailableError();
       }
     },
@@ -683,6 +938,7 @@ export async function openPersistentDecisionTaskWorker(
 async function submitInTransaction(
   client: PoolClient,
   command: ExecuteDecisionTaskCommandV1,
+  ownerUserId: string,
   submittedAt: Date
 ): Promise<DecisionTaskSnapshotV1> {
   const fingerprint = createHash("sha256").update(canonicalize(command)).digest("hex");
@@ -712,6 +968,7 @@ async function submitInTransaction(
     const existingResult = await client.query<ExistingSubmissionRow>(
       `SELECT
          submission.command_fingerprint,
+         submission.owner_user_id,
          submission.execution_request_id,
          operation.decision_task_id,
          operation.agent_run_id,
@@ -727,7 +984,10 @@ async function submitInTransaction(
     const existing = existingResult.rows[0];
 
     if (existing !== undefined) {
-      if (existing.command_fingerprint !== fingerprint) {
+      if (
+        existing.owner_user_id !== ownerUserId ||
+        existing.command_fingerprint !== fingerprint
+      ) {
         throw new IdempotencyConflictError(command.executionRequestId);
       }
 
@@ -738,13 +998,15 @@ async function submitInTransaction(
     await client.query(
       `INSERT INTO decision_task_submissions (
          execution_request_id,
+         owner_user_id,
          command_fingerprint,
          decision_task_id,
          command_payload,
          created_at
-       ) VALUES ($1, $2, $3, $4::jsonb, $5)`,
+       ) VALUES ($1, $2, $3, $4, $5::jsonb, $6)`,
       [
         command.executionRequestId,
+        ownerUserId,
         fingerprint,
         command.requirementRevision.decisionTaskId,
         JSON.stringify(command),

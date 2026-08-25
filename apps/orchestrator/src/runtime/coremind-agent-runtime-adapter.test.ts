@@ -5,12 +5,16 @@ import path from "node:path";
 
 import { CoreMindRuntime } from "coremind-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createEgressGuard, type EgressRecord } from "@choicemind/security";
 
 import { buildOrchestratorApp } from "../app.js";
 import { createDecisionTaskExecutor } from "../decision-tasks/executor.js";
 import type { ExecuteDecisionTaskCommandV1 } from "@choicemind/contracts/decision/v1";
 import { buildSyntheticLaptopRunOutput } from "./synthetic-laptop-fixture.js";
-import { createCoreMindAgentRuntimeAdapter } from "./coremind-agent-runtime-adapter.js";
+import type { AgentRuntimeRunPort } from "./port.js";
+import {
+  createCoreMindAgentRuntimeAdapter as createRawCoreMindAgentRuntimeAdapter
+} from "./coremind-agent-runtime-adapter.js";
 
 type OfflineProvider = Readonly<{
   baseUrl: string;
@@ -45,6 +49,67 @@ afterEach(async () => {
 });
 
 describe("CoreMind AgentRuntimeRunPort", () => {
+  it("fails closed before Provider access when server security context is absent", async () => {
+    const provider = await startOfflineProvider();
+    const adapter = createRawCoreMindAgentRuntimeAdapter({
+      providerBaseUrl: provider.baseUrl,
+      model: "offline-model",
+      egressGuard: createEgressGuard({
+        appendRecord: async () => undefined,
+        nextId: () => "egress-unused",
+        now: () => new Date("2026-08-24T00:29:00.000Z")
+      })
+    });
+    const executor = createDecisionTaskExecutor({ runtime: adapter });
+
+    const result = await executor.execute(buildCoreMindCommand("coremind-no-security"));
+
+    expectRuntimeFailure(result);
+    expect(provider.requests).toHaveLength(0);
+  });
+
+  it("records a confirmed Provider egress before CoreMind executes", async () => {
+    const provider = await startOfflineProvider();
+    const configDir = await createTemporaryDirectory();
+    const records: EgressRecord[] = [];
+    const executor = createDecisionTaskExecutor({
+      runtime: createRawCoreMindAgentRuntimeAdapter({
+        providerBaseUrl: provider.baseUrl,
+        model: "offline-model",
+        configDir,
+        egressGuard: createEgressGuard({
+          appendRecord: async (record) => { records.push(record); },
+          nextId: () => "egress-coremind-1",
+          now: () => new Date("2026-08-24T00:30:00.000Z")
+        })
+      })
+    });
+    const command = buildCoreMindCommand("coremind-egress");
+
+    const result = await executor.execute(command, {
+      agentRunId: "agent-run-coremind-egress",
+      userId: "user-a",
+      operationId: command.executionRequestId,
+      correlationId: "correlation-coremind-egress",
+      egressConfirmation: {
+        operationId: command.executionRequestId,
+        userId: "user-a"
+      }
+    });
+
+    expect(result).toMatchObject({ ok: true });
+    expect(records).toEqual([
+      expect.objectContaining({
+        userId: "user-a",
+        operationId: command.executionRequestId,
+        correlationId: "correlation-coremind-egress",
+        destinationOrigin: new URL(provider.baseUrl).origin,
+        method: "POST",
+        state: "STARTED"
+      })
+    ]);
+  });
+
   it("Gate D: runs through the public CoreMind HTTP/SSE and Tool path before finalizing a Decision", async () => {
     const provider = await startOfflineProvider();
     const configDir = await createTemporaryDirectory();
@@ -623,4 +688,44 @@ function getTextContent(message: Record<string, unknown> | undefined): string | 
     (part) => isRecord(part) && part.type === "text" && typeof part.text === "string"
   );
   return isRecord(text) && typeof text.text === "string" ? text.text : undefined;
+}
+
+function createCoreMindAgentRuntimeAdapter(
+  options: Omit<
+    Parameters<typeof createRawCoreMindAgentRuntimeAdapter>[0],
+    "egressGuard"
+  >
+): AgentRuntimeRunPort {
+  const adapter = createRawCoreMindAgentRuntimeAdapter({
+    ...options,
+    egressGuard: createEgressGuard({
+      appendRecord: async () => undefined,
+      nextId: () => "egress-coremind-test",
+      now: () => new Date("2026-08-24T00:31:00.000Z")
+    })
+  });
+
+  return {
+    run(command) {
+      const operationId = command.decisionTaskId;
+      return adapter.run(command, {
+        userId: "user-coremind-test",
+        operationId,
+        correlationId: operationId,
+        egressConfirmation: { operationId, userId: "user-coremind-test" }
+      });
+    },
+    runPersistent(command) {
+      const operationId = command.decisionTaskId;
+      if (adapter.runPersistent === undefined) {
+        throw new Error("测试 CoreMind Adapter 必须支持持久执行");
+      }
+      return adapter.runPersistent(command, {
+        userId: "user-coremind-test",
+        operationId,
+        correlationId: operationId,
+        egressConfirmation: { operationId, userId: "user-coremind-test" }
+      });
+    }
+  };
 }

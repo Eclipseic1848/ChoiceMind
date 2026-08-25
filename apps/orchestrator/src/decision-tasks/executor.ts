@@ -5,23 +5,34 @@ import type {
 } from "@choicemind/contracts/decision/v1";
 import { finalizeSuccessfulDecisionTaskResultV1 } from "@choicemind/contracts/decision/v1";
 
-import type { AgentRuntimeRunPort } from "../runtime/port.js";
+import type {
+  AgentRuntimeRunPort,
+  AgentRuntimeSecurityContext
+} from "../runtime/port.js";
 
 type DecisionTaskExecutorOptions = Readonly<{
   runtime: AgentRuntimeRunPort;
 }>;
 
+type DecisionTaskExecutionContext = Readonly<{
+  agentRunId: string;
+  userId?: string;
+  operationId?: string;
+  correlationId?: string;
+  egressConfirmation?: Readonly<{ operationId: string; userId: string }>;
+}>;
+
 export interface DecisionTaskExecutor {
   execute(
     command: ExecuteDecisionTaskCommandV1,
-    context?: Readonly<{ agentRunId: string }>
+    context?: DecisionTaskExecutionContext
   ): Promise<DecisionTaskResultV1>;
 }
 
 export interface PersistentDecisionTaskExecutor extends DecisionTaskExecutor {
   executePersistent(
     command: ExecuteDecisionTaskCommandV1,
-    context: Readonly<{ agentRunId: string }>
+    context: DecisionTaskExecutionContext
   ): Promise<DecisionTaskExecutionOutcome>;
 }
 
@@ -50,12 +61,12 @@ export function createDecisionTaskExecutor(
 
   return {
     execute(command, context) {
-      return executeAttempt(command, context?.agentRunId, false).then(
+      return executeAttempt(command, context, false).then(
         (attempt) => attempt.result
       );
     },
     executePersistent(command, context) {
-      return executeAttempt(command, context.agentRunId, true).then(
+      return executeAttempt(command, context, true).then(
         (attempt) => attempt.persistentOutcome
       );
     }
@@ -63,7 +74,7 @@ export function createDecisionTaskExecutor(
 
   function executeAttempt(
     command: ExecuteDecisionTaskCommandV1,
-    persistedAgentRunId: string | undefined,
+    context: DecisionTaskExecutionContext | undefined,
     forPersistence: boolean
   ): Promise<DecisionTaskExecutionAttempt> {
       const fingerprint = canonicalize(command);
@@ -105,7 +116,7 @@ export function createDecisionTaskExecutor(
         });
       }
 
-      const attempt = executeOnce(command, persistedAgentRunId, forPersistence);
+      const attempt = executeOnce(command, context, forPersistence);
       const activeReceipt = { fingerprint, attempt };
       receipts.set(command.executionRequestId, activeReceipt);
       void attempt.then((completedAttempt) => {
@@ -121,10 +132,10 @@ export function createDecisionTaskExecutor(
 
   async function executeOnce(
     command: ExecuteDecisionTaskCommandV1,
-    persistedAgentRunId: string | undefined,
+    context: DecisionTaskExecutionContext | undefined,
     forPersistence: boolean
   ): Promise<DecisionTaskExecutionAttempt> {
-    const agentRunId = persistedAgentRunId ?? `agent-run-${command.executionRequestId}`;
+    const agentRunId = context?.agentRunId ?? `agent-run-${command.executionRequestId}`;
     const decisionTaskId = command.requirementRevision.decisionTaskId;
 
     try {
@@ -134,9 +145,10 @@ export function createDecisionTaskExecutor(
         agentRunId,
         requirementRevision: command.requirementRevision
       } as const;
+      const securityContext = toRuntimeSecurityContext(context);
       const runtimeOutput: unknown = await (forPersistence && options.runtime.runPersistent
-        ? options.runtime.runPersistent(runtimeCommand)
-        : options.runtime.run(runtimeCommand));
+        ? options.runtime.runPersistent(runtimeCommand, securityContext)
+        : options.runtime.run(runtimeCommand, securityContext));
 
       if (isExplicitRuntimeOutcome(runtimeOutput)) {
         return {
@@ -203,6 +215,26 @@ export function createDecisionTaskExecutor(
       return createFailedExecutionAttempt(decisionTaskId, agentRunId);
     }
   }
+}
+
+function toRuntimeSecurityContext(
+  context: DecisionTaskExecutionContext | undefined
+): AgentRuntimeSecurityContext | undefined {
+  if (
+    context?.userId === undefined ||
+    context.operationId === undefined ||
+    context.correlationId === undefined ||
+    context.egressConfirmation === undefined
+  ) {
+    return undefined;
+  }
+
+  return {
+    userId: context.userId,
+    operationId: context.operationId,
+    correlationId: context.correlationId,
+    egressConfirmation: context.egressConfirmation
+  };
 }
 
 function isRetryableOutcome(outcome: DecisionTaskExecutionOutcome): boolean {

@@ -10,6 +10,9 @@ $acceptancePassword = [guid]::NewGuid().ToString("N")
 $env:CHOICEMIND_POSTGRES_PASSWORD = $acceptancePassword
 $env:CHOICEMIND_DATABASE_URL =
   "postgresql://choicemind:$acceptancePassword@postgres:5432/choicemind"
+$env:CHOICEMIND_SYNTHETIC_USER_TOKEN = [guid]::NewGuid().ToString("N")
+$env:CHOICEMIND_SYNTHETIC_OTHER_USER_TOKEN = [guid]::NewGuid().ToString("N")
+$apiHeaders = @{ Authorization = "Bearer $env:CHOICEMIND_SYNTHETIC_USER_TOKEN" }
 $started = $false
 $acceptanceFailed = $false
 
@@ -77,6 +80,7 @@ function Submit-Task {
     -UseBasicParsing `
     -Method Post `
     -Uri "http://127.0.0.1:3100/api/v1/decision-tasks:execute" `
+    -Headers $apiHeaders `
     -ContentType "application/json; charset=utf-8" `
     -Body ($body | ConvertTo-Json -Depth 10 -Compress) `
     -TimeoutSec 10
@@ -104,6 +108,7 @@ function Read-Task {
   return Invoke-RestMethod `
     -Method Get `
     -Uri "http://127.0.0.1:3100/api/v1/decision-tasks/$DecisionTaskId" `
+    -Headers $apiHeaders `
     -TimeoutSec 10
 }
 
@@ -464,6 +469,7 @@ WHERE a.execution_request_id = 'exec-compose-$runId-redis';
     -SkipHttpErrorCheck `
     -Method Post `
     -Uri "http://127.0.0.1:3100/api/v1/decision-tasks:execute" `
+    -Headers $apiHeaders `
     -ContentType "application/json; charset=utf-8" `
     -Body ($postgresOutageBody | ConvertTo-Json -Depth 10 -Compress) `
     -TimeoutSec 15
@@ -480,6 +486,7 @@ WHERE a.execution_request_id = 'exec-compose-$runId-redis';
     -UseBasicParsing `
     -SkipHttpErrorCheck `
     -Uri "http://127.0.0.1:3100/api/v1/decision-tasks/$($normal.decisionTaskId)" `
+    -Headers $apiHeaders `
     -TimeoutSec 15
 
   if ($postgresReadResponse.StatusCode -ne 503) {
@@ -598,4 +605,6 @@ finally {
 
   $env:CHOICEMIND_POSTGRES_PASSWORD = $null
   $env:CHOICEMIND_DATABASE_URL = $null
+  $env:CHOICEMIND_SYNTHETIC_USER_TOKEN = $null
+  $env:CHOICEMIND_SYNTHETIC_OTHER_USER_TOKEN = $null
 }

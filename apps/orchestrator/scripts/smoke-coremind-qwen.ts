@@ -10,6 +10,7 @@ import {
   finalizeSuccessfulDecisionTaskResultV1,
   type ExecuteDecisionTaskCommandV1
 } from "@choicemind/contracts/decision/v1";
+import { createEgressGuard, type EgressRecord } from "@choicemind/security";
 
 import { createDecisionTaskExecutor } from "../src/decision-tasks/executor.js";
 import { createCoreMindAgentRuntimeAdapter } from "../src/runtime/coremind-agent-runtime-adapter.js";
@@ -152,17 +153,29 @@ try {
   await assertSyntheticDraftAccepted(command, draft);
   const recordingProxy = await startRecordingProxy(providerBaseUrl, draft);
   proxy = recordingProxy;
+  const egressRecords: EgressRecord[] = [];
   const executor = createDecisionTaskExecutor({
     runtime: createCoreMindAgentRuntimeAdapter({
       providerBaseUrl: recordingProxy.baseUrl,
       model,
       apiKey: "local-smoke",
       configDir,
-      runTimeoutMs: 120_000
+      runTimeoutMs: 120_000,
+      egressGuard: createEgressGuard({
+        appendRecord: async (record) => { egressRecords.push(record); },
+        nextId: () => `egress-${randomUUID()}`,
+        now: () => new Date()
+      })
     })
   });
 
-  const result = await executor.execute(command);
+  const result = await executor.execute(command, {
+    agentRunId: `agent-run-${executionRequestId}`,
+    userId: "user-local-smoke",
+    operationId: executionRequestId,
+    correlationId: executionRequestId,
+    egressConfirmation: { operationId: executionRequestId, userId: "user-local-smoke" }
+  });
   await recordingProxy.close();
   proxy = undefined;
   const evidenceBoundary = {
@@ -180,6 +193,7 @@ try {
         decisionStatus: result.bundle.decision.status,
         selectedCandidateId: result.bundle.decision.selectedCandidateId,
         eventStates: result.runEvents.map((event) => event.taskState),
+        egressRecords,
         providerObservations: recordingProxy.observations
       }
     : {
@@ -188,6 +202,7 @@ try {
         provider: describeProvider(providerBaseUrl, model),
         taskState: "taskStatus" in result ? result.taskStatus.state : undefined,
         errorCode: result.error.code,
+        egressRecords,
         eventStates:
           "runEvents" in result ? result.runEvents.map((event) => event.taskState) : [],
         providerObservations: recordingProxy.observations

@@ -17,6 +17,7 @@
   },
   "dependencies": {
     "@choicemind/contracts": "workspace:*",
+    "@choicemind/security": "workspace:*",
     "@redis/client": "6.2.1",
     "pg": "8.23.0"
   },

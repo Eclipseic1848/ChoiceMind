@@ -1,7 +1,28 @@
 import Fastify from "fastify";
 import type { DecisionTaskSnapshotV1 } from "@choicemind/contracts/decision/v1";
 import { afterEach, describe, expect, it } from "vitest";
-import { buildApiApp } from "./app.js";
+import { buildApiApp as buildApiAppWithoutIdentity } from "./app.js";
+
+const testIdentityResolver = {
+  async resolve(authorization: string | undefined) {
+    const userId = authorization === "Bearer token-user-b" ? "user-b" : "user-a";
+
+    return {
+      principalId: `principal-${userId}`,
+      role: "USER" as const,
+      userId
+    };
+  }
+};
+
+function buildApiApp(
+  options: Parameters<typeof buildApiAppWithoutIdentity>[0] = {}
+) {
+  return buildApiAppWithoutIdentity({
+    identityResolver: testIdentityResolver,
+    ...options
+  });
+}
 
 const openApps: Array<ReturnType<typeof buildApiApp>> = [];
 
@@ -142,7 +163,9 @@ describe("GET /api/v1/system/health", () => {
 
 describe("POST /api/v1/decision-tasks:execute", () => {
   it("accepts a valid command as a persistent background task", async () => {
+    const auditRecords: unknown[] = [];
     const app = buildApiApp({
+      auditLog: { async append(record) { auditRecords.push(record); } },
       decisionTaskPersistence: {
         async submit(command) {
           return {
@@ -169,6 +192,7 @@ describe("POST /api/v1/decision-tasks:execute", () => {
     const response = await app.inject({
       method: "POST",
       url: "/api/v1/decision-tasks:execute",
+      headers: { "x-correlation-id": "correlation-submit-1" },
       payload: {
         contractType: "execute-decision-task-command",
         contractVersion: "1.0",
@@ -201,6 +225,15 @@ describe("POST /api/v1/decision-tasks:execute", () => {
       terminal: false,
       updatedAt: "2026-08-23T20:20:00.000Z"
     });
+    expect(auditRecords).toEqual([
+      {
+        actor: { principalId: "principal-user-a", role: "USER", userId: "user-a" },
+        action: "DECISION_TASK_SUBMIT",
+        object: { id: "task-api-persistent", type: "DECISION_TASK" },
+        result: "ALLOWED",
+        correlationId: "correlation-submit-1"
+      }
+    ]);
   });
 
   it("returns a versioned 409 for an idempotency conflict", async () => {
@@ -485,6 +518,157 @@ describe("POST /api/v1/decision-tasks:execute", () => {
 });
 
 describe("GET /api/v1/decision-tasks/:decisionTaskId", () => {
+  it("hides a user's task from another authenticated user", async () => {
+    const snapshot: DecisionTaskSnapshotV1 = {
+      contractType: "decision-task-snapshot",
+      contractVersion: "1.0",
+      executionRequestId: "exec-api-owned",
+      decisionTaskId: "task-api-owned",
+      agentRunId: "agent-run-api-owned",
+      state: "ACCEPTED",
+      terminal: false,
+      updatedAt: "2026-08-24T00:00:00.000Z"
+    };
+    const app = buildApiApp({
+      decisionTaskPersistence: {
+        async submit() {
+          throw new Error("本测试不应提交任务");
+        },
+        async get(_decisionTaskId, ownerUserId) {
+          return ownerUserId === "user-a" ? snapshot : undefined;
+        },
+        async listEvents() {
+          return [];
+        }
+      }
+    });
+    openApps.push(app);
+
+    const ownerResponse = await app.inject({
+      method: "GET",
+      url: "/api/v1/decision-tasks/task-api-owned",
+      headers: {
+        authorization: "Bearer token-user-a"
+      }
+    });
+    const otherUserResponse = await app.inject({
+      method: "GET",
+      url: "/api/v1/decision-tasks/task-api-owned",
+      headers: {
+        authorization: "Bearer token-user-b"
+      }
+    });
+
+    expect(ownerResponse.statusCode).toBe(200);
+    expect(otherUserResponse.statusCode).toBe(404);
+    expect(otherUserResponse.json()).toMatchObject({
+      ok: false,
+      error: {
+        code: "DECISION_TASK_NOT_FOUND"
+      }
+    });
+  });
+
+  it.each(["USER", "ADMIN", "SUPERADMIN"] as const)(
+    "denies a %s access to another user's task and records the audit result",
+    async (role) => {
+      const auditRecords: unknown[] = [];
+      const app = buildApiApp({
+        auditLog: {
+          async append(record) {
+            auditRecords.push(record);
+          }
+        },
+        identityResolver: {
+          async resolve() {
+            return {
+              principalId: `principal-other-${role.toLowerCase()}`,
+              role,
+              userId: "user-other"
+            };
+          }
+        },
+        decisionTaskPersistence: {
+          async submit() {
+            throw new Error("本测试不应提交任务");
+          },
+          async get() {
+            return undefined;
+          },
+          async listEvents() {
+            return [];
+          }
+        }
+      });
+      openApps.push(app);
+
+      const response = await app.inject({
+        method: "GET",
+        url: "/api/v1/decision-tasks/task-private",
+        headers: {
+          authorization: "Bearer opaque-other",
+          "x-correlation-id": `correlation-${role.toLowerCase()}`
+        }
+      });
+
+      expect(response.statusCode).toBe(404);
+      expect(auditRecords).toEqual([
+        {
+          actor: {
+            principalId: `principal-other-${role.toLowerCase()}`,
+            role,
+            userId: "user-other"
+          },
+          action: "DECISION_TASK_READ",
+          object: { id: "task-private", type: "DECISION_TASK" },
+          result: "NOT_FOUND",
+          correlationId: `correlation-${role.toLowerCase()}`
+        }
+      ]);
+    }
+  );
+
+  it("records an allowed owner read with its correlation identifier", async () => {
+    const auditRecords: unknown[] = [];
+    const app = buildApiApp({
+      auditLog: { async append(record) { auditRecords.push(record); } },
+      decisionTaskPersistence: {
+        async submit() { throw new Error("本测试不应提交任务"); },
+        async get(decisionTaskId) {
+          return {
+            contractType: "decision-task-snapshot",
+            contractVersion: "1.0",
+            executionRequestId: "exec-audit-allowed",
+            decisionTaskId,
+            agentRunId: "agent-run-audit-allowed",
+            state: "ACCEPTED",
+            terminal: false,
+            updatedAt: "2026-08-24T00:12:00.000Z"
+          };
+        },
+        async listEvents() { return []; }
+      }
+    });
+    openApps.push(app);
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/v1/decision-tasks/task-audit-allowed",
+      headers: { "x-correlation-id": "correlation-allowed" }
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(auditRecords).toEqual([
+      {
+        actor: { principalId: "principal-user-a", role: "USER", userId: "user-a" },
+        action: "DECISION_TASK_READ",
+        object: { id: "task-audit-allowed", type: "DECISION_TASK" },
+        result: "ALLOWED",
+        correlationId: "correlation-allowed"
+      }
+    ]);
+  });
+
   it("returns the persisted task snapshot", async () => {
     const app = buildApiApp({
       decisionTaskPersistence: {
@@ -686,6 +870,41 @@ describe("GET /api/v1/decision-tasks/:decisionTaskId", () => {
 });
 
 describe("GET /api/v1/decision-tasks/:decisionTaskId/events", () => {
+  it("audits a denied event-stream read without revealing task ownership", async () => {
+    const auditRecords: unknown[] = [];
+    const app = buildApiApp({
+      auditLog: { async append(record) { auditRecords.push(record); } },
+      identityResolver: {
+        async resolve() {
+          return { principalId: "principal-user-b", role: "USER", userId: "user-b" };
+        }
+      },
+      decisionTaskPersistence: {
+        async submit() { throw new Error("本测试不应提交任务"); },
+        async get() { return undefined; },
+        async listEvents() { return []; }
+      }
+    });
+    openApps.push(app);
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/v1/decision-tasks/task-private/events",
+      headers: { "x-correlation-id": "correlation-events-denied" }
+    });
+
+    expect(response.statusCode).toBe(404);
+    expect(auditRecords).toEqual([
+      {
+        actor: { principalId: "principal-user-b", role: "USER", userId: "user-b" },
+        action: "DECISION_TASK_EVENTS_READ",
+        object: { id: "task-private", type: "DECISION_TASK" },
+        result: "NOT_FOUND",
+        correlationId: "correlation-events-denied"
+      }
+    ]);
+  });
+
   it("replays persisted events as SSE records with the cursor as id", async () => {
     const persistedEvent = {
       contractType: "persisted-run-event" as const,
@@ -787,7 +1006,7 @@ describe("GET /api/v1/decision-tasks/:decisionTaskId/events", () => {
             updatedAt: "2026-08-24T01:41:00.000Z"
           };
         },
-        async listEvents(_decisionTaskId, afterCursor) {
+        async listEvents(_decisionTaskId, _ownerUserId, afterCursor) {
           receivedCursor = afterCursor;
           return [persistedEvent];
         }

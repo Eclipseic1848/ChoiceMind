@@ -50,14 +50,16 @@ describe("Outbox Publisher", () => {
     await stopContainer(redisContainer);
 
     try {
-      const accepted = await taskModule.submit(command);
+      const accepted = await taskModule.submit(command, "test-owner");
 
       expect(await publisher.runOnce()).toEqual({
         attempted: 1,
         failed: 1,
         published: 0
       });
-      expect(await taskModule.get(command.requirementRevision.decisionTaskId)).toEqual(
+      expect(
+        await taskModule.get(command.requirementRevision.decisionTaskId, "test-owner")
+      ).toEqual(
         accepted
       );
     } finally {
@@ -108,7 +110,7 @@ describe("Outbox Publisher", () => {
       retryDelayMs: 0
     });
     openModules.push(taskModule, publisher);
-    await taskModule.submit(buildCommand(randomUUID()));
+    await taskModule.submit(buildCommand(randomUUID()), "test-owner");
     const faultClient = await installPublishedMarkFailure(databaseUrl);
 
     try {
@@ -163,7 +165,7 @@ describe("Outbox Publisher", () => {
       now: () => currentTime
     });
     openModules.push(taskModule, publisher);
-    const accepted = await taskModule.submit(command);
+    const accepted = await taskModule.submit(command, "test-owner");
 
     expect(await publisher.runOnce()).toMatchObject({ published: 1 });
 
@@ -183,7 +185,9 @@ describe("Outbox Publisher", () => {
       failed: 0,
       published: 1
     });
-    expect(await taskModule.get(command.requirementRevision.decisionTaskId)).toEqual(accepted);
+    expect(
+      await taskModule.get(command.requirementRevision.decisionTaskId, "test-owner")
+    ).toEqual(accepted);
 
     const recoveredRedis = createClient({ url: redisUrl });
     recoveredRedis.on("error", () => undefined);

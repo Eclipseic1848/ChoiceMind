@@ -7,6 +7,8 @@ import {
 import type { DecisionTaskEventNotificationsPort } from "./decision-tasks/event-notifications-port.js";
 import type { DecisionTaskPersistencePort } from "./decision-tasks/persistence-port.js";
 import { registerDecisionTaskRoutes } from "./decision-tasks/routes.js";
+import type { AuditLogPort } from "./security/audit.js";
+import type { IdentityResolver } from "./security/identity.js";
 
 type DependencyService = "web" | "orchestrator" | "data-worker";
 
@@ -17,11 +19,13 @@ type ComponentHealth = {
   error?: string;
 };
 
-type ApiAppOptions = {
+export type ApiAppOptions = {
+  auditLog?: AuditLogPort;
   decisionTaskEventNotifications?: DecisionTaskEventNotificationsPort;
   decisionTaskEventPollIntervalMs?: number;
   decisionTaskPersistence?: DecisionTaskPersistencePort;
   healthUrls?: Record<DependencyService, string>;
+  identityResolver?: IdentityResolver;
   now?: () => Date;
   probe?: (service: DependencyService) => Promise<ComponentHealth>;
 };
@@ -121,7 +125,9 @@ export function buildApiApp(options: ApiAppOptions = {}) {
     options.decisionTaskPersistence,
     options.now ?? (() => new Date()),
     options.decisionTaskEventNotifications,
-    options.decisionTaskEventPollIntervalMs ?? 1_000
+    options.decisionTaskEventPollIntervalMs ?? 1_000,
+    options.identityResolver,
+    options.auditLog
   );
 
   return app;

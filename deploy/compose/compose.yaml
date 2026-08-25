@@ -35,6 +35,7 @@ services:
     command: ["corepack", "pnpm", "--filter", "@choicemind/web", "start"]
     environment:
       CHOICEMIND_API_URL: http://api:3100
+      CHOICEMIND_API_AUTHORIZATION: "Bearer ${CHOICEMIND_SYNTHETIC_USER_TOKEN:?CHOICEMIND_SYNTHETIC_USER_TOKEN is required}"
     ports:
       - "3000:3000"
     healthcheck:
@@ -51,8 +52,10 @@ services:
         condition: service_healthy
     environment:
       CHOICEMIND_DATABASE_URL: "${CHOICEMIND_DATABASE_URL:?CHOICEMIND_DATABASE_URL is required}"
+      CHOICEMIND_IDENTITY_MODE: synthetic
       CHOICEMIND_REDIS_URL: redis://redis:6379
       CHOICEMIND_RUN_EVENT_CHANNEL: choicemind:run-events
+      CHOICEMIND_SYNTHETIC_IDENTITIES_JSON: '{"${CHOICEMIND_SYNTHETIC_USER_TOKEN:?CHOICEMIND_SYNTHETIC_USER_TOKEN is required}":{"principalId":"principal-p0-user","role":"USER","userId":"p0-user"},"${CHOICEMIND_SYNTHETIC_OTHER_USER_TOKEN:?CHOICEMIND_SYNTHETIC_OTHER_USER_TOKEN is required}":{"principalId":"principal-p0-other-user","role":"USER","userId":"p0-other-user"}}'
       DATA_WORKER_HEALTH_URL: http://data-worker:3300/health/live
       HOST: 0.0.0.0
       ORCHESTRATOR_HEALTH_URL: http://orchestrator:3200/health/live

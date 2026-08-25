@@ -5,6 +5,8 @@ import {
   getDecisionTaskResultHttpStatusV1
 } from "@choicemind/contracts/decision/v1";
 
+import { addChoiceMindApiAuthorization } from "../../../../server-api-authorization";
+
 type RouteContext = Readonly<{
   params: Promise<Readonly<{ decisionTaskId: string }>>;
 }>;
@@ -18,6 +20,7 @@ export async function GET(_request: Request, context: RouteContext) {
       `${apiUrl}/api/v1/decision-tasks/${encodeURIComponent(decisionTaskId)}`,
       {
         cache: "no-store",
+        headers: addChoiceMindApiAuthorization(new Headers()),
         signal: AbortSignal.timeout(15_000)
       }
     );
