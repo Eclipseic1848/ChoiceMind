@@ -4,6 +4,7 @@ import type {
   EffectReceiptV1,
   RuntimeSnapshotV1
 } from "@choicemind/contracts/decision/v1";
+import { decodeEffectReceiptV1 } from "@choicemind/contracts/decision/v1";
 
 import {
   openRuntimeRecoveryStore,
@@ -70,6 +71,39 @@ describe("RuntimeRecoveryStore", () => {
     expect(repeated).toEqual(first);
   });
 
+  it("跨进程实例保留绑定权威身份的内容寻址副作用结果", async () => {
+    const databaseUrl = requireEnvironment("CHOICEMIND_TEST_DATABASE_URL");
+    const first = await openRuntimeRecoveryStore({ databaseUrl });
+    openStores.push(first);
+    const result = { accepted: true, source: "synthetic-effect" };
+
+    const reference = await first.putEffectResult(
+      {
+        decisionTaskId: "task-effect-result-1",
+        agentRunId: "run-effect-result-1",
+        checkpointId: "checkpoint-effect-result-1",
+        effectId: "effect-result-1"
+      },
+      result
+    );
+    await first.close();
+    openStores.splice(openStores.indexOf(first), 1);
+
+    const reopened = await openRuntimeRecoveryStore({ databaseUrl });
+    openStores.push(reopened);
+
+    await expect(reopened.loadEffectResult(reference)).resolves.toEqual(result);
+    expect(reference).toMatchObject({
+      algorithm: "sha256",
+      digest: expect.stringMatching(/^[0-9a-f]{64}$/),
+      objectKey: expect.stringMatching(/^effect-results\/sha256\/[0-9a-f]{64}$/),
+      decisionTaskId: "task-effect-result-1",
+      agentRunId: "run-effect-result-1",
+      checkpointId: "checkpoint-effect-result-1",
+      effectId: "effect-result-1"
+    });
+  });
+
   it("跨 Store 实例保持 resume/cancel 原子幂等状态", async () => {
     const databaseUrl = requireEnvironment("CHOICEMIND_TEST_DATABASE_URL");
     let currentTime = new Date("2026-08-24T12:00:00.000Z");
@@ -81,7 +115,8 @@ describe("RuntimeRecoveryStore", () => {
       runId: "coremind-run-control"
     });
     const snapshot = buildRuntimeSnapshot(reference);
-    const safeReceipt = { ...buildEffectReceipt(), state: "committed" as const };
+    const safeReceipt = await buildCommittedEffectReceipt(first, buildEffectReceipt());
+    expect(decodeEffectReceiptV1(safeReceipt)).toEqual({ ok: true, value: safeReceipt });
     await first.recordRuntimeRunning(snapshot.agentRunId, "controller-initial", 10_000);
     await first.saveRecoveryFacts(snapshot, [safeReceipt]);
     await first.completeRuntimeControl(
@@ -202,6 +237,37 @@ describe("RuntimeRecoveryStore", () => {
     });
   });
 
+  it("故障注入篡改副作用结果后报告结构化完整性错误", async () => {
+    const databaseUrl = requireEnvironment("CHOICEMIND_TEST_DATABASE_URL");
+    const store = await openRuntimeRecoveryStore({ databaseUrl });
+    openStores.push(store);
+    const reference = await store.putEffectResult(
+      {
+        decisionTaskId: "task-effect-corrupt",
+        agentRunId: "run-effect-corrupt",
+        checkpointId: "checkpoint-effect-corrupt",
+        effectId: "effect-corrupt"
+      },
+      { accepted: true }
+    );
+    const client = new Client({ connectionString: databaseUrl });
+    await client.connect();
+    try {
+      await client.query(
+        `UPDATE runtime_effect_result_objects
+         SET result_payload = '{"accepted":false}'::jsonb
+         WHERE digest = $1`,
+        [reference.digest]
+      );
+    } finally {
+      await client.end();
+    }
+
+    await expect(store.loadEffectResult(reference)).rejects.toMatchObject({
+      code: "EFFECT_RESULT_INVALID"
+    });
+  });
+
   it("持久任务把 Runtime 暂停保存为 PAUSED 而不是失败或完成", async () => {
     const databaseUrl = requireEnvironment("CHOICEMIND_TEST_DATABASE_URL");
     const module = await openPersistentDecisionTaskModule({
@@ -232,11 +298,12 @@ describe("RuntimeRecoveryStore", () => {
         agentRunId: claim.agentRunId
       }
     };
-    const receipt = {
+    const receiptBase = {
       ...buildEffectReceipt(),
-      agentRunId: claim.agentRunId,
-      state: "committed" as const
+      agentRunId: claim.agentRunId
     };
+    const receipt = await buildCommittedEffectReceipt(store, receiptBase);
+    expect(decodeEffectReceiptV1(receipt)).toEqual({ ok: true, value: receipt });
     await store.saveRecoveryFacts(snapshot, [receipt]);
 
     const completion = await module.complete(operationId, "worker-1", {
@@ -390,7 +457,7 @@ describe("RuntimeRecoveryStore", () => {
           contractType: "runtime-paused-outcome",
           contractVersion: "1.0",
           state: "PAUSED_PERMISSION",
-          summary: "恢复后仍等待必要权限",
+          summary: "已提交副作用的权威结果不可用",
           snapshot,
           effectReceipts: [receipt],
           runEvents: [
@@ -404,7 +471,7 @@ describe("RuntimeRecoveryStore", () => {
               occurredAt: "2026-08-24T12:01:31.000Z",
               eventType: "TASK_STATE_CHANGED",
               taskState: "PAUSED_PERMISSION",
-              summary: "恢复后仍等待必要权限",
+              summary: "已提交副作用的权威结果不可用（EFFECT_RESULT_UNAVAILABLE）",
               synthetic: true
             }
           ]
@@ -427,7 +494,22 @@ describe("RuntimeRecoveryStore", () => {
           userId: "owner-1"
         }
       })
-    ).resolves.toMatchObject({ state: "COMPLETED" });
+    ).resolves.toMatchObject({
+      state: "FAILED",
+      error: {
+        code: "RUNTIME_RESUME_DENIED",
+        message: "已提交副作用的权威结果不可用"
+      }
+    });
+    await expect(reopened.get("task-1", "owner-1")).resolves.toMatchObject({
+      state: "PAUSED_PERMISSION",
+      terminal: false
+    });
+    const resultUnavailableEvents = await reopened.listEvents("task-1", "owner-1");
+    expect(resultUnavailableEvents.at(-1)?.event).toMatchObject({
+      taskState: "PAUSED_PERMISSION",
+      summary: "已提交副作用的权威结果不可用（EFFECT_RESULT_UNAVAILABLE）"
+    });
     await expect(
       reopened.requestRuntimeResume({
         controlRequestId: "control-resume-unsafe-1",
@@ -461,7 +543,12 @@ describe("RuntimeRecoveryStore", () => {
       state: "FAILED",
       error: { code: "RUNTIME_RESUME_DENIED" }
     });
-    await setEffectReceiptState(databaseUrl, receipt.effectReceiptId, "committed");
+    const manualVerificationEvents = await reopened.listEvents("task-1", "owner-1");
+    expect(manualVerificationEvents.at(-1)?.event).toMatchObject({
+      taskState: "PAUSED_PERMISSION",
+      summary: "副作用状态需要人工核验"
+    });
+    await setEffectReceiptState(databaseUrl, receipt.effectReceiptId, "committed", receipt.result);
     await expect(
       reopened.requestRuntimeCancel({
         controlRequestId: "control-cancel-persisted-1",
@@ -530,7 +617,7 @@ function buildRuntimeSnapshot(
   };
 }
 
-function buildEffectReceipt(): EffectReceiptV1 {
+function buildEffectReceipt(): Exclude<EffectReceiptV1, Readonly<{ state: "committed" }>> {
   return {
     contractType: "effect-receipt",
     contractVersion: "1.0",
@@ -542,6 +629,22 @@ function buildEffectReceipt(): EffectReceiptV1 {
     state: "started",
     recordedAt: "2026-08-24T12:00:00.000Z"
   };
+}
+
+async function buildCommittedEffectReceipt(
+  store: RuntimeRecoveryStore,
+  receipt: Exclude<EffectReceiptV1, Readonly<{ state: "committed" }>>
+): Promise<Extract<EffectReceiptV1, Readonly<{ state: "committed" }>>> {
+  const result = await store.putEffectResult(
+    {
+      decisionTaskId: receipt.decisionTaskId,
+      agentRunId: receipt.agentRunId,
+      checkpointId: receipt.checkpointId,
+      effectId: receipt.effectId
+    },
+    { accepted: true, effectId: receipt.effectId }
+  );
+  return { ...receipt, state: "committed", result };
 }
 
 function requireEnvironment(name: string): string {
@@ -595,14 +698,31 @@ async function readOperationId(databaseUrl: string, agentRunId: string): Promise
 async function setEffectReceiptState(
   databaseUrl: string,
   effectReceiptId: string,
-  state: EffectReceiptV1["state"]
+  state: EffectReceiptV1["state"],
+  result?: Extract<EffectReceiptV1, Readonly<{ state: "committed" }>>["result"]
 ): Promise<void> {
   const client = new Client({ connectionString: databaseUrl });
   await client.connect();
   try {
+    if (state === "committed") {
+      if (result === undefined) {
+        throw new Error("恢复 committed 测试收据时必须提供结果引用");
+      }
+      await client.query(
+        `UPDATE runtime_effect_receipts
+         SET receipt_payload = jsonb_set(
+           jsonb_set(receipt_payload, '{state}', to_jsonb($2::text)),
+           '{result}',
+           $3::jsonb
+         )
+         WHERE effect_receipt_id = $1`,
+        [effectReceiptId, state, JSON.stringify(result)]
+      );
+      return;
+    }
     await client.query(
       `UPDATE runtime_effect_receipts
-       SET receipt_payload = jsonb_set(receipt_payload, '{state}', to_jsonb($2::text))
+       SET receipt_payload = jsonb_set(receipt_payload - 'result', '{state}', to_jsonb($2::text))
        WHERE effect_receipt_id = $1`,
       [effectReceiptId, state]
     );

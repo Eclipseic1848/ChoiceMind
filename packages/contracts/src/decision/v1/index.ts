@@ -421,7 +421,17 @@ export type RuntimeSnapshotV1 = Readonly<{
 
 export type EffectReceiptStateV1 = "not_started" | "started" | "committed" | "unknown";
 
-export type EffectReceiptV1 = Readonly<{
+export type EffectResultRefV1 = Readonly<{
+  algorithm: "sha256";
+  digest: string;
+  objectKey: string;
+  decisionTaskId: string;
+  agentRunId: string;
+  checkpointId: string;
+  effectId: string;
+}>;
+
+type EffectReceiptBaseV1 = Readonly<{
   contractType: "effect-receipt";
   contractVersion: "1.0";
   effectReceiptId: string;
@@ -429,9 +439,19 @@ export type EffectReceiptV1 = Readonly<{
   agentRunId: string;
   checkpointId: string;
   effectId: string;
-  state: EffectReceiptStateV1;
   recordedAt: string;
 }>;
+
+export type EffectReceiptV1 =
+  | (EffectReceiptBaseV1 &
+      Readonly<{
+        state: Exclude<EffectReceiptStateV1, "committed">;
+      }>)
+  | (EffectReceiptBaseV1 &
+      Readonly<{
+        state: "committed";
+        result: EffectResultRefV1;
+      }>);
 
 export type RuntimeRecoveryPermissionV1 = Readonly<{
   contractType: "runtime-recovery-permission";
@@ -445,6 +465,8 @@ export type RuntimeRecoveryPermissionV1 = Readonly<{
     | "TASK_NOT_PAUSED"
     | "SNAPSHOT_NOT_RESUMABLE"
     | "EFFECT_STATUS_UNSAFE"
+    | "EFFECT_RESULT_UNAVAILABLE"
+    | "EFFECT_RESULT_INVALID"
     | "RECOVERY_FACTS_INVALID";
 }>;
 

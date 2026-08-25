@@ -13,6 +13,8 @@ type AgentRuntimeFactoryOptions = Readonly<{
     RuntimeRecoveryStore,
     | "putRawSnapshot"
     | "loadRawSnapshot"
+    | "putEffectResult"
+    | "loadEffectResult"
     | "saveRecoveryFacts"
     | "loadRecoveryFacts"
     | "recordRuntimeRunning"

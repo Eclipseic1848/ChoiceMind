@@ -6,6 +6,7 @@ import type { RuntimeRecoveryStore } from "@choicemind/task-persistence";
 
 import { createCoreMindAgentRuntimeAdapter } from "./coremind-agent-runtime-adapter.js";
 import type { AgentRuntimeRunCommandV1, AgentRuntimeSecurityContext } from "./port.js";
+import { buildSyntheticLaptopRunOutput } from "./synthetic-laptop-fixture.js";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -69,7 +70,7 @@ describe("AgentRuntimePort 控制与事件 seam", () => {
     expect(JSON.stringify(observed)).not.toContain("不得进入公开事件");
   });
 
-  it("started 副作用在 Provider 调用前阻断恢复，安全收据才使用原 CoreMind runId", async () => {
+  it("started 阻断恢复；committed 只复用 ChoiceMind Tool 结果，不承诺第三方恰好一次或零重复计费", async () => {
     const create = vi.spyOn(CoreMindRuntime, "create");
     let creation = 0;
     let resumeRunId: string | undefined;
@@ -82,7 +83,7 @@ describe("AgentRuntimePort 控制与事件 seam", () => {
             await seedPausedRunStore(options.runStore);
             return creation === 1
               ? buildPausedCoreMindResult("started")
-              : buildPausedCoreMindResult("committed");
+              : buildPausedCoreMindResult("committed", "submit_decision_draft");
           }
           return buildCompletedCoreMindResult();
         }
@@ -125,7 +126,17 @@ describe("AgentRuntimePort 控制与事件 seam", () => {
         snapshot: paused.snapshot,
         effectReceipts: paused.effectReceipts.map((receipt) => ({
           ...receipt,
-          state: "committed" as const
+          state: "committed" as const,
+          result: {
+            algorithm: "sha256" as const,
+            digest: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            objectKey:
+              "effect-results/sha256/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            decisionTaskId: receipt.decisionTaskId,
+            agentRunId: receipt.agentRunId,
+            checkpointId: receipt.checkpointId,
+            effectId: receipt.effectId
+          }
         }))
       },
       buildSecurityContext()
@@ -146,6 +157,144 @@ describe("AgentRuntimePort 控制与事件 seam", () => {
     if (safePaused === undefined || !("snapshot" in safePaused)) {
       throw new Error("测试前置条件必须形成安全暂停快照");
     }
+    const safeReceipt = safePaused.effectReceipts[0];
+    if (safeReceipt === undefined) {
+      throw new Error("测试前置条件必须形成副作用收据");
+    }
+    const output = buildSyntheticLaptopRunOutput(buildCommand());
+    const result = await safeRecoveryStore.putEffectResult(
+      {
+        decisionTaskId: safeReceipt.decisionTaskId,
+        agentRunId: safeReceipt.agentRunId,
+        checkpointId: safeReceipt.checkpointId,
+        effectId: safeReceipt.effectId
+      },
+      {
+        effectResultType: "choicemind-decision-draft",
+        effectResultVersion: 1,
+        tool: "submit_decision_draft",
+        draft: {
+          candidates: output.candidates,
+          claims: output.claims,
+          evidence: output.evidence,
+          claimEvidenceLinks: output.claimEvidenceLinks,
+          decision: output.decision
+        }
+      }
+    );
+    const committedReceipt = { ...safeReceipt, state: "committed" as const, result };
+    await safeRecoveryStore.saveRecoveryFacts(safePaused.snapshot, [committedReceipt]);
+
+    const missingResult = await createAdapter({
+      ...safeRecoveryStore,
+      async loadEffectResult() {
+        return undefined;
+      }
+    }).resume(
+      {
+        contractVersion: "1.0",
+        decisionTaskId: "task-1",
+        agentRunId: "run-1",
+        snapshot: safePaused.snapshot,
+        effectReceipts: [committedReceipt]
+      },
+      buildSecurityContext()
+    );
+    expect(missingResult).toMatchObject({
+      ok: false,
+      code: "RUNTIME_RESUME_DENIED",
+      recoveryPermission: {
+        decision: "MANUAL_VERIFICATION_REQUIRED",
+        reason: "EFFECT_RESULT_UNAVAILABLE"
+      }
+    });
+
+    const corruptStoredResult = await createAdapter({
+      ...safeRecoveryStore,
+      async loadEffectResult() {
+        throw Object.assign(new Error("副作用结果摘要不一致"), {
+          code: "EFFECT_RESULT_INVALID"
+        });
+      }
+    }).resume(
+      {
+        contractVersion: "1.0",
+        decisionTaskId: "task-1",
+        agentRunId: "run-1",
+        snapshot: safePaused.snapshot,
+        effectReceipts: [committedReceipt]
+      },
+      buildSecurityContext()
+    );
+    expect(corruptStoredResult).toMatchObject({
+      ok: false,
+      code: "RUNTIME_RESUME_DENIED",
+      recoveryPermission: {
+        decision: "MANUAL_VERIFICATION_REQUIRED",
+        reason: "EFFECT_RESULT_INVALID"
+      }
+    });
+
+    const tamperedResult = await createAdapter({
+      ...safeRecoveryStore,
+      async loadEffectResult() {
+        return { forged: true };
+      }
+    }).resume(
+      {
+        contractVersion: "1.0",
+        decisionTaskId: "task-1",
+        agentRunId: "run-1",
+        snapshot: safePaused.snapshot,
+        effectReceipts: [committedReceipt]
+      },
+      buildSecurityContext()
+    );
+    expect(tamperedResult).toMatchObject({
+      ok: false,
+      code: "RUNTIME_RESUME_DENIED",
+      recoveryPermission: {
+        decision: "MANUAL_VERIFICATION_REQUIRED",
+        reason: "EFFECT_RESULT_INVALID"
+      }
+    });
+    expect(create).toHaveBeenCalledTimes(2);
+
+    const unsupportedResultReference = await safeRecoveryStore.putEffectResult(
+      {
+        decisionTaskId: safeReceipt.decisionTaskId,
+        agentRunId: safeReceipt.agentRunId,
+        checkpointId: safeReceipt.checkpointId,
+        effectId: safeReceipt.effectId
+      },
+      { effectResultType: "unsupported-result", effectResultVersion: 1 }
+    );
+    const unsupportedResultReceipt = {
+      ...safeReceipt,
+      state: "committed" as const,
+      result: unsupportedResultReference
+    };
+    await safeRecoveryStore.saveRecoveryFacts(safePaused.snapshot, [unsupportedResultReceipt]);
+    const unsupportedResultType = await createAdapter(safeRecoveryStore).resume(
+      {
+        contractVersion: "1.0",
+        decisionTaskId: "task-1",
+        agentRunId: "run-1",
+        snapshot: safePaused.snapshot,
+        effectReceipts: [unsupportedResultReceipt]
+      },
+      buildSecurityContext()
+    );
+    expect(unsupportedResultType).toMatchObject({
+      ok: false,
+      code: "RUNTIME_RESUME_DENIED",
+      recoveryPermission: {
+        decision: "MANUAL_VERIFICATION_REQUIRED",
+        reason: "EFFECT_RESULT_INVALID"
+      }
+    });
+    expect(create).toHaveBeenCalledTimes(2);
+    await safeRecoveryStore.saveRecoveryFacts(safePaused.snapshot, [committedReceipt]);
 
     const busyAdapter = createAdapter({
       ...safeRecoveryStore,
@@ -159,7 +308,7 @@ describe("AgentRuntimePort 控制与事件 seam", () => {
         decisionTaskId: "task-1",
         agentRunId: "run-1",
         snapshot: safePaused.snapshot,
-        effectReceipts: safePaused.effectReceipts
+        effectReceipts: [committedReceipt]
       },
       buildSecurityContext()
     );
@@ -181,7 +330,7 @@ describe("AgentRuntimePort 控制与事件 seam", () => {
         decisionTaskId: "task-1",
         agentRunId: "run-1",
         snapshot: safePaused.snapshot,
-        effectReceipts: safePaused.effectReceipts
+        effectReceipts: [committedReceipt]
       },
       buildSecurityContext()
     );
@@ -198,12 +347,18 @@ describe("AgentRuntimePort 控制与事件 seam", () => {
         decisionTaskId: "task-1",
         agentRunId: "run-1",
         snapshot: safePaused.snapshot,
-        effectReceipts: safePaused.effectReceipts
+        effectReceipts: [committedReceipt],
+        requirementRevision: buildCommand().requirementRevision
       },
       buildSecurityContext()
     );
 
-    expect(resumed).toMatchObject({ ok: true, changed: true, state: "COMPLETED" });
+    expect(resumed).toMatchObject({
+      ok: true,
+      changed: true,
+      state: "COMPLETED",
+      outcome: { decision: { decisionTaskId: "task-1" } }
+    });
     expect(create).toHaveBeenCalledTimes(3);
     expect(resumeRunId).toBe("coremind-run-1");
 
@@ -213,7 +368,7 @@ describe("AgentRuntimePort 控制与事件 seam", () => {
         decisionTaskId: "task-1",
         agentRunId: "run-1",
         snapshot: safePaused.snapshot,
-        effectReceipts: safePaused.effectReceipts
+        effectReceipts: [committedReceipt]
       },
       buildSecurityContext()
     );
@@ -277,7 +432,7 @@ describe("AgentRuntimePort 控制与事件 seam", () => {
     }
   });
 
-  it("同一 Adapter 的恢复尝试使用不同 controller，异常后不会伪报原尝试仍在执行", async () => {
+  it("not_started 不复用不存在结果，恢复异常后的新 controller 不伪报旧尝试", async () => {
     let creation = 0;
     vi.spyOn(CoreMindRuntime, "create").mockImplementation(async (options) => {
       creation += 1;
@@ -285,7 +440,7 @@ describe("AgentRuntimePort 控制与事件 seam", () => {
         return {
           run: async () => {
             await seedPausedRunStore(options.runStore);
-            return buildPausedCoreMindResult("committed");
+            return buildPausedCoreMindResult("not_started");
           }
         } as unknown as Awaited<ReturnType<typeof CoreMindRuntime.create>>;
       }
@@ -333,6 +488,8 @@ function createAdapter(
     RuntimeRecoveryStore,
     | "putRawSnapshot"
     | "loadRawSnapshot"
+    | "putEffectResult"
+    | "loadEffectResult"
     | "saveRecoveryFacts"
     | "loadRecoveryFacts"
     | "recordRuntimeRunning"
@@ -359,6 +516,8 @@ function createMemoryRecoveryStore(): Pick<
   RuntimeRecoveryStore,
   | "putRawSnapshot"
   | "loadRawSnapshot"
+  | "putEffectResult"
+  | "loadEffectResult"
   | "saveRecoveryFacts"
   | "loadRecoveryFacts"
   | "recordRuntimeRunning"
@@ -368,6 +527,7 @@ function createMemoryRecoveryStore(): Pick<
   | "isRuntimeCancelled"
 > {
   const objects = new Map<string, unknown>();
+  const effectResults = new Map<string, unknown>();
   const facts = new Map<string, Parameters<RuntimeRecoveryStore["saveRecoveryFacts"]>>();
   const controls = new Map<
     string,
@@ -391,6 +551,17 @@ function createMemoryRecoveryStore(): Pick<
     },
     async loadRawSnapshot(reference) {
       return objects.get(reference.objectKey);
+    },
+    async putEffectResult(identity, payload) {
+      const digest = createHash("sha256")
+        .update(canonicalize(payload), "utf8")
+        .digest("hex");
+      const objectKey = `effect-results/sha256/${digest}`;
+      effectResults.set(objectKey, payload);
+      return { algorithm: "sha256", digest, objectKey, ...identity };
+    },
+    async loadEffectResult(reference) {
+      return effectResults.get(reference.objectKey);
     },
     async saveRecoveryFacts(snapshot, effectReceipts) {
       facts.set(snapshot.snapshotId, [snapshot, effectReceipts]);
@@ -551,7 +722,8 @@ function buildSecurityContext(): AgentRuntimeSecurityContext {
 }
 
 function buildPausedCoreMindResult(
-  receiptState: "started" | "committed" = "started"
+  receiptState: "not_started" | "started" | "committed" = "started",
+  tool = "external_lookup"
 ): RunResult {
   const operation = {
     schemaVersion: 1 as const,
@@ -574,7 +746,7 @@ function buildPausedCoreMindResult(
       event: {
         type: "effect_receipt" as const,
         idempotencyKey: "provider-call-1",
-        tool: "external_lookup",
+        tool,
         status: receiptState
       }
     }
@@ -594,7 +766,7 @@ function buildPausedCoreMindResult(
         checkpointId: "coremind-checkpoint-1",
         runId: "coremind-run-1",
         timestamp: "2026-08-24T12:00:00.000Z",
-        tool: "external_lookup",
+        tool,
         reversible: false,
         snapshotFile: ".coremind/checkpoints/coremind-checkpoint-1.json"
       }

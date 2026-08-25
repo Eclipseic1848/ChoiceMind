@@ -25,6 +25,7 @@ export const persistentRuntimeControlRequestMigrationVersion =
   "0016_runtime_control_request";
 export const persistentRuntimeCancellationMigrationVersion =
   "0017_runtime_cancellation";
+export const persistentEffectResultMigrationVersion = "0018_effect_result_objects";
 
 export async function migratePersistentDecisionTasks(client: PoolClient): Promise<void> {
   await client.query("BEGIN");
@@ -615,6 +616,39 @@ export async function migratePersistentDecisionTasks(client: PoolClient): Promis
       await client.query(
         `INSERT INTO decision_task_schema_migrations (version) VALUES ($1)`,
         [persistentRuntimeCancellationMigrationVersion]
+      );
+    }
+    const effectResultMigration = await client.query<{ applied: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM decision_task_schema_migrations WHERE version = $1
+       ) AS applied`,
+      [persistentEffectResultMigrationVersion]
+    );
+    if (!effectResultMigration.rows[0]?.applied) {
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS runtime_effect_result_objects (
+          digest text PRIMARY KEY CHECK (digest ~ '^[0-9a-f]{64}$'),
+          object_key text NOT NULL UNIQUE,
+          result_payload jsonb NOT NULL,
+          created_at timestamptz NOT NULL
+        )
+      `);
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS runtime_effect_result_bindings (
+          decision_task_id text NOT NULL,
+          agent_run_id text NOT NULL,
+          checkpoint_id text NOT NULL,
+          effect_id text NOT NULL,
+          digest text NOT NULL REFERENCES runtime_effect_result_objects(digest),
+          object_key text NOT NULL,
+          created_at timestamptz NOT NULL,
+          PRIMARY KEY (decision_task_id, agent_run_id, checkpoint_id, effect_id),
+          UNIQUE (decision_task_id, agent_run_id, checkpoint_id, effect_id, digest, object_key)
+        )
+      `);
+      await client.query(
+        `INSERT INTO decision_task_schema_migrations (version) VALUES ($1)`,
+        [persistentEffectResultMigrationVersion]
       );
     }
     await client.query("COMMIT");

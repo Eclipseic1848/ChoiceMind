@@ -9,12 +9,14 @@ import {
   decodeDecisionTaskResultV1,
   decodeDecisionTaskSnapshotV1,
   decodePersistedRunEventV1,
+  decodeRuntimeControlStatusV1,
   type FailedDecisionTaskStatusV1,
   getDecisionTaskResultHttpStatusV1,
   type PersistedRunEventV1,
+  type RuntimeControlStatusV1,
   type SuccessfulDecisionTaskResultV1
 } from "@choicemind/contracts/decision/v1";
-import { type FormEvent, useCallback, useEffect, useState } from "react";
+import { type FormEvent, useCallback, useEffect, useRef, useState } from "react";
 
 const defaultRequirement = "预算不超过 8000 元，至少 32 GiB 内存和 1 TiB 存储。";
 
@@ -25,11 +27,17 @@ export function DecisionFlow() {
   const [taskId, setTaskId] = useState<string | null>(null);
   const [persistedEvents, setPersistedEvents] = useState<readonly PersistedRunEventV1[]>([]);
   const [observationError, setObservationError] = useState(false);
+  const [controlPending, setControlPending] = useState<"RESUME" | "CANCEL" | null>(null);
+  const [controlStatus, setControlStatus] = useState<RuntimeControlStatusV1 | null>(null);
+  const [controlError, setControlError] = useState<string | null>(null);
   const [connectionState, setConnectionState] = useState<"idle" | "connected" | "reconnecting">(
     "idle"
   );
+  const activeControl = useRef<
+    Readonly<{ controlRequestId: string; acceptedAt?: string }> | undefined
+  >(undefined);
 
-  const loadTask = useCallback(async (decisionTaskId: string) => {
+  const loadTask = useCallback(async (decisionTaskId: string, settleControl = false) => {
     try {
       const response = await fetch(`/api/decision-tasks/${encodeURIComponent(decisionTaskId)}`, {
         cache: "no-store"
@@ -45,6 +53,19 @@ export function DecisionFlow() {
         setSnapshot(decodedSnapshot.value);
         setResult(null);
         setObservationError(false);
+        if (decodedSnapshot.value.state.startsWith("PAUSED_")) {
+          if (settleControl) {
+            setControlPending(null);
+            setControlStatus(null);
+            activeControl.current = undefined;
+          }
+        } else {
+          setControlPending(null);
+          if (decodedSnapshot.value.state !== "RUNNING") {
+            setControlStatus(null);
+            activeControl.current = undefined;
+          }
+        }
         return;
       }
 
@@ -59,6 +80,9 @@ export function DecisionFlow() {
         setSnapshot(null);
         setResult(decodedResult.value);
         setObservationError(false);
+        setControlPending(null);
+        setControlStatus(null);
+        activeControl.current = undefined;
         return;
       }
 
@@ -128,7 +152,13 @@ export function DecisionFlow() {
 
         setPersistedEvents((current) => mergePersistedEvent(current, decoded.value));
         setConnectionState("connected");
-        void loadTask(decisionTaskId);
+        const acceptedAt = activeControl.current?.acceptedAt;
+        const eventAt = Date.parse(decoded.value.event.occurredAt);
+        const settleControl =
+          acceptedAt !== undefined &&
+          Number.isFinite(eventAt) &&
+          eventAt >= Date.parse(acceptedAt);
+        void loadTask(decisionTaskId, settleControl);
       };
       nextSource.onerror = () => {
         if (!active) {
@@ -236,6 +266,71 @@ export function DecisionFlow() {
     }
   }
 
+  async function requestRuntimeControl(action: "RESUME" | "CANCEL") {
+    if (taskId === null || snapshot === null || !("runtimeSnapshotId" in snapshot)) {
+      return;
+    }
+
+    const controlRequestId = `control-${action.toLowerCase()}-${crypto.randomUUID()}`;
+    const requestBody =
+      action === "RESUME"
+        ? {
+            contractType: "runtime-resume-request",
+            contractVersion: "1.0",
+            controlRequestId,
+            runtimeSnapshotId: snapshot.runtimeSnapshotId
+          }
+        : {
+            contractType: "runtime-cancel-request",
+            contractVersion: "1.0",
+            controlRequestId,
+            cancellationId: `cancel-${crypto.randomUUID()}`
+          };
+
+    setControlPending(action);
+    setControlStatus(null);
+    setControlError(null);
+    activeControl.current = { controlRequestId };
+    let keepPending = false;
+
+    try {
+      const response = await fetch(
+        `/api/decision-tasks/${encodeURIComponent(taskId)}/${action.toLowerCase()}`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(requestBody)
+        }
+      );
+      const responseBody: unknown = await response.json();
+      const decoded = decodeRuntimeControlStatusV1(responseBody);
+      const expectedStatus = action === "RESUME" ? 202 : 200;
+
+      if (
+        response.status !== expectedStatus ||
+        !decoded.ok ||
+        decoded.value.controlRequestId !== controlRequestId ||
+        decoded.value.decisionTaskId !== taskId ||
+        decoded.value.action !== action
+      ) {
+        throw new Error("控制响应不符合合同");
+      }
+
+      setControlStatus(decoded.value);
+      keepPending = decoded.value.state === "ACCEPTED" || decoded.value.state === "RUNNING";
+      activeControl.current = keepPending
+        ? { controlRequestId, acceptedAt: decoded.value.updatedAt }
+        : undefined;
+    } catch {
+      setControlError(action === "RESUME" ? "恢复请求状态暂时无法确认" : "取消请求状态暂时无法确认");
+    } finally {
+      if (!keepPending) {
+        setControlPending(null);
+        activeControl.current = undefined;
+      }
+    }
+  }
+
   return (
     <section aria-labelledby="decision-heading">
       <h1 id="decision-heading">智能消费决策</h1>
@@ -265,6 +360,11 @@ export function DecisionFlow() {
           connectionState={connectionState}
           events={persistedEvents}
           observationError={observationError}
+          controlError={controlError}
+          controlPending={controlPending}
+          controlStatus={controlStatus}
+          onControl={requestRuntimeControl}
+          paused={snapshot?.state.startsWith("PAUSED_") === true}
           taskId={taskId}
         />
       )}
@@ -286,6 +386,11 @@ function TaskProgress({
   connectionState,
   events,
   observationError,
+  controlError,
+  controlPending,
+  controlStatus,
+  onControl,
+  paused,
   taskId
 }: Readonly<{
   authoritativeState:
@@ -296,6 +401,11 @@ function TaskProgress({
   connectionState: "idle" | "connected" | "reconnecting";
   events: readonly PersistedRunEventV1[];
   observationError: boolean;
+  controlError: string | null;
+  controlPending: "RESUME" | "CANCEL" | null;
+  controlStatus: RuntimeControlStatusV1 | null;
+  onControl: (action: "RESUME" | "CANCEL") => Promise<void>;
+  paused: boolean;
   taskId: string;
 }>) {
   return (
@@ -304,6 +414,33 @@ function TaskProgress({
       <p>任务：{taskId}</p>
       {authoritativeState === null ? null : <p>权威状态：{authoritativeState}</p>}
       {observationError ? <p role="status">任务状态暂时无法读取</p> : null}
+      {paused ? (
+        <div>
+          <p>任务已暂停，请根据最新事件确认原因后选择恢复或取消。</p>
+          <button
+            type="button"
+            disabled={controlPending !== null}
+            onClick={() => void onControl("RESUME")}
+          >
+            {controlPending === "RESUME"
+              ? controlStatus?.state === "ACCEPTED" || controlStatus?.state === "RUNNING"
+                ? "正在恢复"
+                : "正在请求恢复"
+              : "安全恢复"}
+          </button>
+          <button
+            type="button"
+            disabled={controlPending !== null}
+            onClick={() => void onControl("CANCEL")}
+          >
+            {controlPending === "CANCEL" ? "正在取消" : "取消任务"}
+          </button>
+        </div>
+      ) : null}
+      {controlStatus === null ? null : (
+        <p role="status">{runtimeControlStatusLabel(controlStatus)}</p>
+      )}
+      {controlError === null ? null : <p role="alert">{controlError}</p>}
       <p aria-live="polite">
         {connectionState === "reconnecting"
           ? "事件连接中断，正在重连"
@@ -318,6 +455,16 @@ function TaskProgress({
       </ol>
     </section>
   );
+}
+
+function runtimeControlStatusLabel(status: RuntimeControlStatusV1): string {
+  if (status.state === "ACCEPTED" || status.state === "RUNNING") {
+    return status.action === "RESUME" ? "恢复中" : "取消中";
+  }
+  if (status.state === "COMPLETED") {
+    return status.action === "RESUME" ? "恢复完成" : "取消完成";
+  }
+  return status.action === "RESUME" ? "恢复失败" : "取消失败";
 }
 
 function mergePersistedEvent(

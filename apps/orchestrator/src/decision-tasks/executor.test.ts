@@ -1407,6 +1407,77 @@ describe("DecisionTaskExecutor.executePersistent", () => {
     });
   });
 
+  it("副作用结果需要人工核验时保持暂停并产生结构化公开事件", async () => {
+    const command = buildRuntimeBoundaryCommand("persistent-resume-manual");
+    const snapshot = {
+      contractType: "runtime-snapshot" as const,
+      contractVersion: "1.0" as const,
+      snapshotId: "snapshot-manual",
+      decisionTaskId: command.requirementRevision.decisionTaskId,
+      agentRunId: "agent-run-manual",
+      taskState: "PAUSED_PERMISSION" as const,
+      resumable: true,
+      runtimeProtocol: { name: "agent-runtime-protocol" as const, version: "1" as const },
+      rawSnapshot: {
+        algorithm: "sha256" as const,
+        digest: "c".repeat(64),
+        objectKey: `runtime-snapshots/sha256/${"c".repeat(64)}`
+      },
+      checkpoint: {
+        contractType: "checkpoint-ref" as const,
+        contractVersion: "1.0" as const,
+        checkpointId: "checkpoint-manual",
+        decisionTaskId: command.requirementRevision.decisionTaskId,
+        agentRunId: "agent-run-manual",
+        sequence: 1,
+        persistedAt: "2026-08-24T12:00:00.000Z"
+      },
+      capturedAt: "2026-08-24T12:00:00.000Z"
+    };
+    const executor = createDecisionTaskExecutor({
+      runtime: {
+        async run() {
+          throw new Error("不应调用 run");
+        },
+        async resume() {
+          return {
+            ok: false,
+            code: "RUNTIME_RESUME_DENIED" as const,
+            message: "已提交副作用的权威结果不可用",
+            recoveryPermission: {
+              contractType: "runtime-recovery-permission" as const,
+              contractVersion: "1.0" as const,
+              decisionTaskId: snapshot.decisionTaskId,
+              agentRunId: snapshot.agentRunId,
+              snapshotId: snapshot.snapshotId,
+              decision: "MANUAL_VERIFICATION_REQUIRED" as const,
+              reason: "EFFECT_RESULT_UNAVAILABLE" as const
+            }
+          };
+        }
+      }
+    });
+
+    await expect(
+      executor.resumePersistent(
+        command,
+        { snapshot, effectReceipts: [] },
+        { agentRunId: snapshot.agentRunId }
+      )
+    ).resolves.toMatchObject({
+      contractType: "runtime-paused-outcome",
+      state: "PAUSED_PERMISSION",
+      summary: "已提交副作用的权威结果不可用",
+      runEvents: [
+        {
+          eventType: "TASK_STATE_CHANGED",
+          taskState: "PAUSED_PERMISSION",
+          summary: "已提交副作用的权威结果不可用（EFFECT_RESULT_UNAVAILABLE）"
+        }
+      ]
+    });
+  });
+
   it("把 Runtime 恢复事实持久化故障保留为可重试失败", async () => {
     const executor = createDecisionTaskExecutor({
       runtime: {
