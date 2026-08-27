@@ -130,28 +130,11 @@ function Get-OrCreateLocalSecret {
 }
 
 $databasePassword = Get-OrCreateLocalSecret -Path $databasePasswordPath
-$syntheticUserToken = Get-OrCreateLocalSecret -Path (Join-Path $developmentStateDirectory 'synthetic-user-token.txt')
-$syntheticOtherUserToken = Get-OrCreateLocalSecret -Path (Join-Path $developmentStateDirectory 'synthetic-other-user-token.txt')
-$syntheticIdentities = [ordered]@{}
-$syntheticIdentities[$syntheticUserToken] = [ordered]@{
-    principalId = 'principal-local-dev-user'
-    role = 'USER'
-    userId = 'local-dev-user'
-}
-$syntheticIdentities[$syntheticOtherUserToken] = [ordered]@{
-    principalId = 'principal-local-dev-other-user'
-    role = 'USER'
-    userId = 'local-dev-other-user'
-}
 
 $env:CHOICEMIND_POSTGRES_PASSWORD = $databasePassword
 $env:CHOICEMIND_DATABASE_URL = "postgres://choicemind:$databasePassword@127.0.0.1:5432/choicemind"
 $env:CHOICEMIND_REDIS_URL = 'redis://127.0.0.1:6379'
-$env:CHOICEMIND_IDENTITY_MODE = 'synthetic'
-$env:CHOICEMIND_SYNTHETIC_USER_TOKEN = $syntheticUserToken
-$env:CHOICEMIND_SYNTHETIC_OTHER_USER_TOKEN = $syntheticOtherUserToken
-$env:CHOICEMIND_SYNTHETIC_IDENTITIES_JSON = $syntheticIdentities | ConvertTo-Json -Compress -Depth 3
-$env:CHOICEMIND_API_AUTHORIZATION = "Bearer $syntheticUserToken"
+$env:CHOICEMIND_IDENTITY_MODE = 'persistent'
 $composeFile = Join-Path $RepositoryRoot 'deploy\compose\compose.yaml'
 $developmentComposeFile = Join-Path $RepositoryRoot 'deploy\compose\compose.dev.yaml'
 $applicationPidPath = Join-Path $developmentStateDirectory "start-all-$PID.pid"
@@ -185,7 +168,7 @@ $applicationProcess = $null
 $scriptExitCode = 0
 
 try {
-    Write-Output '正在启动应用服务；日志统一显示在当前窗口，并带有 contracts/web/api/api-publisher/orchestrator/orchestrator-worker/data-worker 前缀。'
+        Write-Output '正在启动应用服务；日志统一显示在当前窗口，并带有 contracts/identity/web/api/api-publisher/identity-lifecycle/orchestrator/orchestrator-worker/data-worker 前缀。'
     $processStartInfo = [System.Diagnostics.ProcessStartInfo]::new()
     $processStartInfo.FileName = $env:ComSpec
     $processStartInfo.Arguments = '/d /c "pnpm.cmd dev"'
@@ -246,6 +229,7 @@ try {
         Write-Output "$serviceName 健康：$($healthUrls[$serviceName])"
     }
     Write-Output 'API Publisher 后台进程：运行中（由 pnpm dev 进程组监护）'
+    Write-Output 'Identity Lifecycle Worker 后台进程：运行中（由 pnpm dev 进程组监护）'
     Write-Output 'Orchestrator Worker 后台进程：运行中（由 pnpm dev 进程组监护）'
 
     $applicationProcess.WaitForExit()

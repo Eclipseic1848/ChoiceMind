@@ -32,7 +32,10 @@ export function registerDecisionTaskRoutes(
   runtimeControl: DecisionTaskRuntimeControlPort | undefined
 ) {
   app.post("/api/v1/decision-tasks:execute", async (request, reply) => {
-    const principal = await identityResolver?.resolve(request.headers.authorization);
+    const principal = await identityResolver?.resolve(
+      request.headers.authorization,
+      request.headers.cookie
+    );
 
     if (principal === undefined) {
       return sendAuthenticationRequired(reply, now);
@@ -127,7 +130,10 @@ export function registerDecisionTaskRoutes(
           );
       }
 
-      const principal = await identityResolver?.resolve(request.headers.authorization);
+      const principal = await identityResolver?.resolve(
+        request.headers.authorization,
+        request.headers.cookie
+      );
 
       if (principal === undefined) {
         return sendAuthenticationRequired(reply, now);
@@ -239,7 +245,10 @@ export function registerDecisionTaskRoutes(
 
       const decisionTaskId = request.params.decisionTaskId;
       const lastEventId = request.headers["last-event-id"];
-      const principal = await identityResolver?.resolve(request.headers.authorization);
+      const principal = await identityResolver?.resolve(
+        request.headers.authorization,
+        request.headers.cookie
+      );
 
       if (principal === undefined) {
         return sendAuthenticationRequired(reply, now);
@@ -361,7 +370,10 @@ export function registerDecisionTaskRoutes(
   app.post<{ Params: { decisionTaskId: string } }>(
     "/api/v1/decision-tasks/:decisionTaskId/resume",
     async (request, reply) => {
-      const principal = await identityResolver?.resolve(request.headers.authorization);
+      const principal = await identityResolver?.resolve(
+        request.headers.authorization,
+        request.headers.cookie
+      );
       if (principal === undefined) {
         return sendAuthenticationRequired(reply, now);
       }
@@ -419,7 +431,10 @@ export function registerDecisionTaskRoutes(
   app.post<{ Params: { decisionTaskId: string } }>(
     "/api/v1/decision-tasks/:decisionTaskId/cancel",
     async (request, reply) => {
-      const principal = await identityResolver?.resolve(request.headers.authorization);
+      const principal = await identityResolver?.resolve(
+        request.headers.authorization,
+        request.headers.cookie
+      );
       if (principal === undefined) return sendAuthenticationRequired(reply, now);
       if (runtimeControl === undefined) {
         return sendRuntimeControlError(

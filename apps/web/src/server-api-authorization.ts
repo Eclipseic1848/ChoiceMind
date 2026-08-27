@@ -1,4 +1,9 @@
-export function addChoiceMindApiAuthorization(headers: Headers): Headers {
+export function addChoiceMindApiAuthorization(headers: Headers, request?: Request): Headers {
+  const cookie = request?.headers.get("cookie");
+  if (cookie !== null && cookie !== undefined && cookie.length > 0) {
+    headers.set("Cookie", cookie);
+  }
+
   const authorization = process.env.CHOICEMIND_API_AUTHORIZATION;
 
   if (authorization === undefined || authorization.length === 0) {

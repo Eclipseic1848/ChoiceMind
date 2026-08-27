@@ -1,0 +1,13 @@
+{
+	"canonicalMap": "UX-CONTRACT.md",
+	"evidence": {
+		"crudFullFlow": "apps/web/tests/identity.spec.ts",
+		"failurePaths": "apps/web/tests/identity.spec.ts"
+	},
+	"ownership": {
+		"Select/Listbox": "native"
+	},
+	"profile": "product-admin",
+	"requiredCapabilities": ["CRUD", "Form", "Scrollbar", "Select/Listbox"],
+	"sourceRoots": ["apps/web/src/app"]
+}

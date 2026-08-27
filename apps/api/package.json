@@ -7,13 +7,19 @@
     "build": "tsc --project tsconfig.build.json",
     "dev": "tsx watch src/server.ts",
     "start": "node dist/server.js",
+    "start:identity-lifecycle": "node dist/identity-lifecycle-worker.js",
     "start:publisher": "node dist/outbox-publisher.js",
     "test": "vitest run",
     "typecheck": "tsc --project tsconfig.json"
   },
   "dependencies": {
     "@choicemind/contracts": "workspace:*",
+    "@choicemind/identity-access": "workspace:*",
     "@choicemind/task-persistence": "workspace:*",
     "fastify": "5.11.3"
+  },
+  "devDependencies": {
+    "@types/pg": "8.23.1",
+    "pg": "8.23.0"
   }
 }

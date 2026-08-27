@@ -32,12 +32,22 @@ importers:
       '@choicemind/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
+      '@choicemind/identity-access':
+        specifier: workspace:*
+        version: link:../../packages/identity-access
       '@choicemind/task-persistence':
         specifier: workspace:*
         version: link:../../packages/task-persistence
       fastify:
         specifier: 5.11.3
         version: 5.11.3
+    devDependencies:
+      '@types/pg':
+        specifier: 8.23.1
+        version: 8.23.1
+      pg:
+        specifier: 8.23.0
+        version: 8.23.0
 
   apps/orchestrator:
     dependencies:
@@ -76,15 +86,24 @@ importers:
         specifier: 19.2.8
         version: 19.2.8(react@19.2.8)
     devDependencies:
+      '@choicemind/identity-access':
+        specifier: workspace:*
+        version: link:../../packages/identity-access
       '@playwright/test':
         specifier: 1.62.1
         version: 1.62.1
+      '@types/pg':
+        specifier: 8.23.1
+        version: 8.23.1
       '@types/react':
         specifier: 19.2.18
         version: 19.2.18
       '@types/react-dom':
         specifier: 19.2.4
         version: 19.2.4(@types/react@19.2.18)
+      pg:
+        specifier: 8.23.0
+        version: 8.23.0
 
   packages/contracts:
     dependencies:
@@ -106,6 +125,16 @@ importers:
       '@choicemind/task-persistence':
         specifier: workspace:*
         version: link:../task-persistence
+
+  packages/identity-access:
+    dependencies:
+      pg:
+        specifier: 8.23.0
+        version: 8.23.0
+    devDependencies:
+      '@types/pg':
+        specifier: 8.23.1
+        version: 8.23.1
 
   packages/local-services:
     dependencies:
