@@ -94,6 +94,13 @@ export type PersistentDecisionTaskModule = Readonly<{
   requestRuntimeCancel(
     input: RuntimeCancelRequestInput
   ): Promise<RuntimeControlStatusV1 | undefined>;
+  cancelActiveTasksForOwner(
+    ownerUserId: string,
+    correlationId: string
+  ): Promise<Readonly<{ cancelled: number }>>;
+  purgePrivateDataForOwner(
+    ownerUserId: string
+  ): Promise<Readonly<{ deletedCredentials: number; deletedTasks: number }>>;
   claimNextRuntimeControl(
     workerId: string,
     leaseDurationMs: number
@@ -440,11 +447,11 @@ export async function openRuntimeRecoveryStore(
   try {
     await migratePersistentDecisionTasks(migrationClient);
   } catch (error) {
+    migrationClient.release();
     await pool.end();
     throw error;
-  } finally {
-    migrationClient.release();
   }
+  migrationClient.release();
 
   const now = options.now ?? (() => new Date());
   let closed = false;
@@ -1170,16 +1177,16 @@ export async function openPersistentDecisionTaskModule(
   try {
     await migratePersistentDecisionTasks(migrationClient);
   } catch (error) {
+    migrationClient.release();
     await pool.end();
     throw error;
-  } finally {
-    migrationClient.release();
   }
+  migrationClient.release();
 
   const now = options.now ?? (() => new Date());
   let closed = false;
 
-  return {
+  const persistentModule: PersistentDecisionTaskModule = {
     async submit(command, ownerUserId) {
       assertOpen(closed);
       let client: PoolClient | undefined;
@@ -1578,6 +1585,209 @@ export async function openPersistentDecisionTaskModule(
         throw new PersistenceUnavailableError();
       } finally {
         client?.release();
+      }
+    },
+    async cancelActiveTasksForOwner(ownerUserId, correlationId) {
+      assertOpen(closed);
+      let activeTasks: readonly { decision_task_id: string }[];
+      try {
+        const result = await pool.query<{ decision_task_id: string }>(
+          `SELECT decision_task_id
+           FROM (
+             SELECT DISTINCT ON (operation.decision_task_id)
+                    operation.decision_task_id, operation.state
+             FROM agent_run_operations AS operation
+             INNER JOIN decision_task_submissions AS submission
+               ON submission.execution_request_id = operation.execution_request_id
+             WHERE submission.owner_user_id = $1
+             ORDER BY operation.decision_task_id, operation.created_at DESC
+           ) AS latest
+           WHERE state NOT IN ('COMPLETED', 'FAILED_FINAL', 'CANCELLED')
+           ORDER BY decision_task_id`,
+          [ownerUserId]
+        );
+        activeTasks = result.rows;
+      } catch {
+        throw new PersistenceUnavailableError();
+      }
+
+      let cancelled = 0;
+      for (const task of activeTasks) {
+        try {
+          const status = await persistentModule.requestRuntimeCancel({
+            controlRequestId: `account-lifecycle-${randomUUID()}`,
+            decisionTaskId: task.decision_task_id,
+            ownerUserId,
+            cancellationId: `account-lifecycle-${randomUUID()}`,
+            correlationId
+          });
+          if (status !== undefined) cancelled += 1;
+        } catch (error) {
+          if (!(error instanceof RuntimeCancelRejectedError)) throw error;
+        }
+      }
+      return { cancelled };
+    },
+    async purgePrivateDataForOwner(ownerUserId) {
+      assertOpen(closed);
+      const client = await pool.connect();
+      let transactionStarted = false;
+      try {
+        await client.query("BEGIN");
+        transactionStarted = true;
+        const submissions = await client.query<{
+          decision_task_id: string;
+          execution_request_id: string;
+        }>(
+          `SELECT decision_task_id, execution_request_id
+           FROM decision_task_submissions
+           WHERE owner_user_id = $1
+           FOR UPDATE`,
+          [ownerUserId]
+        );
+        const taskIds = submissions.rows.map((row) => row.decision_task_id);
+        const executionRequestIds = submissions.rows.map((row) => row.execution_request_id);
+        const operations = await client.query<{
+          agent_run_id: string;
+          operation_id: string;
+        }>(
+          `SELECT operation_id::text, agent_run_id
+           FROM agent_run_operations
+           WHERE execution_request_id = ANY($1::text[])
+           FOR UPDATE`,
+          [executionRequestIds]
+        );
+        const operationIds = operations.rows.map((row) => row.operation_id);
+        const agentRunIds = operations.rows.map((row) => row.agent_run_id);
+        const snapshots = await client.query<{
+          raw_snapshot_digest: string;
+          snapshot_id: string;
+        }>(
+          `SELECT snapshot_id, raw_snapshot_digest
+           FROM runtime_recovery_facts
+           WHERE agent_run_id = ANY($1::text[])
+           FOR UPDATE`,
+          [agentRunIds]
+        );
+        const snapshotIds = snapshots.rows.map((row) => row.snapshot_id);
+        const snapshotDigests = snapshots.rows.map((row) => row.raw_snapshot_digest);
+        const effectResults = await client.query<{ digest: string }>(
+          `SELECT DISTINCT digest
+           FROM runtime_effect_result_bindings
+           WHERE agent_run_id = ANY($1::text[])`,
+          [agentRunIds]
+        );
+        const effectResultDigests = effectResults.rows.map((row) => row.digest);
+        const events = await client.query<{ cursor: string }>(
+          `SELECT cursor::text
+           FROM decision_task_run_events
+           WHERE agent_run_id = ANY($1::text[])`,
+          [agentRunIds]
+        );
+        const eventCursors = events.rows.map((row) => row.cursor);
+        const credentials = await client.query<{ credential_id: string }>(
+          `SELECT credential_id
+           FROM encrypted_credentials
+           WHERE owner_user_id = $1
+           FOR UPDATE`,
+          [ownerUserId]
+        );
+        const credentialIds = credentials.rows.map((row) => row.credential_id);
+        const pseudonym = `deleted_${createHash("sha256").update(ownerUserId).digest("hex").slice(0, 16)}`;
+        const privateObjectIds = [...taskIds, ...credentialIds];
+
+        await client.query(
+          `UPDATE audit_records
+           SET actor_principal_id = $2, actor_user_id = $2
+           WHERE actor_user_id = $1`,
+          [ownerUserId, pseudonym]
+        );
+        await client.query(
+          `UPDATE audit_records
+           SET object_id = $2
+           WHERE object_id = ANY($1::text[])`,
+          [privateObjectIds, pseudonym]
+        );
+        await client.query(
+          "DELETE FROM decision_task_run_event_notifications WHERE event_cursor = ANY($1::bigint[])",
+          [eventCursors]
+        );
+        await client.query(
+          "DELETE FROM runtime_control_requests WHERE operation_id = ANY($1::uuid[])",
+          [operationIds]
+        );
+        await client.query(
+          "DELETE FROM runtime_control_states WHERE agent_run_id = ANY($1::text[])",
+          [agentRunIds]
+        );
+        await client.query(
+          "DELETE FROM runtime_effect_receipts WHERE snapshot_id = ANY($1::text[])",
+          [snapshotIds]
+        );
+        await client.query(
+          "DELETE FROM runtime_effect_result_bindings WHERE agent_run_id = ANY($1::text[])",
+          [agentRunIds]
+        );
+        await client.query("DELETE FROM evidence_index WHERE decision_task_id = ANY($1::text[])", [
+          taskIds
+        ]);
+        await client.query(
+          "DELETE FROM decision_task_run_events WHERE agent_run_id = ANY($1::text[])",
+          [agentRunIds]
+        );
+        await client.query(
+          "DELETE FROM runtime_recovery_facts WHERE snapshot_id = ANY($1::text[])",
+          [snapshotIds]
+        );
+        await client.query(
+          "DELETE FROM decision_task_agent_runs WHERE operation_id = ANY($1::uuid[])",
+          [operationIds]
+        );
+        await client.query("DELETE FROM outbox_messages WHERE operation_id = ANY($1::uuid[])", [
+          operationIds
+        ]);
+        await client.query(
+          "DELETE FROM agent_run_operations WHERE operation_id = ANY($1::uuid[])",
+          [operationIds]
+        );
+        await client.query("DELETE FROM decision_task_submissions WHERE owner_user_id = $1", [
+          ownerUserId
+        ]);
+        await client.query(
+          `DELETE FROM runtime_effect_result_objects AS object
+           WHERE object.digest = ANY($1::text[])
+             AND NOT EXISTS (
+               SELECT 1 FROM runtime_effect_result_bindings AS binding
+               WHERE binding.digest = object.digest
+             )`,
+          [effectResultDigests]
+        );
+        await client.query(
+          `DELETE FROM runtime_snapshot_objects AS object
+           WHERE object.digest = ANY($1::text[])
+             AND NOT EXISTS (
+               SELECT 1 FROM runtime_recovery_facts AS fact
+               WHERE fact.raw_snapshot_digest = object.digest
+             )`,
+          [snapshotDigests]
+        );
+        await client.query("DELETE FROM egress_records WHERE user_id = $1", [ownerUserId]);
+        const deletedCredentials = await client.query(
+          "DELETE FROM encrypted_credentials WHERE owner_user_id = $1",
+          [ownerUserId]
+        );
+        await client.query("COMMIT");
+        transactionStarted = false;
+        return {
+          deletedCredentials: deletedCredentials.rowCount ?? 0,
+          deletedTasks: submissions.rowCount ?? 0
+        };
+      } catch (error) {
+        if (transactionStarted) await client.query("ROLLBACK");
+        if (error instanceof PersistenceUnavailableError) throw error;
+        throw new PersistenceUnavailableError();
+      } finally {
+        client.release();
       }
     },
     async claimNextRuntimeControl(workerId, leaseDurationMs) {
@@ -2335,6 +2545,7 @@ export async function openPersistentDecisionTaskModule(
       await pool.end();
     }
   };
+  return persistentModule;
 }
 
 export async function openPersistentDecisionTaskWorker(

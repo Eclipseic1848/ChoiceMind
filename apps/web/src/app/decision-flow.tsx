@@ -335,9 +335,10 @@ export function DecisionFlow() {
     <section aria-labelledby="decision-heading">
       <h1 id="decision-heading">智能消费决策</h1>
       <p>使用固定合成候选验证 ChoiceMind 的决策合同，不访问真实商品或价格。</p>
-      <form onSubmit={submit}>
+      <form noValidate onSubmit={submit}>
         <label htmlFor="requirement">合成消费需求</label>
         <textarea
+          className="resize-none"
           id="requirement"
           name="requirement"
           rows={4}

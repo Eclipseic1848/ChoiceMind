@@ -11,6 +11,61 @@ const repositoryRoot = resolve(
 	"../..",
 );
 describe("start_all.bat", () => {
+	test("本地开发使用持久身份并监听 Identity 包源码", () => {
+		const startScript = readFileSync(
+			resolve(repositoryRoot, "scripts/start-all/start-all.ps1"),
+			"utf8",
+		);
+		const rootManifest = JSON.parse(
+			readFileSync(resolve(repositoryRoot, "package.json"), "utf8"),
+		) as { scripts: { dev: string; predev: string } };
+		const identityManifest = JSON.parse(
+			readFileSync(
+				resolve(repositoryRoot, "packages/identity-access/package.json"),
+				"utf8",
+			),
+		) as { scripts: Record<string, string> };
+		const apiManifest = JSON.parse(
+			readFileSync(resolve(repositoryRoot, "apps/api/package.json"), "utf8"),
+		) as { scripts: Record<string, string> };
+		const compose = readFileSync(
+			resolve(repositoryRoot, "deploy/compose/compose.yaml"),
+			"utf8",
+		);
+
+		expect(startScript).toContain("CHOICEMIND_IDENTITY_MODE = 'persistent'");
+		expect(startScript).not.toContain("CHOICEMIND_SYNTHETIC_IDENTITIES_JSON");
+		expect(rootManifest.scripts.predev).toContain(
+			"@choicemind/identity-access build",
+		);
+		expect(rootManifest.scripts.dev).toContain(
+			"@choicemind/identity-access dev",
+		);
+		expect(rootManifest.scripts.dev).toContain(
+			"src/identity-lifecycle-worker.ts",
+		);
+		expect(identityManifest.scripts.dev).toContain("--watch");
+		expect(apiManifest.scripts["start:identity-lifecycle"]).toContain(
+			"identity-lifecycle-worker.js",
+		);
+		const lifecycleWorker = readFileSync(
+			resolve(repositoryRoot, "apps/api/src/identity-lifecycle-worker.ts"),
+			"utf8",
+		);
+		expect(lifecycleWorker).toContain(
+			"const identityAccess = await openPostgresIdentityAccess",
+		);
+		expect(
+			lifecycleWorker.indexOf(
+				"const identityAccess = await openPostgresIdentityAccess",
+			),
+		).toBeLessThan(
+			lifecycleWorker.indexOf(
+				"const worker = await openPostgresIdentityLifecycleWorker",
+			),
+		);
+		expect(compose).toContain("identity-lifecycle-worker:");
+	});
 	test("主启动进程意外消失后清理守护进程会停止基础容器", () => {
 		const windowsRoot = process.env.SystemRoot ?? "C:\\Windows";
 		const commandDirectory = mkdtempSync(
@@ -401,8 +456,7 @@ describe("start_all.bat", () => {
 			resolve(commandDirectory, "docker.cmd"),
 			[
 				"@echo off",
-				'if "%1"=="compose" if not "%2"=="version" if not defined CHOICEMIND_SYNTHETIC_USER_TOKEN exit /b 29',
-				'if "%1"=="compose" if not "%2"=="version" if not defined CHOICEMIND_SYNTHETIC_OTHER_USER_TOKEN exit /b 29',
+				'if "%1"=="compose" if not "%2"=="version" if not "%CHOICEMIND_IDENTITY_MODE%"=="persistent" exit /b 29',
 				"exit /b 0",
 			].join("\r\n"),
 			"utf8",
@@ -563,6 +617,7 @@ describe("start_all.bat", () => {
 
 			expect(result.status).toBe(0);
 			expect(output).toContain("ChoiceMind Alpha 已启动，前端开发热更新已启用");
+			expect(output).toContain("Identity Lifecycle Worker 后台进程：运行中");
 			expect(output).toContain("Web 健康：http://127.0.0.1:3000/health/live");
 			expect(output).toContain("API Publisher 后台进程：运行中");
 			expect(output).toContain("Orchestrator Worker 后台进程：运行中");

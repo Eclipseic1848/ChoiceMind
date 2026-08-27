@@ -21,6 +21,7 @@ const sseRecoveryRunId = "agent-run-web-sse-recovery";
 const sseRecoveryTaskId = "task-web-sse-recovery";
 let sseRecoveryCursors: Array<string | null> = [];
 let decisionAuthorizationHeaders: Array<string | undefined> = [];
+let decisionCookieHeaders: Array<string | undefined> = [];
 let runtimeControlRequests: Array<{
   authorization: string | undefined;
   body: Record<string, unknown>;
@@ -35,6 +36,7 @@ test.beforeEach(() => {
   decisionResponseFactory = buildSyntheticDecisionResult;
   sseRecoveryCursors = [];
   decisionAuthorizationHeaders = [];
+  decisionCookieHeaders = [];
   runtimeControlRequests = [];
 });
 
@@ -59,6 +61,7 @@ test.beforeAll(async () => {
 
     if (request.url?.startsWith("/api/v1/decision-tasks")) {
       decisionAuthorizationHeaders.push(request.headers.authorization);
+      decisionCookieHeaders.push(request.headers.cookie);
     }
 
     if (request.url === "/api/v1/system/health") {
@@ -73,6 +76,18 @@ test.beforeAll(async () => {
             { service: "data-worker", status: "healthy", latencyMs: 9 }
           ],
           status: "healthy"
+        })
+      );
+      return;
+    }
+
+    if (request.url === "/api/v1/identity/me" && request.method === "GET") {
+      response.setHeader("content-type", "application/json; charset=utf-8");
+      response.end(
+        JSON.stringify({
+          access: "FULL",
+          account: { accountId: "account-web-test", role: "USER", username: "web-test" },
+          authenticated: true
         })
       );
       return;
@@ -213,6 +228,22 @@ test("forwards the server-owned synthetic authorization to the API", async ({ pa
   await page.getByRole("button", { name: "运行合成决策" }).click();
 
   await expect.poll(() => decisionAuthorizationHeaders[0]).toBe("Bearer web-test-token");
+});
+
+test("forwards the browser session Cookie to decision APIs", async ({ page, context }) => {
+  await context.addCookies([
+    {
+      name: "choicemind_session",
+      value: "browser-session-cookie",
+      url: "http://127.0.0.1:3000"
+    }
+  ]);
+  await page.goto("/");
+  await page.getByRole("button", { name: "运行合成决策" }).click();
+
+  await expect.poll(() => decisionCookieHeaders[0]).toContain(
+    "choicemind_session=browser-session-cookie"
+  );
 });
 
 test("stores the accepted task in the URL and restores persisted events after refresh", async ({
@@ -982,6 +1013,17 @@ test("returns a versioned contract error for malformed decision JSON", async ({ 
 });
 
 test("shows an explicit failure when the API cannot be reached", async ({ page }) => {
+  await page.route("**/api/identity/me", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json; charset=utf-8",
+      body: JSON.stringify({
+        access: "FULL",
+        account: { accountId: "account-web-test", role: "USER", username: "web-test" },
+        authenticated: true
+      })
+    });
+  });
   await closeApiServer();
 
   await page.goto("/");

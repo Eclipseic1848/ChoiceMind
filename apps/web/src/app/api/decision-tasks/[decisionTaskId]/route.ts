@@ -11,7 +11,7 @@ type RouteContext = Readonly<{
   params: Promise<Readonly<{ decisionTaskId: string }>>;
 }>;
 
-export async function GET(_request: Request, context: RouteContext) {
+export async function GET(request: Request, context: RouteContext) {
   const { decisionTaskId } = await context.params;
   const apiUrl = process.env.CHOICEMIND_API_URL ?? "http://127.0.0.1:3100";
 
@@ -20,7 +20,7 @@ export async function GET(_request: Request, context: RouteContext) {
       `${apiUrl}/api/v1/decision-tasks/${encodeURIComponent(decisionTaskId)}`,
       {
         cache: "no-store",
-        headers: addChoiceMindApiAuthorization(new Headers()),
+        headers: addChoiceMindApiAuthorization(new Headers(), request),
         signal: AbortSignal.timeout(15_000)
       }
     );

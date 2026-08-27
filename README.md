@@ -106,7 +106,7 @@ start_all.bat
 
 脚本会检查仓库声明的 Node.js/pnpm 版本、uv、Docker Engine/Compose、已安装依赖和固定端口，然后启动 PostgreSQL、Redis 以及现有 `pnpm dev` 全部应用服务。所有应用日志保留在同一窗口并带服务名前缀；修改 Web 源码后由 Next.js 开发服务器热更新。按 `Ctrl+C` 会终止脚本创建的应用进程树并停止本次基础容器，PostgreSQL 与 Redis 命名数据卷不会删除。
 
-本地数据库密码与两套合成用户令牌首次启动时随机生成，只保存在当前 Windows 用户的 `%LOCALAPPDATA%\ChoiceMind\development`，不会写入仓库或输出到终端。依赖或端口不满足时，脚本会用中文指出具体修复动作并返回失败。只做启动前检查而不启动服务，可执行 `start_all.bat --preflight-only`。
+本地数据库密码首次启动时随机生成，只保存在当前 Windows 用户的 `%LOCALAPPDATA%\ChoiceMind\development`，不会写入仓库或输出到终端。首次打开前端后，按照页面提示创建第一个 SUPERADMIN；后续账号与登录状态持久保存在本地 PostgreSQL。依赖或端口不满足时，脚本会用中文指出具体修复动作并返回失败。只做启动前检查而不启动服务，可执行 `start_all.bat --preflight-only`。
 
 启动后可访问：
 

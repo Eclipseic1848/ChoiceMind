@@ -1,4 +1,5 @@
 import Fastify from "fastify";
+import type { IdentityAccess } from "@choicemind/identity-access";
 import {
   createContractRejectedDecisionTaskResultV1,
   getDecisionTaskResultHttpStatusV1
@@ -8,8 +9,10 @@ import type { DecisionTaskEventNotificationsPort } from "./decision-tasks/event-
 import type { DecisionTaskPersistencePort } from "./decision-tasks/persistence-port.js";
 import type { DecisionTaskRuntimeControlPort } from "./decision-tasks/runtime-control-port.js";
 import { registerDecisionTaskRoutes } from "./decision-tasks/routes.js";
+import { registerIdentityAccessRoutes } from "./identity-access/routes.js";
 import type { AuditLogPort } from "./security/audit.js";
 import type { IdentityResolver } from "./security/identity.js";
+import { createPersistentIdentityResolver } from "./security/identity.js";
 
 type DependencyService = "web" | "orchestrator" | "data-worker";
 
@@ -28,6 +31,7 @@ export type ApiAppOptions = {
   decisionTaskRuntimeControl?: DecisionTaskRuntimeControlPort;
   healthUrls?: Record<DependencyService, string>;
   identityResolver?: IdentityResolver;
+  identityAccess?: IdentityAccess;
   now?: () => Date;
   probe?: (service: DependencyService) => Promise<ComponentHealth>;
 };
@@ -59,6 +63,11 @@ async function probeHealth(service: DependencyService, url: string): Promise<Com
 
 export function buildApiApp(options: ApiAppOptions = {}) {
   const app = Fastify({ logger: false });
+  const identityResolver =
+    options.identityResolver ??
+    (options.identityAccess === undefined
+      ? undefined
+      : createPersistentIdentityResolver(options.identityAccess));
 
   app.setErrorHandler((error, _request, reply) => {
     if (
@@ -122,13 +131,15 @@ export function buildApiApp(options: ApiAppOptions = {}) {
     });
   });
 
+  registerIdentityAccessRoutes(app, options.identityAccess);
+
   registerDecisionTaskRoutes(
     app,
     options.decisionTaskPersistence,
     options.now ?? (() => new Date()),
     options.decisionTaskEventNotifications,
     options.decisionTaskEventPollIntervalMs ?? 1_000,
-    options.identityResolver,
+    identityResolver,
     options.auditLog,
     options.decisionTaskRuntimeControl
   );

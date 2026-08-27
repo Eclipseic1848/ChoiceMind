@@ -45,7 +45,8 @@ export async function POST(request: Request) {
     const response = await fetch(`${apiUrl}/api/v1/decision-tasks:execute`, {
       method: "POST",
       headers: addChoiceMindApiAuthorization(
-        new Headers({ "content-type": "application/json" })
+        new Headers({ "content-type": "application/json" }),
+        request
       ),
       body: JSON.stringify(decodedCommand.value),
       cache: "no-store",

@@ -2,20 +2,23 @@ import {
   openPersistentDecisionTaskModule,
   openRunEventNotificationSubscriber
 } from "@choicemind/task-persistence";
+import { openPostgresIdentityAccess } from "@choicemind/identity-access";
 
 import { buildApiApp } from "./app.js";
 import {
+  createPersistentIdentityResolver,
   createSyntheticIdentityResolverFromJson,
   type IdentityResolver
 } from "./security/identity.js";
 
 const databaseUrl = process.env.CHOICEMIND_DATABASE_URL;
-const identityResolver = loadIdentityResolver();
 
 if (databaseUrl === undefined || databaseUrl.length === 0) {
   throw new Error("CHOICEMIND_DATABASE_URL 必须指向 ChoiceMind Postgres");
 }
 
+const identityAccess = await openPostgresIdentityAccess({ databaseUrl });
+const identityResolver = loadIdentityResolver(identityAccess);
 const decisionTaskPersistence = await openPersistentDecisionTaskModule({ databaseUrl });
 const redisUrl = process.env.CHOICEMIND_REDIS_URL;
 let decisionTaskEventNotifications:
@@ -63,11 +66,16 @@ const app = buildApiApp({
     orchestrator: process.env.ORCHESTRATOR_HEALTH_URL ?? "http://127.0.0.1:3200/health/live",
     web: process.env.WEB_HEALTH_URL ?? "http://127.0.0.1:3000/health/live"
   },
+  identityAccess,
   ...(identityResolver === undefined ? {} : { identityResolver })
 });
 
 app.addHook("onClose", async () => {
-  await Promise.all([decisionTaskPersistence.close(), decisionTaskEventNotifications?.close()]);
+  await Promise.all([
+    decisionTaskPersistence.close(),
+    decisionTaskEventNotifications?.close(),
+    identityAccess.close()
+  ]);
 });
 
 const port = Number(process.env.PORT ?? 3100);
@@ -75,11 +83,13 @@ const host = process.env.HOST ?? "127.0.0.1";
 
 await app.listen({ host, port });
 
-function loadIdentityResolver(): IdentityResolver | undefined {
+function loadIdentityResolver(
+  persistentIdentity: Parameters<typeof createPersistentIdentityResolver>[0]
+): IdentityResolver | undefined {
   const mode = process.env.CHOICEMIND_IDENTITY_MODE;
 
-  if (mode === undefined || mode.length === 0) {
-    return undefined;
+  if (mode === undefined || mode.length === 0 || mode === "persistent") {
+    return createPersistentIdentityResolver(persistentIdentity);
   }
 
   if (mode !== "synthetic") {

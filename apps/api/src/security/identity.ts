@@ -1,3 +1,8 @@
+import type {
+  GetCurrentSessionQuery,
+  GetCurrentSessionResult
+} from "@choicemind/identity-access";
+
 export type PrincipalRole = "USER" | "ADMIN" | "SUPERADMIN";
 
 export type AuthenticatedPrincipal = Readonly<{
@@ -7,7 +12,31 @@ export type AuthenticatedPrincipal = Readonly<{
 }>;
 
 export interface IdentityResolver {
-  resolve(authorization: string | undefined): Promise<AuthenticatedPrincipal | undefined>;
+  resolve(
+    authorization: string | undefined,
+    cookie?: string
+  ): Promise<AuthenticatedPrincipal | undefined>;
+}
+
+export interface CurrentSessionReader {
+  read(query: GetCurrentSessionQuery): Promise<GetCurrentSessionResult>;
+}
+
+export function createPersistentIdentityResolver(
+  identityAccess: CurrentSessionReader
+): IdentityResolver {
+  return {
+    async resolve(authorization, cookie) {
+      const sessionToken = getSessionToken(authorization, cookie);
+
+      if (sessionToken === undefined) {
+        return undefined;
+      }
+
+      const result = await identityAccess.read({ type: "GET_CURRENT_SESSION", sessionToken });
+      return result.authenticated && result.access === "FULL" ? result.principal : undefined;
+    }
+  };
 }
 
 export function createSyntheticIdentityResolver(
@@ -65,4 +94,34 @@ function isAuthenticatedPrincipal(value: unknown): value is AuthenticatedPrincip
     "role" in value &&
     (value.role === "USER" || value.role === "ADMIN" || value.role === "SUPERADMIN")
   );
+}
+
+function getSessionToken(
+  authorization: string | undefined,
+  cookie: string | undefined
+): string | undefined {
+  if (authorization?.startsWith("Bearer ")) {
+    const token = authorization.slice("Bearer ".length);
+
+    if (token.length > 0 && token.trim() === token) {
+      return token;
+    }
+  }
+
+  if (cookie === undefined) {
+    return undefined;
+  }
+
+  for (const part of cookie.split(";")) {
+    const separator = part.indexOf("=");
+
+    if (separator < 0 || part.slice(0, separator).trim() !== "choicemind_session") {
+      continue;
+    }
+
+    const value = part.slice(separator + 1).trim();
+    return value.length === 0 ? undefined : decodeURIComponent(value);
+  }
+
+  return undefined;
 }

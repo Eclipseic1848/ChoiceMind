@@ -26,7 +26,8 @@ export async function POST(request: Request, context: RouteContext) {
 
   const apiUrl = process.env.CHOICEMIND_API_URL ?? "http://127.0.0.1:3100";
   const headers = addChoiceMindApiAuthorization(
-    new Headers({ "content-type": "application/json" })
+    new Headers({ "content-type": "application/json" }),
+    request
   );
 
   try {

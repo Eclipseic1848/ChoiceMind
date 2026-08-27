@@ -22,6 +22,7 @@ export default async function HomePage() {
   const health = await loadSystemHealth();
 
   return (
+    <IdentityGate>
     <main>
       <p>ChoiceMind 星枢智购</p>
       <DecisionFlow />
@@ -43,6 +44,7 @@ export default async function HomePage() {
         </>
       )}
     </main>
+    </IdentityGate>
   );
 }
 
@@ -51,10 +53,19 @@ async function loadSystemHealth(): Promise<SystemHealth | null> {
 
   try {
     const response = await fetch(`${apiUrl}/api/v1/system/health`, { cache: "no-store" });
-
-    return (await response.json()) as SystemHealth;
+    if (!response.ok) return null;
+    const result = (await response.json()) as Partial<SystemHealth>;
+    if (
+      (result.status !== "healthy" && result.status !== "unhealthy") ||
+      typeof result.checkedAt !== "string" ||
+      !Array.isArray(result.components)
+    ) {
+      return null;
+    }
+    return result as SystemHealth;
   } catch {
     return null;
   }
 }
 import { DecisionFlow } from "./decision-flow";
+import { IdentityGate } from "./identity-gate";
