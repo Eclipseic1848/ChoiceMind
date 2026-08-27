@@ -1,12 +1,12 @@
 "use client";
 
 import {
+	type DecisionTaskResultV1,
+	type DecisionTaskSnapshotV1,
 	decodeDecisionTaskResultV1,
 	decodeDecisionTaskSnapshotV1,
 	decodePersistedRunEventV1,
 	decodeRuntimeControlStatusV1,
-	type DecisionTaskResultV1,
-	type DecisionTaskSnapshotV1,
 	type PersistedRunEventV1,
 	type RetryModeV1,
 	type RuntimeControlStatusV1,
@@ -34,6 +34,15 @@ export function ConversationTaskProgress({
 	const activeControl = useRef<
 		Readonly<{ controlRequestId: string; acceptedAt?: string }> | undefined
 	>(undefined);
+	const controlAttempt = useRef<
+		| Readonly<{
+				action: "RESUME" | "CANCEL";
+				controlRequestId: string;
+				requestBody: Readonly<Record<string, string>>;
+				runtimeSnapshotId: string;
+		  }>
+		| undefined
+	>(undefined);
 
 	const loadTask = useCallback(
 		async (settleControl = false) => {
@@ -52,13 +61,11 @@ export function ConversationTaskProgress({
 					setSnapshot(decodedSnapshot.value);
 					setResult(null);
 					setObservationError(false);
-					if (
-						settleControl &&
-						!decodedSnapshot.value.state.startsWith("PAUSED_")
-					) {
+					if (settleControl) {
 						setControlPending(null);
 						setControlStatus(null);
 						activeControl.current = undefined;
+						controlAttempt.current = undefined;
 					}
 					return;
 				}
@@ -75,6 +82,7 @@ export function ConversationTaskProgress({
 					setControlPending(null);
 					setControlStatus(null);
 					activeControl.current = undefined;
+					controlAttempt.current = undefined;
 					return;
 				}
 				throw new Error("任务响应不符合合同");
@@ -154,21 +162,14 @@ export function ConversationTaskProgress({
 
 	async function requestControl(action: "RESUME" | "CANCEL") {
 		if (snapshot === null || !("runtimeSnapshotId" in snapshot)) return;
-		const controlRequestId = `control-${action.toLowerCase()}-${crypto.randomUUID()}`;
-		const requestBody =
-			action === "RESUME"
-				? {
-						contractType: "runtime-resume-request",
-						contractVersion: "1.0",
-						controlRequestId,
-						runtimeSnapshotId: snapshot.runtimeSnapshotId,
-					}
-				: {
-						contractType: "runtime-cancel-request",
-						contractVersion: "1.0",
-						controlRequestId,
-						cancellationId: `cancel-${crypto.randomUUID()}`,
-					};
+		const previousAttempt = controlAttempt.current;
+		const attempt =
+			previousAttempt?.action === action &&
+			previousAttempt.runtimeSnapshotId === snapshot.runtimeSnapshotId
+				? previousAttempt
+				: createControlAttempt(action, snapshot.runtimeSnapshotId);
+		controlAttempt.current = attempt;
+		const { controlRequestId, requestBody } = attempt;
 		setControlPending(action);
 		setControlStatus(null);
 		setControlError(null);
@@ -202,6 +203,7 @@ export function ConversationTaskProgress({
 			activeControl.current = keepPending
 				? { controlRequestId, acceptedAt: decoded.value.updatedAt }
 				: undefined;
+			if (!keepPending) controlAttempt.current = undefined;
 		} catch {
 			setControlError(
 				action === "RESUME"
@@ -247,6 +249,32 @@ export function ConversationTaskProgress({
 			) : null}
 		</>
 	);
+}
+
+function createControlAttempt(
+	action: "RESUME" | "CANCEL",
+	runtimeSnapshotId: string,
+) {
+	const controlRequestId = `control-${action.toLowerCase()}-${crypto.randomUUID()}`;
+	return {
+		action,
+		controlRequestId,
+		requestBody:
+			action === "RESUME"
+				? {
+						contractType: "runtime-resume-request",
+						contractVersion: "1.0",
+						controlRequestId,
+						runtimeSnapshotId,
+					}
+				: {
+						contractType: "runtime-cancel-request",
+						contractVersion: "1.0",
+						controlRequestId,
+						cancellationId: `cancel-${crypto.randomUUID()}`,
+					},
+		runtimeSnapshotId,
+	} as const;
 }
 
 function failureNextStep(retryMode: RetryModeV1): string {

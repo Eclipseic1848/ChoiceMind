@@ -199,7 +199,7 @@ test("在 Session 中恢复权威任务事件并执行暂停控制", async ({ pa
 		},
 	];
 	let resumeBody: Record<string, unknown> | undefined;
-	let taskState: "PAUSED_PERMISSION" | "RUNNING" = "PAUSED_PERMISSION";
+	let taskState: "PAUSED_PERMISSION" | "PAUSED_LIMIT" = "PAUSED_PERMISSION";
 	await page.route(/\/api\/conversations(?:\/.*)?$/, async (route) => {
 		const path = new URL(route.request().url()).pathname;
 		await json(
@@ -212,7 +212,7 @@ test("在 Session 中恢复权威任务事件并执行暂停控制", async ({ pa
 		"**/api/decision-tasks/task-conversation-web/resume",
 		async (route) => {
 			resumeBody = route.request().postDataJSON() as Record<string, unknown>;
-			taskState = "RUNNING";
+			taskState = "PAUSED_LIMIT";
 			await json(route, 202, {
 				contractType: "runtime-control-status",
 				contractVersion: "1.0",
@@ -236,9 +236,10 @@ test("在 Session 中恢复权威任务事件并执行暂停控制", async ({ pa
 				agentRunId: "run-conversation-web",
 				state: taskState,
 				terminal: false,
-				...(taskState === "PAUSED_PERMISSION"
-					? { runtimeSnapshotId: "snapshot-conversation-web" }
-					: {}),
+				runtimeSnapshotId:
+					taskState === "PAUSED_PERMISSION"
+						? "snapshot-conversation-web"
+						: "snapshot-conversation-web-after-resume",
 				updatedAt: "2026-08-27T23:10:00.000Z",
 			});
 		},
@@ -277,15 +278,91 @@ test("在 Session 中恢复权威任务事件并执行暂停控制", async ({ pa
 				sequence: 1,
 				occurredAt: "2026-08-27T23:10:03.000Z",
 				eventType: "TASK_STATE_CHANGED",
-				taskState: "UNDERSTANDING",
-				summary: "已安全恢复研究任务",
+				taskState: "PAUSED_LIMIT",
+				summary: "恢复后因额度限制再次暂停",
 				synthetic: true,
 			},
 		}),
 	);
-	await expect(page.getByText("已安全恢复研究任务")).toBeVisible();
-	await expect(page.getByText("权威状态：RUNNING")).toBeVisible();
+	await expect(page.getByText("恢复后因额度限制再次暂停")).toBeVisible();
+	await expect(page.getByText("权威状态：PAUSED_LIMIT")).toBeVisible();
 	await expect(page.getByText("恢复中")).not.toBeVisible();
+	await expect(page.getByRole("button", { name: "安全恢复" })).toBeVisible();
+});
+
+test("控制响应丢失后重试复用控制与取消请求 ID", async ({ page }) => {
+	const session = buildSession();
+	session.decisionTasks = [
+		{
+			decisionTaskId: "task-control-retry",
+			linkedAt: "2026-08-27T23:10:00.000Z",
+		},
+	];
+	const cancellationBodies: Array<{
+		cancellationId: string;
+		controlRequestId: string;
+	}> = [];
+	await page.route(/\/api\/conversations(?:\/.*)?$/, async (route) => {
+		const path = new URL(route.request().url()).pathname;
+		await json(
+			route,
+			200,
+			path === "/api/conversations" ? [summary(session)] : session,
+		);
+	});
+	await page.route(
+		"**/api/decision-tasks/task-control-retry/events*",
+		async (route) => {
+			await route.fulfill({
+				status: 200,
+				contentType: "text/event-stream",
+				body: "",
+			});
+		},
+	);
+	await page.route(
+		"**/api/decision-tasks/task-control-retry/cancel",
+		async (route) => {
+			const body = route.request().postDataJSON() as {
+				cancellationId: string;
+				controlRequestId: string;
+			};
+			cancellationBodies.push(body);
+			if (cancellationBodies.length === 1) {
+				await json(route, 503, { error: { code: "UNAVAILABLE" } });
+				return;
+			}
+			await json(route, 200, {
+				contractType: "runtime-control-status",
+				contractVersion: "1.0",
+				controlRequestId: body.controlRequestId,
+				decisionTaskId: "task-control-retry",
+				agentRunId: "run-task-control-retry",
+				action: "CANCEL",
+				state: "COMPLETED",
+				updatedAt: "2026-08-27T23:10:02.000Z",
+			});
+		},
+	);
+	await page.route(
+		"**/api/decision-tasks/task-control-retry",
+		async (route) => {
+			await json(
+				route,
+				200,
+				buildTaskSnapshot("task-control-retry", "PAUSED_PERMISSION"),
+			);
+		},
+	);
+
+	await page.goto("/?session=session-web-1");
+	await page.getByRole("button", { name: "取消任务" }).click();
+	await expect(page.getByText("取消请求状态暂时无法确认")).toBeVisible();
+	await page.getByRole("button", { name: "取消任务" }).click();
+	await expect(page.getByText("取消完成")).toBeVisible();
+
+	expect(cancellationBodies).toHaveLength(2);
+	expect(cancellationBodies[1]).toEqual(cancellationBodies[0]);
 });
 
 test("在产品壳中明确显示后台任务失败原因", async ({ page }) => {
@@ -423,6 +500,39 @@ test("切换 Session 时不复用上一项任务的暂停控制状态", async ({
 		page.getByRole("button", { name: "安全恢复" }),
 	).not.toBeVisible();
 	await expect(page.getByText("权威状态：RUNNING")).toBeVisible();
+});
+
+test("快速切换 Session 时较慢的旧响应不会覆盖最后选择", async ({ page }) => {
+	const first = buildSession();
+	first.title = "第一项决策";
+	const second = buildSession();
+	second.sessionId = "session-web-2";
+	second.title = "第二项决策";
+	let firstReads = 0;
+	await page.route(/\/api\/conversations(?:\/.*)?$/, async (route) => {
+		const path = new URL(route.request().url()).pathname;
+		if (path === "/api/conversations") {
+			await json(route, 200, [summary(first), summary(second)]);
+			return;
+		}
+		if (path.endsWith(second.sessionId)) {
+			await new Promise((resolve) => setTimeout(resolve, 300));
+			await json(route, 200, second);
+			return;
+		}
+		firstReads += 1;
+		if (firstReads > 1) await new Promise((resolve) => setTimeout(resolve, 20));
+		await json(route, 200, first);
+	});
+
+	await page.goto(`/?session=${first.sessionId}`);
+	await expect(page.getByRole("heading", { name: "第一项决策" })).toBeVisible();
+	await page.getByRole("button", { name: /第二项决策/ }).click();
+	await page.getByRole("button", { name: /第一项决策/ }).click();
+	await page.waitForTimeout(500);
+
+	await expect(page.getByRole("heading", { name: "第一项决策" })).toBeVisible();
+	await expect(page).toHaveURL(new RegExp(`session=${first.sessionId}$`));
 });
 
 function buildSession() {

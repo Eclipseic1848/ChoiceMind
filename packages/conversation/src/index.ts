@@ -455,7 +455,10 @@ async function appendUserTurn(
 
 		const previous = await loadLatestRequirement(client, command.sessionId);
 		const nextRequirement = mergeRequirement(previous, normalizedUpdate);
-		if (Object.keys(normalizedUpdate).length > 0) {
+		if (
+			Object.keys(normalizedUpdate).length > 0 &&
+			requirementChanged(previous, nextRequirement)
+		) {
 			const revisionId = randomUUID();
 			const revisionNumber = (previous?.revisionNumber ?? 0) + 1;
 			await client.query(
@@ -784,6 +787,31 @@ function mergeRequirement(
 		readiness:
 			missingKeys.length === 0 ? "READY_FOR_RESEARCH" : "NEEDS_CLARIFICATION",
 	};
+}
+
+function requirementChanged(
+	previous: RequirementRevision | null,
+	next: ReturnType<typeof mergeRequirement>,
+): boolean {
+	return (
+		previous === null ||
+		previous.consumptionGoal !== next.consumptionGoal ||
+		previous.primaryScenario !== next.primaryScenario ||
+		!sameStrings(previous.hardConstraints, next.hardConstraints)
+	);
+}
+
+function sameStrings(
+	left: readonly string[] | null,
+	right: readonly string[] | null,
+): boolean {
+	return (
+		left === right ||
+		(left !== null &&
+			right !== null &&
+			left.length === right.length &&
+			left.every((value, index) => value === right[index]))
+	);
 }
 
 function clarificationMessage(

@@ -60,6 +60,7 @@ export function ConversationWorkbench({
 		useState<RequirementMissingKey>();
 	const [error, setError] = useState<string>();
 	const createRequestIdRef = useRef<string | undefined>(undefined);
+	const sessionRequestSequenceRef = useRef(0);
 	const turnAttemptRef = useRef<
 		| Readonly<{
 				clientTurnId: string;
@@ -77,6 +78,7 @@ export function ConversationWorkbench({
 
 	useEffect(() => {
 		let active = true;
+		const requestSequence = ++sessionRequestSequenceRef.current;
 		void (async () => {
 			try {
 				const response = await fetch("/api/conversations", {
@@ -84,7 +86,8 @@ export function ConversationWorkbench({
 				});
 				if (!response.ok) throw new Error("会话列表暂时无法读取");
 				const nextSummaries = (await response.json()) as SessionSummary[];
-				if (!active) return;
+				if (!active || sessionRequestSequenceRef.current !== requestSequence)
+					return;
 				setSummaries(nextSummaries);
 				const sessionId = requestedSessionId ?? nextSummaries[0]?.sessionId;
 				if (sessionId === undefined) {
@@ -97,17 +100,19 @@ export function ConversationWorkbench({
 				});
 				if (!sessionResponse.ok) throw new Error("当前会话暂时无法读取");
 				const restored = (await sessionResponse.json()) as ConversationSession;
-				if (!active) return;
+				if (!active || sessionRequestSequenceRef.current !== requestSequence)
+					return;
 				setSession(restored);
 				if (requestedSessionId === null)
 					router.replace(`/?session=${restored.sessionId}`);
 			} catch (cause) {
-				if (active)
+				if (active && sessionRequestSequenceRef.current === requestSequence)
 					setError(
 						cause instanceof Error ? cause.message : "会话服务暂时不可用",
 					);
 			} finally {
-				if (active) setLoading(false);
+				if (active && sessionRequestSequenceRef.current === requestSequence)
+					setLoading(false);
 			}
 		})();
 		return () => {
@@ -127,6 +132,7 @@ export function ConversationWorkbench({
 	}, [error]);
 
 	async function createSession() {
+		sessionRequestSequenceRef.current += 1;
 		setPending("CREATE");
 		setError(undefined);
 		const clientRequestId = createRequestIdRef.current ?? crypto.randomUUID();
@@ -156,6 +162,7 @@ export function ConversationWorkbench({
 	}
 
 	async function openSession(sessionId: string) {
+		const requestSequence = ++sessionRequestSequenceRef.current;
 		setLoading(true);
 		setError(undefined);
 		try {
@@ -164,6 +171,7 @@ export function ConversationWorkbench({
 			});
 			if (!response.ok)
 				throw new Error(await readError(response, "无法打开会话"));
+			if (sessionRequestSequenceRef.current !== requestSequence) return;
 			setSession((await response.json()) as ConversationSession);
 			createRequestIdRef.current = undefined;
 			turnAttemptRef.current = undefined;
@@ -171,9 +179,11 @@ export function ConversationWorkbench({
 			setDraft("");
 			router.replace(`/?session=${sessionId}`);
 		} catch (cause) {
-			setError(cause instanceof Error ? cause.message : "无法打开会话");
+			if (sessionRequestSequenceRef.current === requestSequence)
+				setError(cause instanceof Error ? cause.message : "无法打开会话");
 		} finally {
-			setLoading(false);
+			if (sessionRequestSequenceRef.current === requestSequence)
+				setLoading(false);
 		}
 	}
 

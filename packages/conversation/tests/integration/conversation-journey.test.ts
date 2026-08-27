@@ -94,6 +94,18 @@ describe.skipIf(databaseUrl === undefined)("Conversation 用户旅程", () => {
 			role: "ASSISTANT",
 			text: "关键信息已经足够，可以开始有界研究。你仍可继续补充偏好或预算。",
 		});
+		const unchanged = await conversation.execute({
+			type: "APPEND_USER_TURN",
+			clientTurnId: "turn-same-goal",
+			ownerUserId: "user-a",
+			sessionId: created.sessionId,
+			text: "消费目标保持不变。",
+			requirementUpdate: {
+				consumptionGoal: "购买一台工作显示器",
+			},
+		});
+		expect(unchanged.currentRequirement?.revisionNumber).toBe(3);
+		expect(unchanged.messages).toHaveLength(ready.messages.length + 2);
 		await conversation.close();
 
 		const reopened = await openPostgresConversation({ databaseUrl: isolated });
@@ -103,7 +115,7 @@ describe.skipIf(databaseUrl === undefined)("Conversation 用户旅程", () => {
 				ownerUserId: "user-a",
 				sessionId: created.sessionId,
 			}),
-		).resolves.toEqual(ready);
+		).resolves.toEqual(unchanged);
 		await expect(
 			reopened.read({
 				type: "GET_SESSION",

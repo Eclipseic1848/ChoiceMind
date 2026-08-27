@@ -36,7 +36,11 @@ if ($actualNodeVersion -ne $requiredNodeVersion) {
             $relaunchArguments += '-PreflightOnly'
         }
         & $fnmCommand.Source @relaunchArguments
-        exit $LASTEXITCODE
+        $fnmExitCode = $LASTEXITCODE
+        if ($fnmExitCode -ne 0) {
+            [Console]::Error.WriteLine("错误：fnm 无法使用项目要求的 Node.js $requiredNodeVersion。请先执行 fnm install $requiredNodeVersion，再重新双击 start_all.bat。")
+        }
+        exit $fnmExitCode
     }
 
     if ($null -eq $actualNodeVersion) {

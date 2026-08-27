@@ -286,6 +286,46 @@ describe("start_all.bat", () => {
 		}
 	});
 
+	test("fnm 缺少项目 Node 版本时给出中文安装命令", () => {
+		const windowsRoot = process.env.SystemRoot ?? "C:\\Windows";
+		const commandDirectory = mkdtempSync(
+			resolve(tmpdir(), "choicemind-start-all-"),
+		);
+		writeFileSync(
+			resolve(commandDirectory, "node.cmd"),
+			"@echo v24.16.0\r\n",
+			"utf8",
+		);
+		writeFileSync(
+			resolve(commandDirectory, "fnm.cmd"),
+			"@echo requested version is not installed 1>&2\r\n@exit /b 44\r\n",
+			"utf8",
+		);
+		const environment = { ...process.env };
+		delete environment.PATH;
+		delete environment.Path;
+		environment.PATH = [
+			commandDirectory,
+			resolve(windowsRoot, "System32"),
+			resolve(windowsRoot, "System32/WindowsPowerShell/v1.0"),
+		].join(";");
+
+		try {
+			const result = spawnSync(
+				process.env.ComSpec ?? resolve(windowsRoot, "System32/cmd.exe"),
+				["/d", "/c", "start_all.bat --preflight-only"],
+				{ cwd: repositoryRoot, encoding: "utf8", env: environment },
+			);
+
+			expect(result.status).toBe(44);
+			expect(`${result.stdout}${result.stderr}`).toContain(
+				"fnm install 22.22.1",
+			);
+		} finally {
+			rmSync(commandDirectory, { force: true, recursive: true });
+		}
+	});
+
 	test("依赖与端口可用时输出服务地址和数据卷策略", () => {
 		const windowsRoot = process.env.SystemRoot ?? "C:\\Windows";
 		const commandDirectory = mkdtempSync(
