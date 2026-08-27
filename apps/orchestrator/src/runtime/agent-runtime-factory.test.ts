@@ -6,7 +6,7 @@ import { createDecisionTaskExecutor } from "../decision-tasks/executor.js";
 describe("Agent Runtime factory", () => {
   it("keeps Fake as the default runtime", async () => {
     const result = await createDecisionTaskExecutor({
-      runtime: createAgentRuntimeAdapter({ env: {} })
+      runtime: await createAgentRuntimeAdapter({ env: {} })
     }).execute(buildFactoryCommand("factory-default-fake"));
 
     expect(result).toMatchObject({
@@ -16,23 +16,23 @@ describe("Agent Runtime factory", () => {
     });
   });
 
-  it("requires a complete explicit CoreMind provider configuration", () => {
-    expect(() =>
+  it("requires a complete explicit CoreMind provider configuration", async () => {
+    await expect(
       createAgentRuntimeAdapter({
         env: { CHOICEMIND_RUNTIME: "coremind" }
       })
-    ).toThrow("CHOICEMIND_COREMIND_PROVIDER_BASE_URL");
+    ).rejects.toThrow("CHOICEMIND_COREMIND_PROVIDER_BASE_URL");
 
-    expect(() =>
+    await expect(
       createAgentRuntimeAdapter({
         env: {
           CHOICEMIND_RUNTIME: "coremind",
           CHOICEMIND_COREMIND_PROVIDER_BASE_URL: "http://127.0.0.1:1234/v1"
         }
       })
-    ).toThrow("CHOICEMIND_COREMIND_MODEL");
+    ).rejects.toThrow("CHOICEMIND_COREMIND_MODEL");
 
-    expect(() =>
+    await expect(
       createAgentRuntimeAdapter({
         env: {
           CHOICEMIND_RUNTIME: "coremind",
@@ -40,13 +40,13 @@ describe("Agent Runtime factory", () => {
           CHOICEMIND_COREMIND_MODEL: "offline-model"
         }
       })
-    ).toThrow("EgressGuard");
+    ).rejects.toThrow("EgressGuard");
   });
 
-  it("fails closed for an unknown runtime instead of silently selecting Fake", () => {
-    expect(() =>
+  it("fails closed for an unknown runtime instead of silently selecting Fake", async () => {
+    await expect(
       createAgentRuntimeAdapter({ env: { CHOICEMIND_RUNTIME: "unknown" } })
-    ).toThrow("未知 CHOICEMIND_RUNTIME");
+    ).rejects.toThrow("未知 CHOICEMIND_RUNTIME");
   });
 });
 

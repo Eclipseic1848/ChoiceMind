@@ -98,6 +98,16 @@ corepack pnpm --filter @choicemind/web exec playwright install chromium
 corepack pnpm dev
 ```
 
+Windows 本地开发也可以在仓库根目录双击 `start_all.bat`，或在 CMD/Windows Terminal 中执行：
+
+```bat
+start_all.bat
+```
+
+脚本会检查仓库声明的 Node.js/pnpm 版本、uv、Docker Engine/Compose、已安装依赖和固定端口，然后启动 PostgreSQL、Redis 以及现有 `pnpm dev` 全部应用服务。所有应用日志保留在同一窗口并带服务名前缀；修改 Web 源码后由 Next.js 开发服务器热更新。按 `Ctrl+C` 会终止脚本创建的应用进程树并停止本次基础容器，PostgreSQL 与 Redis 命名数据卷不会删除。
+
+本地数据库密码与两套合成用户令牌首次启动时随机生成，只保存在当前 Windows 用户的 `%LOCALAPPDATA%\ChoiceMind\development`，不会写入仓库或输出到终端。依赖或端口不满足时，脚本会用中文指出具体修复动作并返回失败。只做启动前检查而不启动服务，可执行 `start_all.bat --preflight-only`。
+
 启动后可访问：
 
 - Web 合成决策页面：<http://127.0.0.1:3000>
