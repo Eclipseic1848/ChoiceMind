@@ -1,6 +1,10 @@
 import { randomUUID } from "node:crypto";
 
 import {
+	type Conversation,
+	openPostgresConversation,
+} from "@choicemind/conversation";
+import {
 	type IdentityAccess,
 	openPostgresIdentityAccess,
 } from "@choicemind/identity-access";
@@ -16,6 +20,7 @@ test.describe("真实 Identity Web 纵向", () => {
 	test.describe.configure({ mode: "serial" });
 
 	let api: ReturnType<typeof buildApiApp> | undefined;
+	let conversation: Conversation | undefined;
 	let identity: IdentityAccess | undefined;
 	let isolatedDatabaseUrl = "";
 	let schema = "";
@@ -66,6 +71,25 @@ test.describe("真实 Identity Web 纵向", () => {
 		await page.reload();
 		await expect(page.getByText("你好，真实管理员")).toBeVisible();
 
+		await page.getByRole("button", { name: "新建决策" }).click();
+		await page
+			.getByLabel("这次想解决什么消费问题？")
+			.fill("购买一台工作显示器");
+		await page.getByRole("button", { name: "发送并记录目标" }).click();
+		await page.getByLabel("主要使用场景").fill("每天长时间编程和办公");
+		await page.getByRole("button", { name: "发送并记录场景" }).click();
+		await page.getByLabel("硬性条件（每行一项）").fill("至少 4K");
+		await page.getByRole("button", { name: "发送并记录硬性条件" }).click();
+		await expect(page.getByText("需求已可研究")).toBeVisible();
+
+		await stopApi();
+		await startApi(new Date("2026-08-27T19:01:00.000Z"));
+		await page.reload();
+		await expect(
+			page.getByRole("heading", { name: "购买一台工作显示器" }),
+		).toBeVisible();
+		await expect(page.getByText("需求已可研究")).toBeVisible();
+
 		await stopApi();
 		await startApi(new Date("2026-09-04T18:00:00.000Z"));
 		await page.reload();
@@ -80,7 +104,15 @@ test.describe("真实 Identity Web 纵向", () => {
 			databaseUrl: isolatedDatabaseUrl,
 			now: () => now,
 		});
-		api = buildApiApp({ identityAccess: identity, now: () => now });
+		conversation = await openPostgresConversation({
+			databaseUrl: isolatedDatabaseUrl,
+			now: () => now,
+		});
+		api = buildApiApp({
+			conversation,
+			identityAccess: identity,
+			now: () => now,
+		});
 		await api.listen({ host: "127.0.0.1", port: 3199 });
 	}
 
@@ -89,5 +121,7 @@ test.describe("真实 Identity Web 纵向", () => {
 		api = undefined;
 		await identity?.close();
 		identity = undefined;
+		await conversation?.close();
+		conversation = undefined;
 	}
 });

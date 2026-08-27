@@ -13,6 +13,7 @@
     "typecheck": "tsc --project tsconfig.json"
   },
   "dependencies": {
+    "@choicemind/conversation": "workspace:*",
     "@choicemind/contracts": "workspace:*",
     "@choicemind/identity-access": "workspace:*",
     "@choicemind/task-persistence": "workspace:*",

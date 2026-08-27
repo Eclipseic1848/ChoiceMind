@@ -382,7 +382,7 @@ export function DecisionFlow() {
   );
 }
 
-function TaskProgress({
+export function TaskProgress({
   authoritativeState,
   connectionState,
   events,
@@ -468,7 +468,7 @@ function runtimeControlStatusLabel(status: RuntimeControlStatusV1): string {
   return status.action === "RESUME" ? "恢复失败" : "取消失败";
 }
 
-function mergePersistedEvent(
+export function mergePersistedEvent(
   current: readonly PersistedRunEventV1[],
   incoming: PersistedRunEventV1
 ): readonly PersistedRunEventV1[] {

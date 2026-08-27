@@ -168,7 +168,7 @@ $applicationProcess = $null
 $scriptExitCode = 0
 
 try {
-        Write-Output '正在启动应用服务；日志统一显示在当前窗口，并带有 contracts/identity/web/api/api-publisher/identity-lifecycle/orchestrator/orchestrator-worker/data-worker 前缀。'
+        Write-Output '正在启动应用服务；日志统一显示在当前窗口，并带有 contracts/conversation/identity/web/api/api-publisher/identity-lifecycle/orchestrator/orchestrator-worker/data-worker 前缀。'
     $processStartInfo = [System.Diagnostics.ProcessStartInfo]::new()
     $processStartInfo.FileName = $env:ComSpec
     $processStartInfo.Arguments = '/d /c "pnpm.cmd dev"'

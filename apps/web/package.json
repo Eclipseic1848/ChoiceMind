@@ -16,6 +16,7 @@
     "react-dom": "19.2.8"
   },
   "devDependencies": {
+    "@choicemind/conversation": "workspace:*",
     "@choicemind/identity-access": "workspace:*",
     "@playwright/test": "1.62.1",
     "@types/pg": "8.23.1",

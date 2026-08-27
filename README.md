@@ -110,11 +110,12 @@ start_all.bat
 
 启动后可访问：
 
-- Web 合成决策页面：<http://127.0.0.1:3000>
+- Web 对话决策工作台：<http://127.0.0.1:3000>
+- P0 合成决策开发验证页：<http://127.0.0.1:3000/dev/synthetic-decision>
 - API 健康汇总：<http://127.0.0.1:3100/api/v1/system/health>
 - Web、API、Orchestrator、Data Worker 的存活端点分别位于 `3000`、`3100`、`3200`、`3300` 端口的 `/health/live`
 
-页面使用固定合成需求与证据，不访问真实商品、价格或用户凭据。
+首页使用真实本地账号、Conversation、消息和 Requirement Revision；刷新或重启后从 PostgreSQL 恢复。研究来源、Provider 与最终 Decision 仍由后续 P1 纵向接入，当前首页不会用合成商品结果冒充真实研究。固定合成需求与证据仅保留在开发验证页，不访问真实商品、价格或用户凭据。
 
 ### Evidence 采集链路（P0-11，已完成）
 

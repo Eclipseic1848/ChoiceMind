@@ -17,6 +17,8 @@
 | Select/Listbox | 浏览器原生 `select` | 本文件“表单契约” | 账号创建、角色变更 | 浏览器键盘操作与 `identity.spec.ts` |
 | Scrollbar | `apps/web/src/app/globals.css` | `DESIGN.md` Token | 表格横向滚动 | 严格静态审计与浏览器窄屏检查 |
 | CRUD | `admin-pages.tsx` + Identity BFF/API | GitHub Issue #56 | 账号、邀请 | `identity.spec.ts` 与真实 Postgres 集成测试 |
+| Conversation | `conversation-workbench.tsx` + Conversation BFF/API | GitHub Issue #57 | Session、消息、Requirement Revision | `conversation.spec.ts` 与真实 Postgres 浏览器纵向 |
+| Task Progress | `TaskProgress` 权威投影 | Decision Task Snapshot、Result 与 Persisted Run Event | 产品工作台与 P0 开发验证页 | 断线重连、暂停/恢复/取消和失败浏览器测试 |
 
 ## 路由与可见性
 
@@ -25,7 +27,8 @@
 | `/setup` | 仅本机且尚未初始化 | 创建首个 SUPERADMIN | 检查、表单、提交、一次性恢复码、已完成 |
 | `/login` | 未登录用户 | 用户名密码登录 | 默认、提交、错误、节流、强制改密、删除待定 |
 | `/register?code=` | 持有效邀请者 | 创建 USER 账号 | 缺码、有效表单、无效/过期/已使用、成功 |
-| `/` | 已登录用户 | 决策工作台 | 身份检查、可用、服务降级、会话失效 |
+| `/` | 已登录用户 | 对话决策工作台 | Session 空态/创建/恢复、MVR 澄清、任务进度/失败/重连、服务降级 |
+| `/dev/synthetic-decision` | 已登录开发者 | 保留 P0 固定合成纵向的开发验证入口 | 提交、事件重放、暂停/恢复/取消、Decision/失败 |
 | `/security` | 已登录用户 | 密码与会话管理 | 改密、退出当前、退出全部、删除等待期 |
 | `/admin/accounts` | ADMIN、SUPERADMIN | 账号管理 | 表格、创建、重置、停用、删除、空态、失败与权限拒绝 |
 | `/admin/invitations` | ADMIN、SUPERADMIN | 邀请管理 | 列表、创建、复制一次、撤销 |
@@ -50,6 +53,15 @@
 - 密码字段统一使用共享 `PasswordInput`，默认隐藏并提供键盘可操作的显示/隐藏按钮。
 - 账号角色选择接受 Windows 与浏览器原生下拉弹层，统一使用原生 `select`；ChoiceMind 不拥有弹层几何外观。
 - 远程提交使用服务端确认后的悲观更新；等待期间按钮显示具体动作并禁用，确认框在失败时保留上下文和重试路径。
+
+## Conversation 与 Requirement 契约
+
+- Conversation Module 拥有用户可见 Session、连续消息、不可变 Requirement Revision 和 Decision Task 链接；Web 只呈现投影并发送动作。
+- Minimum Viable Requirement 由消费目标、主要使用场景和已明确的硬性条件组成；“没有硬性条件”是有效的明确答案，预算不是开始有界研究的必填项。
+- 普通补充消息必须保存，但只有明确改变需求字段时才创建新 Requirement Revision；历史 Revision 不可覆盖。
+- Session、消息、Revision 和任务链接绑定服务端 Principal。客户端提交的 User ID 或 Role 一律不参与授权。
+- 任务进度只读取权威 Snapshot、Result 和 Persisted Run Event；断线显示重连，任务失败显示真实原因和安全下一步，不伪装为 Decision。
+- 账号真正到期删除时，生命周期 Worker 必须在删除账号事实前清理该 User 的 Conversation 私有数据；任一步失败都保留事件供重试。
 
 ## 权限与隐私
 

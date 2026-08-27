@@ -11,21 +11,40 @@ type SystemHealth = {
 	status: "healthy" | "unhealthy";
 };
 
-export default async function HomePage() {
-	const health = await loadSystemHealth();
+const serviceNames: Record<ComponentHealth["service"], string> = {
+	web: "Web",
+	api: "API",
+	orchestrator: "Orchestrator",
+	"data-worker": "Data Worker",
+};
 
+export async function SystemHealthPanel() {
+	const health = await loadSystemHealth();
 	return (
-		<IdentityGate>
-			<ConversationWorkbench
-				systemHealth={health === null ? "unavailable" : health.status}
-			/>
-		</IdentityGate>
+		<section aria-labelledby="system-health-heading">
+			<h2 id="system-health-heading">系统健康</h2>
+			{health === null ? (
+				<p>健康状态不可用</p>
+			) : (
+				<>
+					<p>{health.status === "healthy" ? "全部正常" : "存在异常"}</p>
+					<ul>
+						{health.components.map((component) => (
+							<li key={component.service}>
+								<strong>{serviceNames[component.service]}</strong>
+								{`：${component.status === "healthy" ? "正常" : "异常"}（${component.latencyMs} ms）`}
+							</li>
+						))}
+					</ul>
+					<time dateTime={health.checkedAt}>{health.checkedAt}</time>
+				</>
+			)}
+		</section>
 	);
 }
 
 async function loadSystemHealth(): Promise<SystemHealth | null> {
 	const apiUrl = process.env.CHOICEMIND_API_URL ?? "http://127.0.0.1:3100";
-
 	try {
 		const response = await fetch(`${apiUrl}/api/v1/system/health`, {
 			cache: "no-store",
@@ -44,5 +63,3 @@ async function loadSystemHealth(): Promise<SystemHealth | null> {
 		return null;
 	}
 }
-import { ConversationWorkbench } from "./conversation-workbench";
-import { IdentityGate } from "./identity-gate";
