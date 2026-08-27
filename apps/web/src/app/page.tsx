@@ -1,3 +1,6 @@
+import { ConversationWorkbench } from "./conversation-workbench";
+import { IdentityGate } from "./identity-gate";
+
 type ComponentHealth = {
 	service: "web" | "api" | "orchestrator" | "data-worker";
 	status: "healthy" | "unhealthy";
@@ -44,5 +47,3 @@ async function loadSystemHealth(): Promise<SystemHealth | null> {
 		return null;
 	}
 }
-import { ConversationWorkbench } from "./conversation-workbench";
-import { IdentityGate } from "./identity-gate";

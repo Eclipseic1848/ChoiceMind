@@ -13,6 +13,7 @@ import {
   openRuntimeRecoveryStore
 } from "../../../packages/task-persistence/src/index.js";
 import { resetPersistentDecisionTaskTestData } from "../../../packages/task-persistence/tests/integration/support.js";
+import { isSyntheticDevelopmentPageEnabled } from "../src/app/dev/synthetic-decision/access";
 
 let apiServer: Server;
 let decisionResponseStatus = 200;
@@ -30,6 +31,16 @@ let runtimeControlRequests: Array<{
 let verticalApiUrl: string | undefined;
 
 test.describe.configure({ mode: "serial" });
+
+test("keeps the synthetic verification page disabled outside development by default", () => {
+  expect(isSyntheticDevelopmentPageEnabled({ NODE_ENV: "production" })).toBe(false);
+  expect(
+    isSyntheticDevelopmentPageEnabled({
+      NODE_ENV: "production",
+      CHOICEMIND_ENABLE_SYNTHETIC_DEV_PAGE: "true"
+    })
+  ).toBe(true);
+});
 
 test.beforeEach(() => {
   decisionResponseStatus = 200;

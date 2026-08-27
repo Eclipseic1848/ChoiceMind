@@ -1,8 +1,12 @@
+import { notFound } from "next/navigation";
+
 import { DecisionFlow } from "../../decision-flow";
 import { IdentityGate } from "../../identity-gate";
 import { SystemHealthPanel } from "../../system-health-panel";
+import { isSyntheticDevelopmentPageEnabled } from "./access";
 
 export default function SyntheticDecisionPage() {
+	if (!isSyntheticDevelopmentPageEnabled(process.env)) notFound();
 	return (
 		<IdentityGate>
 			<main>

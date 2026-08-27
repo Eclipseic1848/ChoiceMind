@@ -1,7 +1,7 @@
 "use client";
 
 import { useRouter, useSearchParams } from "next/navigation";
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { type FormEvent, useEffect, useRef, useState } from "react";
 
 import { ConversationTaskProgress } from "./conversation-task-progress";
 
@@ -56,10 +56,23 @@ export function ConversationWorkbench({
 	const [loading, setLoading] = useState(true);
 	const [pending, setPending] = useState<"CREATE" | "SEND" | null>(null);
 	const [draft, setDraft] = useState("");
+	const [editingRequirementKey, setEditingRequirementKey] =
+		useState<RequirementMissingKey>();
 	const [error, setError] = useState<string>();
+	const createRequestIdRef = useRef<string | undefined>(undefined);
+	const turnAttemptRef = useRef<
+		| Readonly<{
+				clientTurnId: string;
+				promptKey: ReturnType<typeof composerPrompt>["key"];
+				sessionId: string;
+				text: string;
+		  }>
+		| undefined
+	>(undefined);
 	const focusLatestMessage = useRef(false);
 	const latestAssistantRef = useRef<HTMLElement>(null);
 	const errorRef = useRef<HTMLParagraphElement>(null);
+	const draftRef = useRef<HTMLTextAreaElement>(null);
 	const latestMessageId = session?.messages.at(-1)?.messageId;
 
 	useEffect(() => {
@@ -116,17 +129,23 @@ export function ConversationWorkbench({
 	async function createSession() {
 		setPending("CREATE");
 		setError(undefined);
+		const clientRequestId = createRequestIdRef.current ?? crypto.randomUUID();
+		createRequestIdRef.current = clientRequestId;
 		try {
 			const response = await fetch("/api/conversations", {
 				method: "POST",
 				headers: { "content-type": "application/json" },
-				body: JSON.stringify({ clientRequestId: crypto.randomUUID() }),
+				body: JSON.stringify({ clientRequestId }),
 			});
 			if (!response.ok)
 				throw new Error(await readError(response, "无法创建新会话"));
 			const created = (await response.json()) as ConversationSession;
 			setSession(created);
 			setSummaries((current) => upsertSummary(current, created));
+			createRequestIdRef.current = undefined;
+			turnAttemptRef.current = undefined;
+			setEditingRequirementKey(undefined);
+			setDraft("");
 			router.replace(`/?session=${created.sessionId}`);
 			focusLatestMessage.current = true;
 		} catch (cause) {
@@ -146,6 +165,10 @@ export function ConversationWorkbench({
 			if (!response.ok)
 				throw new Error(await readError(response, "无法打开会话"));
 			setSession((await response.json()) as ConversationSession);
+			createRequestIdRef.current = undefined;
+			turnAttemptRef.current = undefined;
+			setEditingRequirementKey(undefined);
+			setDraft("");
 			router.replace(`/?session=${sessionId}`);
 		} catch (cause) {
 			setError(cause instanceof Error ? cause.message : "无法打开会话");
@@ -157,9 +180,25 @@ export function ConversationWorkbench({
 	async function submitTurn(event: FormEvent<HTMLFormElement>) {
 		event.preventDefault();
 		if (session === undefined || draft.trim().length === 0) return;
-		const prompt = composerPrompt(session.currentRequirement);
+		const prompt = composerPrompt(
+			session.currentRequirement,
+			editingRequirementKey,
+		);
 		const text = draft.trim();
 		const requirementUpdate = buildRequirementUpdate(prompt.key, text);
+		const previousAttempt = turnAttemptRef.current;
+		const clientTurnId =
+			previousAttempt?.sessionId === session.sessionId &&
+			previousAttempt.promptKey === prompt.key &&
+			previousAttempt.text === text
+				? previousAttempt.clientTurnId
+				: crypto.randomUUID();
+		turnAttemptRef.current = {
+			clientTurnId,
+			promptKey: prompt.key,
+			sessionId: session.sessionId,
+			text,
+		};
 		setPending("SEND");
 		setError(undefined);
 		try {
@@ -169,7 +208,7 @@ export function ConversationWorkbench({
 					method: "POST",
 					headers: { "content-type": "application/json" },
 					body: JSON.stringify({
-						clientTurnId: crypto.randomUUID(),
+						clientTurnId,
 						requirementUpdate,
 						text,
 					}),
@@ -181,6 +220,8 @@ export function ConversationWorkbench({
 			setSession(updated);
 			setSummaries((current) => upsertSummary(current, updated));
 			setDraft("");
+			setEditingRequirementKey(undefined);
+			turnAttemptRef.current = undefined;
 			focusLatestMessage.current = true;
 		} catch (cause) {
 			setError(cause instanceof Error ? cause.message : "消息发送失败");
@@ -189,7 +230,27 @@ export function ConversationWorkbench({
 		}
 	}
 
-	const prompt = composerPrompt(session?.currentRequirement ?? null);
+	function editRequirement(key: RequirementMissingKey) {
+		const requirement = session?.currentRequirement;
+		if (requirement === null || requirement === undefined) return;
+		setEditingRequirementKey(key);
+		turnAttemptRef.current = undefined;
+		setDraft(
+			key === "CONSUMPTION_GOAL"
+				? (requirement.consumptionGoal ?? "")
+				: key === "PRIMARY_SCENARIO"
+					? (requirement.primaryScenario ?? "")
+					: requirement.hardConstraints?.length === 0
+						? "没有额外硬性条件"
+						: (requirement.hardConstraints?.join("\n") ?? ""),
+		);
+		requestAnimationFrame(() => draftRef.current?.focus());
+	}
+
+	const prompt = composerPrompt(
+		session?.currentRequirement ?? null,
+		editingRequirementKey,
+	);
 	const latestTask = session?.decisionTasks.at(-1);
 
 	return (
@@ -333,6 +394,7 @@ export function ConversationWorkbench({
 							>
 								<label htmlFor="conversation-draft">{prompt.label}</label>
 								<textarea
+									ref={draftRef}
 									id="conversation-draft"
 									rows={prompt.key === "HARD_CONSTRAINTS" ? 4 : 3}
 									value={draft}
@@ -361,6 +423,7 @@ export function ConversationWorkbench({
 						<h2 id="requirement-heading">当前需求</h2>
 						<RequirementSummary
 							requirement={session?.currentRequirement ?? null}
+							onEdit={editRequirement}
 						/>
 					</section>
 					<section
@@ -377,6 +440,7 @@ export function ConversationWorkbench({
 							</p>
 						) : (
 							<ConversationTaskProgress
+								key={latestTask.decisionTaskId}
 								decisionTaskId={latestTask.decisionTaskId}
 							/>
 						)}
@@ -400,47 +464,68 @@ export function ConversationWorkbench({
 
 function RequirementSummary({
 	requirement,
-}: Readonly<{ requirement: RequirementRevision | null }>) {
+	onEdit,
+}: Readonly<{
+	requirement: RequirementRevision | null;
+	onEdit: (key: RequirementMissingKey) => void;
+}>) {
 	if (requirement === null) {
 		return <p className="empty-copy">还没有形成 Requirement Revision。</p>;
 	}
 	return (
-		<dl className="requirement-list">
-			<div>
-				<dt>消费目标</dt>
-				<dd>{requirement.consumptionGoal ?? "待确认"}</dd>
-			</div>
-			<div>
-				<dt>主要场景</dt>
-				<dd>{requirement.primaryScenario ?? "待确认"}</dd>
-			</div>
-			<div>
-				<dt>硬性条件</dt>
-				<dd>
-					{requirement.hardConstraints === null
-						? "待确认"
-						: requirement.hardConstraints.length === 0
-							? "已确认没有额外硬性条件"
-							: requirement.hardConstraints.join("；")}
-				</dd>
-			</div>
-			<div>
-				<dt>版本</dt>
-				<dd>Revision {requirement.revisionNumber}</dd>
-			</div>
-		</dl>
+		<>
+			<dl className="requirement-list">
+				<div>
+					<dt>消费目标</dt>
+					<dd>{requirement.consumptionGoal ?? "待确认"}</dd>
+				</div>
+				<div>
+					<dt>主要场景</dt>
+					<dd>{requirement.primaryScenario ?? "待确认"}</dd>
+				</div>
+				<div>
+					<dt>硬性条件</dt>
+					<dd>
+						{requirement.hardConstraints === null
+							? "待确认"
+							: requirement.hardConstraints.length === 0
+								? "已确认没有额外硬性条件"
+								: requirement.hardConstraints.join("；")}
+					</dd>
+				</div>
+				<div>
+					<dt>版本</dt>
+					<dd>Revision {requirement.revisionNumber}</dd>
+				</div>
+			</dl>
+			<fieldset className="requirement-actions" aria-label="修改当前需求">
+				<button type="button" onClick={() => onEdit("CONSUMPTION_GOAL")}>
+					修改消费目标
+				</button>
+				<button type="button" onClick={() => onEdit("PRIMARY_SCENARIO")}>
+					修改主要场景
+				</button>
+				<button type="button" onClick={() => onEdit("HARD_CONSTRAINTS")}>
+					修改硬性条件
+				</button>
+			</fieldset>
+		</>
 	);
 }
 
-function composerPrompt(requirement: RequirementRevision | null) {
-	const missing = requirement?.missingKeys[0] ?? "CONSUMPTION_GOAL";
+function composerPrompt(
+	requirement: RequirementRevision | null,
+	editingKey?: RequirementMissingKey,
+) {
+	const missing =
+		editingKey ?? requirement?.missingKeys[0] ?? "CONSUMPTION_GOAL";
 	if (missing === "CONSUMPTION_GOAL") {
 		return {
 			key: missing,
 			label: "这次想解决什么消费问题？",
 			placeholder: "例如：购买一台更适合长期编程的显示器",
 			hint: "先说目标，不需要一次写完整。",
-			action: "发送并记录目标",
+			action: editingKey === undefined ? "发送并记录目标" : "更新消费目标",
 		} as const;
 	}
 	if (missing === "PRIMARY_SCENARIO") {
@@ -449,7 +534,7 @@ function composerPrompt(requirement: RequirementRevision | null) {
 			label: "主要使用场景",
 			placeholder: "例如：每天长时间编程和办公",
 			hint: "写最常见、最影响判断的场景。",
-			action: "发送并记录场景",
+			action: editingKey === undefined ? "发送并记录场景" : "更新主要场景",
 		} as const;
 	}
 	if (missing === "HARD_CONSTRAINTS") {
@@ -458,7 +543,7 @@ function composerPrompt(requirement: RequirementRevision | null) {
 			label: "硬性条件（每行一项）",
 			placeholder: "至少 4K\n支持 USB-C 供电",
 			hint: "没有硬性条件时，输入“没有额外硬性条件”。",
-			action: "发送并记录硬性条件",
+			action: editingKey === undefined ? "发送并记录硬性条件" : "更新硬性条件",
 		} as const;
 	}
 	return {

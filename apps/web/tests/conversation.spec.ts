@@ -1,4 +1,4 @@
-import { expect, test, type Route } from "@playwright/test";
+import { expect, type Route, test } from "@playwright/test";
 
 type Message = {
 	messageId: string;
@@ -95,20 +95,102 @@ test("创建 Session、逐步形成 MVR，并在刷新后恢复对话", async ({
 		thread.getByText("关键信息已经足够，可以开始有界研究。", { exact: false }),
 	).toBeVisible();
 	await expect(page.getByText("需求已可研究")).toBeVisible();
+	await page.getByRole("button", { name: "修改消费目标" }).click();
+	await expect(page.getByLabel("这次想解决什么消费问题？")).toBeFocused();
+	await page.getByLabel("这次想解决什么消费问题？").fill("更换一台工作显示器");
+	await page.getByRole("button", { name: "更新消费目标" }).click();
+	await expect(page.getByText("Revision 4")).toBeVisible();
 	expect(receivedUpdates).toEqual([
 		{ consumptionGoal: "购买一台工作显示器" },
 		{ primaryScenario: "每天长时间编程和办公" },
 		{ hardConstraints: ["至少 4K", "支持 USB-C 供电"] },
+		{ consumptionGoal: "更换一台工作显示器" },
 	]);
 
 	await page.reload();
 	await expect(
-		page.getByRole("heading", { name: "购买一台工作显示器" }),
+		page.getByRole("heading", { name: "更换一台工作显示器" }),
 	).toBeVisible();
 	await expect(page.getByText("需求已可研究")).toBeVisible();
 });
 
+test("响应丢失后原地重试复用同一幂等请求 ID", async ({ page }) => {
+	let session: ReturnType<typeof buildSession> | undefined;
+	const createRequestIds: string[] = [];
+	const turnRequestIds: string[] = [];
+	await page.route(/\/api\/conversations(?:\/.*)?$/, async (route) => {
+		const request = route.request();
+		const path = new URL(request.url()).pathname;
+		if (request.method() === "GET" && path === "/api/conversations") {
+			await json(route, 200, []);
+			return;
+		}
+		if (request.method() === "POST" && path === "/api/conversations") {
+			const body = request.postDataJSON() as { clientRequestId: string };
+			createRequestIds.push(body.clientRequestId);
+			session ??= buildSession();
+			await json(route, createRequestIds.length === 1 ? 503 : 201, session);
+			return;
+		}
+		if (request.method() === "POST" && path.endsWith("/turns")) {
+			const body = request.postDataJSON() as {
+				clientTurnId: string;
+				requirementUpdate: Record<string, unknown>;
+				text: string;
+			};
+			turnRequestIds.push(body.clientTurnId);
+			if (session === undefined) throw new Error("测试 Session 尚未创建");
+			const updated = appendTurn(session, body.text, body.requirementUpdate);
+			if (turnRequestIds.length > 1) session = updated;
+			await json(route, turnRequestIds.length === 1 ? 503 : 200, updated);
+			return;
+		}
+		await json(route, 404, { error: { code: "NOT_FOUND" } });
+	});
+
+	await page.goto("/");
+	await page.getByRole("button", { name: "新建决策" }).click();
+	await expect(page.locator("p.form-message[role='alert']")).toContainText(
+		"无法创建新会话",
+	);
+	await page.getByRole("button", { name: "新建决策" }).click();
+	await page.getByLabel("这次想解决什么消费问题？").fill("购买显示器");
+	await page.getByRole("button", { name: "发送并记录目标" }).click();
+	await expect(page.locator("p.form-message[role='alert']")).toContainText(
+		"消息发送失败",
+	);
+	await page.getByRole("button", { name: "发送并记录目标" }).click();
+
+	expect(createRequestIds).toHaveLength(2);
+	expect(new Set(createRequestIds).size).toBe(1);
+	expect(turnRequestIds).toHaveLength(2);
+	expect(new Set(turnRequestIds).size).toBe(1);
+});
+
 test("在 Session 中恢复权威任务事件并执行暂停控制", async ({ page }) => {
+	await page.addInitScript(() => {
+		class ControlledEventSource {
+			onopen: ((event: Event) => void) | null = null;
+			onmessage: ((event: MessageEvent) => void) | null = null;
+			onerror: ((event: Event) => void) | null = null;
+
+			constructor(_url: string | URL) {
+				(
+					window as unknown as {
+						conversationTestEventSource: ControlledEventSource;
+					}
+				).conversationTestEventSource = this;
+				queueMicrotask(() => this.onopen?.(new Event("open")));
+			}
+
+			close() {}
+		}
+
+		Object.defineProperty(window, "EventSource", {
+			configurable: true,
+			value: ControlledEventSource,
+		});
+	});
 	const session = buildSession();
 	session.decisionTasks = [
 		{
@@ -117,6 +199,7 @@ test("在 Session 中恢复权威任务事件并执行暂停控制", async ({ pa
 		},
 	];
 	let resumeBody: Record<string, unknown> | undefined;
+	let taskState: "PAUSED_PERMISSION" | "RUNNING" = "PAUSED_PERMISSION";
 	await page.route(/\/api\/conversations(?:\/.*)?$/, async (route) => {
 		const path = new URL(route.request().url()).pathname;
 		await json(
@@ -126,36 +209,10 @@ test("在 Session 中恢复权威任务事件并执行暂停控制", async ({ pa
 		);
 	});
 	await page.route(
-		"**/api/decision-tasks/task-conversation-web/events*",
-		async (route) => {
-			await route.fulfill({
-				status: 200,
-				contentType: "text/event-stream; charset=utf-8",
-				body: `id: 1\ndata: ${JSON.stringify({
-					contractType: "persisted-run-event",
-					contractVersion: "1.0",
-					cursor: "1",
-					event: {
-						contractType: "run-event",
-						contractVersion: "1.0",
-						eventId: "event-conversation-web",
-						decisionTaskId: "task-conversation-web",
-						agentRunId: "run-conversation-web",
-						sequence: 1,
-						occurredAt: "2026-08-27T23:10:01.000Z",
-						eventType: "TASK_STATE_CHANGED",
-						taskState: "PAUSED_PERMISSION",
-						summary: "需要你确认本次外部访问",
-						synthetic: true,
-					},
-				})}\n\n`,
-			});
-		},
-	);
-	await page.route(
 		"**/api/decision-tasks/task-conversation-web/resume",
 		async (route) => {
 			resumeBody = route.request().postDataJSON() as Record<string, unknown>;
+			taskState = "RUNNING";
 			await json(route, 202, {
 				contractType: "runtime-control-status",
 				contractVersion: "1.0",
@@ -177,9 +234,11 @@ test("在 Session 中恢复权威任务事件并执行暂停控制", async ({ pa
 				executionRequestId: "exec-conversation-web",
 				decisionTaskId: "task-conversation-web",
 				agentRunId: "run-conversation-web",
-				state: "PAUSED_PERMISSION",
+				state: taskState,
 				terminal: false,
-				runtimeSnapshotId: "snapshot-conversation-web",
+				...(taskState === "PAUSED_PERMISSION"
+					? { runtimeSnapshotId: "snapshot-conversation-web" }
+					: {}),
 				updatedAt: "2026-08-27T23:10:00.000Z",
 			});
 		},
@@ -187,7 +246,6 @@ test("在 Session 中恢复权威任务事件并执行暂停控制", async ({ pa
 
 	await page.goto("/?session=session-web-1");
 	await expect(page.getByRole("heading", { name: "任务进度" })).toBeVisible();
-	await expect(page.getByText("需要你确认本次外部访问")).toBeVisible();
 	await page.getByRole("button", { name: "安全恢复" }).click();
 	await expect(page.getByText("恢复中")).toBeVisible();
 	expect(resumeBody).toMatchObject({
@@ -195,6 +253,39 @@ test("在 Session 中恢复权威任务事件并执行暂停控制", async ({ pa
 		contractVersion: "1.0",
 		runtimeSnapshotId: "snapshot-conversation-web",
 	});
+	await page.evaluate(
+		(data) => {
+			const source = (
+				window as unknown as {
+					conversationTestEventSource: {
+						onmessage: ((event: MessageEvent) => void) | null;
+					};
+				}
+			).conversationTestEventSource;
+			source.onmessage?.(new MessageEvent("message", { data }));
+		},
+		JSON.stringify({
+			contractType: "persisted-run-event",
+			contractVersion: "1.0",
+			cursor: "1",
+			event: {
+				contractType: "run-event",
+				contractVersion: "1.0",
+				eventId: "event-conversation-web",
+				decisionTaskId: "task-conversation-web",
+				agentRunId: "run-conversation-web",
+				sequence: 1,
+				occurredAt: "2026-08-27T23:10:03.000Z",
+				eventType: "TASK_STATE_CHANGED",
+				taskState: "UNDERSTANDING",
+				summary: "已安全恢复研究任务",
+				synthetic: true,
+			},
+		}),
+	);
+	await expect(page.getByText("已安全恢复研究任务")).toBeVisible();
+	await expect(page.getByText("权威状态：RUNNING")).toBeVisible();
+	await expect(page.getByText("恢复中")).not.toBeVisible();
 });
 
 test("在产品壳中明确显示后台任务失败原因", async ({ page }) => {
@@ -267,6 +358,71 @@ test("移动端在 reduced motion 下可用键盘创建，并把错误焦点交�
 			() => document.documentElement.scrollWidth <= window.innerWidth,
 		),
 	).toBe(true);
+});
+
+test("切换 Session 时不复用上一项任务的暂停控制状态", async ({ page }) => {
+	const first = buildSession();
+	first.title = "第一项决策";
+	first.decisionTasks = [
+		{
+			decisionTaskId: "task-session-first",
+			linkedAt: "2026-08-27T23:10:00.000Z",
+		},
+	];
+	const second = buildSession();
+	second.sessionId = "session-web-2";
+	second.title = "第二项决策";
+	second.decisionTasks = [
+		{
+			decisionTaskId: "task-session-second",
+			linkedAt: "2026-08-27T23:11:00.000Z",
+		},
+	];
+	await page.route(/\/api\/conversations(?:\/.*)?$/, async (route) => {
+		const path = new URL(route.request().url()).pathname;
+		if (path === "/api/conversations") {
+			await json(route, 200, [summary(first), summary(second)]);
+			return;
+		}
+		await json(route, 200, path.endsWith(first.sessionId) ? first : second);
+	});
+	await page.route("**/api/decision-tasks/*/events*", async (route) => {
+		await route.fulfill({
+			status: 200,
+			contentType: "text/event-stream",
+			body: "",
+		});
+	});
+	await page.route(
+		"**/api/decision-tasks/task-session-first",
+		async (route) => {
+			await json(
+				route,
+				200,
+				buildTaskSnapshot("task-session-first", "PAUSED_PERMISSION"),
+			);
+		},
+	);
+	await page.route(
+		"**/api/decision-tasks/task-session-second",
+		async (route) => {
+			await new Promise((resolve) => setTimeout(resolve, 400));
+			await json(
+				route,
+				200,
+				buildTaskSnapshot("task-session-second", "RUNNING"),
+			);
+		},
+	);
+
+	await page.goto(`/?session=${first.sessionId}`);
+	await expect(page.getByRole("button", { name: "安全恢复" })).toBeVisible();
+	await page.getByRole("button", { name: /第二项决策/ }).click();
+
+	await expect(
+		page.getByRole("button", { name: "安全恢复" }),
+	).not.toBeVisible();
+	await expect(page.getByText("权威状态：RUNNING")).toBeVisible();
 });
 
 function buildSession() {
@@ -424,5 +580,24 @@ function buildFailedResult() {
 			issues: [],
 			occurredAt: "2026-08-27T23:10:00.000Z",
 		},
+	};
+}
+
+function buildTaskSnapshot(
+	decisionTaskId: string,
+	state: "PAUSED_PERMISSION" | "RUNNING",
+) {
+	return {
+		contractType: "decision-task-snapshot",
+		contractVersion: "1.0",
+		executionRequestId: `exec-${decisionTaskId}`,
+		decisionTaskId,
+		agentRunId: `run-${decisionTaskId}`,
+		state,
+		terminal: false,
+		...(state === "PAUSED_PERMISSION"
+			? { runtimeSnapshotId: `snapshot-${decisionTaskId}` }
+			: {}),
+		updatedAt: "2026-08-27T23:10:00.000Z",
 	};
 }

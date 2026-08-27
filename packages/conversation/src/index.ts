@@ -324,10 +324,12 @@ async function createSession(
 		}
 
 		const sessionId = randomUUID();
-		await client.query(
+		const inserted = await client.query<{ session_id: string }>(
 			`INSERT INTO conversation_sessions (
 				session_id, owner_user_id, client_request_id, title, created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $5)`,
+			) VALUES ($1, $2, $3, $4, $5, $5)
+			ON CONFLICT (owner_user_id, client_request_id) DO NOTHING
+			RETURNING session_id`,
 			[
 				sessionId,
 				command.ownerUserId,
@@ -336,6 +338,28 @@ async function createSession(
 				createdAt,
 			],
 		);
+		if (inserted.rowCount === 0) {
+			const concurrent = await client.query<{ session_id: string }>(
+				`SELECT session_id
+				 FROM conversation_sessions
+				 WHERE owner_user_id = $1 AND client_request_id = $2`,
+				[command.ownerUserId, command.clientRequestId],
+			);
+			await client.query("COMMIT");
+			const concurrentSessionId = concurrent.rows[0]?.session_id;
+			if (concurrentSessionId === undefined) {
+				throw new Error("并发幂等 Session 无法读取");
+			}
+			const concurrentSession = await loadSession(
+				pool,
+				command.ownerUserId,
+				concurrentSessionId,
+			);
+			if (concurrentSession === undefined) {
+				throw new Error("并发幂等 Session 无法读取");
+			}
+			return concurrentSession;
+		}
 		await insertMessage(client, {
 			createdAt,
 			messageId: randomUUID(),
@@ -470,13 +494,13 @@ async function appendUserTurn(
 		});
 		await client.query(
 			`UPDATE conversation_sessions
-			 SET title = CASE WHEN title = '新的消费决策' AND $3::text IS NOT NULL THEN $3::text ELSE title END,
+			 SET title = CASE WHEN $3::text IS NOT NULL THEN $3::text ELSE title END,
 			     updated_at = $4
 			 WHERE session_id = $1 AND owner_user_id = $2`,
 			[
 				command.sessionId,
 				command.ownerUserId,
-				nextRequirement.consumptionGoal,
+				normalizedUpdate.consumptionGoal ?? null,
 				createdAt,
 			],
 		);

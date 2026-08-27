@@ -244,6 +244,41 @@ describe.skipIf(databaseUrl === undefined)("Conversation 用户旅程", () => {
 		await conversation.close();
 	});
 
+	it("并发重试同一创建请求只生成一个 Session", async () => {
+		if (databaseUrl === undefined) throw new Error("测试数据库未配置");
+		const isolated = await createIsolatedDatabaseUrl(databaseUrl);
+		const conversation = await openPostgresConversation({
+			databaseUrl: isolated,
+		});
+		const lockPool = new Pool({ connectionString: isolated });
+		const lockClient = await lockPool.connect();
+		await lockClient.query("BEGIN");
+		await lockClient.query("LOCK TABLE conversation_sessions IN SHARE MODE");
+		const attempts = Promise.all([
+			conversation.execute({
+				type: "CREATE_SESSION",
+				clientRequestId: "create-concurrently",
+				ownerUserId: "user-a",
+			}),
+			conversation.execute({
+				type: "CREATE_SESSION",
+				clientRequestId: "create-concurrently",
+				ownerUserId: "user-a",
+			}),
+		]);
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		await lockClient.query("COMMIT");
+		lockClient.release();
+		await lockPool.end();
+		const [first, second] = await attempts;
+
+		expect(second).toEqual(first);
+		await expect(
+			conversation.read({ type: "LIST_SESSIONS", ownerUserId: "user-a" }),
+		).resolves.toHaveLength(1);
+		await conversation.close();
+	});
+
 	it("幂等链接 Decision Task，但不允许其他 User 改写 Session", async () => {
 		if (databaseUrl === undefined) throw new Error("测试数据库未配置");
 		const isolated = await createIsolatedDatabaseUrl(databaseUrl);

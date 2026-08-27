@@ -244,6 +244,48 @@ describe("start_all.bat", () => {
 		}
 	});
 
+	test("Node 版本不匹配时通过已安装的 fnm 使用仓库固定版本", () => {
+		const windowsRoot = process.env.SystemRoot ?? "C:\\Windows";
+		const commandDirectory = mkdtempSync(
+			resolve(tmpdir(), "choicemind-start-all-"),
+		);
+		const fnmLogPath = resolve(commandDirectory, "fnm.log");
+		writeFileSync(
+			resolve(commandDirectory, "node.cmd"),
+			"@echo v24.16.0\r\n",
+			"utf8",
+		);
+		writeFileSync(
+			resolve(commandDirectory, "fnm.cmd"),
+			`@echo %*>>"${fnmLogPath}"\r\n@exit /b 37\r\n`,
+			"utf8",
+		);
+		const environment = { ...process.env };
+		delete environment.PATH;
+		delete environment.Path;
+		environment.PATH = [
+			commandDirectory,
+			resolve(windowsRoot, "System32"),
+			resolve(windowsRoot, "System32/WindowsPowerShell/v1.0"),
+		].join(";");
+
+		try {
+			const result = spawnSync(
+				process.env.ComSpec ?? resolve(windowsRoot, "System32/cmd.exe"),
+				["/d", "/c", "start_all.bat --preflight-only"],
+				{ cwd: repositoryRoot, encoding: "utf8", env: environment },
+			);
+
+			expect(result.status).toBe(37);
+			expect(readFileSync(fnmLogPath, "utf8")).toContain(
+				"exec --using=22.22.1 --",
+			);
+			expect(readFileSync(fnmLogPath, "utf8")).toContain("-PreflightOnly");
+		} finally {
+			rmSync(commandDirectory, { force: true, recursive: true });
+		}
+	});
+
 	test("依赖与端口可用时输出服务地址和数据卷策略", () => {
 		const windowsRoot = process.env.SystemRoot ?? "C:\\Windows";
 		const commandDirectory = mkdtempSync(

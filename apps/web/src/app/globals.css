@@ -902,6 +902,27 @@ thead th {
 	line-height: 1.65;
 }
 
+.requirement-actions {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px 14px;
+	min-inline-size: 0;
+	margin-top: 14px;
+	padding: 0;
+	border: 0;
+}
+
+.requirement-actions button {
+	padding: 0;
+	border: 0;
+	border-bottom: 1px solid currentColor;
+	background: transparent;
+	color: var(--copper);
+	font: inherit;
+	font-size: 13px;
+	cursor: pointer;
+}
+
 .research-state > p:last-child {
 	color: var(--muted);
 	line-height: 1.7;

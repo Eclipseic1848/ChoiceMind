@@ -10,18 +10,41 @@ $ProgressPreference = 'SilentlyContinue'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 $RepositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
-
-if ($null -eq (Get-Command node -ErrorAction SilentlyContinue)) {
-    [Console]::Error.WriteLine('错误：缺少必需命令：node。请安装项目要求的 Node.js 后重试。')
-    exit 1
-}
-
 $packageManifest = Get-Content -LiteralPath (Join-Path $RepositoryRoot 'package.json') -Raw -Encoding utf8 | ConvertFrom-Json
 $requiredNodeVersion = [string]$packageManifest.engines.node
-$actualNodeVersion = (& node --version).Trim().TrimStart('v')
+$nodeCommand = Get-Command node -ErrorAction SilentlyContinue
+$actualNodeVersion = if ($null -eq $nodeCommand) { $null } else { (& node --version).Trim().TrimStart('v') }
 
 if ($actualNodeVersion -ne $requiredNodeVersion) {
-    [Console]::Error.WriteLine("错误：Node.js 版本不匹配：需要 $requiredNodeVersion，当前为 $actualNodeVersion。请使用 fnm 切换后重试。")
+    $fnmCommand = Get-Command fnm -ErrorAction SilentlyContinue
+    if ($null -ne $fnmCommand -and $env:CHOICEMIND_FNM_RELAUNCHED -ne '1') {
+        Write-Output "检测到 Node.js 版本不匹配，正在通过 fnm 使用项目要求的 $requiredNodeVersion…"
+        $env:CHOICEMIND_FNM_RELAUNCHED = '1'
+        $relaunchArguments = @(
+            'exec',
+            "--using=$requiredNodeVersion",
+            '--',
+            (Get-Process -Id $PID).Path,
+            '-NoLogo',
+            '-NoProfile',
+            '-ExecutionPolicy',
+            'Bypass',
+            '-File',
+            $PSCommandPath
+        )
+        if ($PreflightOnly) {
+            $relaunchArguments += '-PreflightOnly'
+        }
+        & $fnmCommand.Source @relaunchArguments
+        exit $LASTEXITCODE
+    }
+
+    if ($null -eq $actualNodeVersion) {
+        [Console]::Error.WriteLine("错误：缺少必需命令：node，也未找到可自动切换到 $requiredNodeVersion 的 fnm。请安装项目要求的 Node.js 后重试。")
+    }
+    else {
+        [Console]::Error.WriteLine("错误：Node.js 版本不匹配：需要 $requiredNodeVersion，当前为 $actualNodeVersion，且无法通过 fnm 自动切换。")
+    }
     exit 1
 }
 

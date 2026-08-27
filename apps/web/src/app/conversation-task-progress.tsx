@@ -54,7 +54,7 @@ export function ConversationTaskProgress({
 					setObservationError(false);
 					if (
 						settleControl &&
-						decodedSnapshot.value.state.startsWith("PAUSED_")
+						!decodedSnapshot.value.state.startsWith("PAUSED_")
 					) {
 						setControlPending(null);
 						setControlStatus(null);
