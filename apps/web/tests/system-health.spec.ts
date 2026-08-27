@@ -16,6 +16,7 @@ import { resetPersistentDecisionTaskTestData } from "../../../packages/task-pers
 
 let apiServer: Server;
 let decisionResponseStatus = 200;
+let decisionResponseFactory: () => unknown = buildSyntheticDecisionResult;
 const sseRecoveryRunId = "agent-run-web-sse-recovery";
 const sseRecoveryTaskId = "task-web-sse-recovery";
 let sseRecoveryCursors: Array<string | null> = [];
@@ -31,6 +32,7 @@ test.describe.configure({ mode: "serial" });
 
 test.beforeEach(() => {
   decisionResponseStatus = 200;
+  decisionResponseFactory = buildSyntheticDecisionResult;
   sseRecoveryCursors = [];
   decisionAuthorizationHeaders = [];
   runtimeControlRequests = [];
@@ -79,7 +81,7 @@ test.beforeAll(async () => {
     if (request.url === "/api/v1/decision-tasks:execute" && request.method === "POST") {
       response.setHeader("content-type", "application/json; charset=utf-8");
       response.statusCode = decisionResponseStatus;
-      response.end(JSON.stringify(buildSyntheticDecisionResult()));
+      response.end(JSON.stringify(decisionResponseFactory()));
       return;
     }
 
@@ -189,6 +191,21 @@ test("shows a reviewable decision with conditions, risk and synthetic evidence",
   await expect(page.getByText("核验实际到手价", { exact: true })).toBeVisible();
   await expect(page.getByText("合成观测价为 7699 元", { exact: true })).toBeVisible();
   await expect(page.getByText("2026-08-19T12:00:00.000Z").first()).toBeVisible();
+});
+
+test("opens the exact source URL from expanded public-web Evidence", async ({ page }) => {
+  decisionResponseFactory = buildPublicEvidenceDecisionResult;
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "运行合成决策" }).click();
+
+  const sourceLink = page.getByRole("link", { name: "打开原始来源" });
+  await expect(sourceLink).toBeVisible();
+  await expect(sourceLink).toHaveAttribute(
+    "href",
+    "https://example.com/choicemind/p0-fixture"
+  );
+  await expect(page.getByText("定位：body / text", { exact: true })).toBeVisible();
 });
 
 test("forwards the server-owned synthetic authorization to the API", async ({ page }) => {
@@ -1324,6 +1341,36 @@ function buildPreferenceDecisionResult() {
     }
   ];
 
+  return result;
+}
+
+function buildPublicEvidenceDecisionResult(): unknown {
+  const result = structuredClone(buildSyntheticDecisionResult());
+  const bundle = result.bundle as unknown as { evidence: unknown[] };
+  bundle.evidence[0] = {
+    contractType: "evidence",
+    contractVersion: "1.0",
+    evidenceId: "evidence-synth-a-price",
+    decisionTaskId: result.taskStatus.decisionTaskId,
+    capturedAt: result.bundle.decision.validFrom,
+    locator: { section: "body", field: "text" },
+    excerpt: "候选 A 公开标价为 7699 元",
+    validUntil: result.bundle.decision.validUntil,
+    synthetic: false,
+    source: {
+      sourceKind: "PUBLIC_WEB",
+      sourceId: "source-public-a",
+      title: "ChoiceMind 固定公开资料",
+      url: "https://example.com/choicemind/p0-fixture"
+    },
+    excerptHash: { algorithm: "sha256", digest: "d".repeat(64) },
+    parserVersion: "choicemind-html-parser-1.0",
+    rawArtifact: {
+      algorithm: "sha256",
+      digest: "c".repeat(64),
+      objectKey: `evidence-raw/sha256/${"c".repeat(64)}`
+    }
+  };
   return result;
 }
 

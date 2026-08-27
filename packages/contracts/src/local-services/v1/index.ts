@@ -54,7 +54,7 @@ export type DocumentParserRequestV1 = Readonly<{
 	port: "DOCUMENT_PARSER";
 	input: Readonly<{
 		document: Readonly<{
-			mediaType: "application/pdf" | "image/png" | "image/jpeg";
+			mediaType: "application/pdf" | "image/png" | "image/jpeg" | "text/html";
 			dataBase64: string;
 		}>;
 	}>;
@@ -206,7 +206,12 @@ const localServiceRequestSchema = z.discriminatedUnion("port", [
 		port: z.literal("DOCUMENT_PARSER"),
 		input: z.strictObject({
 			document: z.strictObject({
-				mediaType: z.enum(["application/pdf", "image/png", "image/jpeg"]),
+				mediaType: z.enum([
+					"application/pdf",
+					"image/png",
+					"image/jpeg",
+					"text/html",
+				]),
 				dataBase64: base64Schema,
 			}),
 		}),

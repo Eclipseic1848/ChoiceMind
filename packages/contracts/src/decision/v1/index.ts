@@ -216,22 +216,46 @@ export type ClaimV1 = Readonly<{
   claimKind: ClaimKindV1;
 }>;
 
-export type EvidenceV1 = Readonly<{
+type EvidenceHeaderV1 = Readonly<{
   contractType: "evidence";
   contractVersion: "1.0";
   evidenceId: string;
   decisionTaskId: string;
+  capturedAt: string;
+  locator: Readonly<{ section: string; field: string }>;
+  excerpt: string;
+  validUntil: string;
+}>;
+
+export type SyntheticEvidenceV1 = EvidenceHeaderV1 &
+  Readonly<{
   synthetic: true;
   source: Readonly<{
     sourceKind: "SYNTHETIC";
     sourceId: string;
     title: string;
   }>;
-  capturedAt: string;
-  locator: Readonly<{ section: string; field: string }>;
-  excerpt: string;
-  validUntil: string;
 }>;
+
+export type PublicWebEvidenceV1 = EvidenceHeaderV1 &
+  Readonly<{
+    synthetic: false;
+    source: Readonly<{
+      sourceKind: "PUBLIC_WEB";
+      sourceId: string;
+      title: string;
+      url: string;
+    }>;
+    excerptHash: Readonly<{ algorithm: "sha256"; digest: string }>;
+    parserVersion: string;
+    rawArtifact: Readonly<{
+      algorithm: "sha256";
+      digest: string;
+      objectKey: string;
+    }>;
+  }>;
+
+export type EvidenceV1 = SyntheticEvidenceV1 | PublicWebEvidenceV1;
 
 export type ClaimEvidenceLinkV1 = Readonly<{
   contractType: "claim-evidence-link";

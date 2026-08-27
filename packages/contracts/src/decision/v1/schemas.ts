@@ -128,17 +128,11 @@ const claimSchema = z.strictObject({
   claimKind: z.enum(["FACT_ASSERTION", "SOURCE_OPINION", "SYSTEM_INFERENCE"])
 });
 
-const evidenceSchema = z.strictObject({
+const evidenceHeaderShape = {
   ...contractHeader,
   contractType: z.literal("evidence"),
   evidenceId: z.string().min(1),
   decisionTaskId: z.string().min(1),
-  synthetic: z.literal(true),
-  source: z.strictObject({
-    sourceKind: z.literal("SYNTHETIC"),
-    sourceId: z.string().min(1),
-    title: meaningfulTextSchema
-  }),
   capturedAt: utcTimestampSchema,
   locator: z.strictObject({
     section: meaningfulTextSchema,
@@ -146,7 +140,49 @@ const evidenceSchema = z.strictObject({
   }),
   excerpt: meaningfulTextSchema,
   validUntil: utcTimestampSchema
+};
+
+const sha256DigestSchema = z.string().regex(/^[0-9a-f]{64}$/);
+
+const syntheticEvidenceSchema = z.strictObject({
+  ...evidenceHeaderShape,
+  synthetic: z.literal(true),
+  source: z.strictObject({
+    sourceKind: z.literal("SYNTHETIC"),
+    sourceId: z.string().min(1),
+    title: meaningfulTextSchema
+  })
 });
+
+const publicWebEvidenceSchema = z.strictObject({
+  ...evidenceHeaderShape,
+  synthetic: z.literal(false),
+  source: z.strictObject({
+    sourceKind: z.literal("PUBLIC_WEB"),
+    sourceId: z.string().min(1),
+    title: meaningfulTextSchema,
+    url: z.url()
+  }),
+  excerptHash: z.strictObject({
+    algorithm: z.literal("sha256"),
+    digest: sha256DigestSchema
+  }),
+  parserVersion: meaningfulTextSchema,
+  rawArtifact: z
+    .strictObject({
+      algorithm: z.literal("sha256"),
+      digest: sha256DigestSchema,
+      objectKey: z.string().min(1)
+    })
+    .refine((value) => value.objectKey === `evidence-raw/sha256/${value.digest}`, {
+      path: ["objectKey"]
+    })
+});
+
+const evidenceSchema = z.discriminatedUnion("synthetic", [
+  syntheticEvidenceSchema,
+  publicWebEvidenceSchema
+]);
 
 const claimEvidenceLinkSchema = z.strictObject({
   ...contractHeader,

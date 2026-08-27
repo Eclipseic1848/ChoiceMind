@@ -617,6 +617,13 @@ function DecisionResult({ result }: Readonly<{ result: SuccessfulDecisionTaskRes
           <p>
             定位：{item.locator.section} / {item.locator.field}
           </p>
+          {item.synthetic ? null : (
+            <p>
+              <a href={item.source.url} rel="noreferrer" target="_blank">
+                打开原始来源
+              </a>
+            </p>
+          )}
           <p>证据有效期：{item.validUntil}</p>
           {Date.parse(item.validUntil) < Date.parse(decision.validFrom) ? (
             <p>形成 Decision 时已过期，仅供追溯</p>

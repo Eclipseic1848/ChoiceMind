@@ -162,4 +162,27 @@ describe("本地服务 v1 合同", () => {
 			],
 		});
 	});
+
+	it("接受受控网页快照的 HTML 文档解析请求", () => {
+		expect(
+			decodeLocalServiceRequestV1({
+				contractType: "local-service-request",
+				contractVersion: "1.0",
+				requestId: "request-html-parser",
+				port: "DOCUMENT_PARSER",
+				input: {
+					document: {
+						mediaType: "text/html",
+						dataBase64: "PG1haW4+Q2hvaWNlTWluZDwvbWFpbj4=",
+					},
+				},
+			}),
+		).toMatchObject({
+			ok: true,
+			value: {
+				port: "DOCUMENT_PARSER",
+				input: { document: { mediaType: "text/html" } },
+			},
+		});
+	});
 });

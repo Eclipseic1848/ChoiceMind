@@ -33,6 +33,8 @@ ChoiceMind 尚未发布 V1.0，也未声明生产就绪。当前仅对 `main` �
 - 每条 Secret 使用独立数据密钥进行信封加密，主密钥必须与数据库密文分离；Secret 只能在受控使用期内解密，不能序列化到 API、RunEvent、日志或错误详情。
 - 凭据访问或变更在加载、解密、回调或保存前必须先写入不可变审计事实；审计不可用时操作失败关闭。
 - 外部访问必须经过 RiskPolicy 与 EgressGuard。EgressRecord 只能包含主体、操作、目标来源、方法、策略结果、关联标识和时间，不得包含 URL 路径、查询参数、正文、响应或 Secret。
+- Evidence 采集只允许精确 allowlist 中的 HTTPS URL；必须在 Egress 与正文读取前拒绝回环、私网、链路本地、DNS 解析失败和手动重定向，且不得仅依赖可伪造的 `Content-Length` 执行大小限制。
+- MIME 与大小门禁必须在对象写入前执行。网页原始字节只进入 SHA-256 内容寻址对象存储；Postgres 只能持久化来源、locator、哈希、parser 版本、对象引用和向量元数据，不得新增原始正文列。
 - Provider、Runtime、工具和外部来源输出均是不可信输入，必须经过 ChoiceMind 合同、安全策略与失败关闭校验。
 - Postgres 是任务状态和公开 RunEvent 的权威来源；Redis、缓存或实时通知不能覆盖权威事实。SSE 断线恢复必须按持久游标从 Postgres 补发。
 - 公开 RunEvent 只能包含可审查的阶段、动作和失败摘要，不得包含模型隐藏思维链、凭据、个人数据或原始模型响应。

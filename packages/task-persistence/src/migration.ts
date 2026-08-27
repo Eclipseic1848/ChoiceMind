@@ -26,6 +26,7 @@ export const persistentRuntimeControlRequestMigrationVersion =
 export const persistentRuntimeCancellationMigrationVersion =
   "0017_runtime_cancellation";
 export const persistentEffectResultMigrationVersion = "0018_effect_result_objects";
+export const persistentEvidenceIndexMigrationVersion = "0019_evidence_index";
 
 export async function migratePersistentDecisionTasks(client: PoolClient): Promise<void> {
   await client.query("BEGIN");
@@ -649,6 +650,47 @@ export async function migratePersistentDecisionTasks(client: PoolClient): Promis
       await client.query(
         `INSERT INTO decision_task_schema_migrations (version) VALUES ($1)`,
         [persistentEffectResultMigrationVersion]
+      );
+    }
+    const evidenceIndexMigration = await client.query<{ applied: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM decision_task_schema_migrations WHERE version = $1
+       ) AS applied`,
+      [persistentEvidenceIndexMigrationVersion]
+    );
+    if (!evidenceIndexMigration.rows[0]?.applied) {
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS evidence_index (
+          evidence_id text PRIMARY KEY,
+          decision_task_id text NOT NULL,
+          captured_at timestamptz NOT NULL,
+          valid_until timestamptz NOT NULL,
+          locator_section text NOT NULL,
+          locator_field text NOT NULL,
+          source_id text NOT NULL,
+          source_title text NOT NULL,
+          source_url text NOT NULL,
+          excerpt_sha256 text NOT NULL CHECK (excerpt_sha256 ~ '^[0-9a-f]{64}$'),
+          parser_version text NOT NULL,
+          raw_artifact_digest text NOT NULL CHECK (raw_artifact_digest ~ '^[0-9a-f]{64}$'),
+          raw_artifact_object_key text NOT NULL,
+          embedding_model text NOT NULL,
+          embedding_dimensions integer NOT NULL CHECK (embedding_dimensions > 0),
+          embedding vector NOT NULL,
+          created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          CHECK (
+            raw_artifact_object_key = 'evidence-raw/sha256/' || raw_artifact_digest
+          ),
+          CHECK (vector_dims(embedding) = embedding_dimensions)
+        )
+      `);
+      await client.query(`
+        CREATE INDEX IF NOT EXISTS evidence_index_task_lookup
+        ON evidence_index (decision_task_id, captured_at DESC, evidence_id)
+      `);
+      await client.query(
+        `INSERT INTO decision_task_schema_migrations (version) VALUES ($1)`,
+        [persistentEvidenceIndexMigrationVersion]
       );
     }
     await client.query("COMMIT");

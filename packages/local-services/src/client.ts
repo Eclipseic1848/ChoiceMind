@@ -193,6 +193,15 @@ function buildUpstreamRequest(
 				{ method: "POST", body: form, signal },
 			];
 		}
+		case "CHOICEMIND_DOCUMENT_PARSER": {
+			if (request.port !== "DOCUMENT_PARSER") {
+				throw new Error("ChoiceMind 解析协议只接受 DocumentParser 请求");
+			}
+			return [
+				joinUrl(target.baseUrl, "document/parse"),
+				jsonPost(request, signal),
+			];
+		}
 	}
 }
 
@@ -210,6 +219,11 @@ function mapSuccessfulResponse(
 	} as const;
 	if (!isRecord(payload)) {
 		return { ...header, output: undefined };
+	}
+	if (target.protocol === "CHOICEMIND_DOCUMENT_PARSER") {
+		return payload.requestId === request.requestId && payload.port === request.port
+			? payload
+			: { ...header, output: undefined };
 	}
 	if (
 		target.protocol === "MINERU"
