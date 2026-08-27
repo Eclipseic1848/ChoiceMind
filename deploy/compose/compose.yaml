@@ -128,6 +128,25 @@ services:
       timeout: 3s
       retries: 5
 
+  evidence-smoke:
+    <<: *node-runtime
+    profiles: ["evidence-smoke"]
+    command: ["corepack", "pnpm", "--filter", "@choicemind/evidence-ingestion", "smoke"]
+    depends_on:
+      data-worker:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      CHOICEMIND_DATABASE_URL: "${CHOICEMIND_DATABASE_URL:?CHOICEMIND_DATABASE_URL is required}"
+      CHOICEMIND_DATA_WORKER_BASE_URL: http://data-worker:3300/v1
+      CHOICEMIND_EVIDENCE_OBJECT_ROOT: /var/lib/choicemind/evidence-objects
+      CHOICEMIND_EVIDENCE_SOURCE_TITLE: "${CHOICEMIND_EVIDENCE_SOURCE_TITLE:-ChoiceMind P0 public source}"
+      CHOICEMIND_EVIDENCE_SOURCE_URL: "${CHOICEMIND_EVIDENCE_SOURCE_URL:-}"
+    volumes:
+      - evidence-objects:/var/lib/choicemind/evidence-objects
+
 volumes:
+  evidence-objects:
   postgres-data:
   redis-data:

@@ -29,7 +29,7 @@ describe("runLocalServiceSmoke", () => {
 		});
 	});
 
-	it("五个固定样本成功时只生成 SMOKE_PASSED 证据", async () => {
+	it("六个固定样本成功时只生成 SMOKE_PASSED 证据", async () => {
 		let tick = 0;
 		const report = await runLocalServiceSmoke(
 			loadLocalServiceConfiguration({}),
@@ -46,8 +46,9 @@ describe("runLocalServiceSmoke", () => {
 			status: "SMOKE_PASSED",
 			executedAt: "2026-08-24T08:00:00.000Z",
 		});
-		expect(report.services).toHaveLength(5);
+		expect(report.services).toHaveLength(6);
 		expect(report.services.map((service) => service.status)).toEqual([
+			"SMOKE_PASSED",
 			"SMOKE_PASSED",
 			"SMOKE_PASSED",
 			"SMOKE_PASSED",
@@ -147,6 +148,16 @@ function success(
 				port: "DOCUMENT_PARSER",
 				output: {
 					parser: requiredModel(target),
+					text: "ChoiceMind",
+					pageCount: 1,
+				},
+			};
+		case "choicemind-html-parser":
+			return {
+				...header,
+				port: "DOCUMENT_PARSER",
+				output: {
+					parser: "choicemind-html-parser-1.0",
 					text: "ChoiceMind",
 					pageCount: 1,
 				},

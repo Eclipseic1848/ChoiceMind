@@ -83,6 +83,28 @@ describe("executeLocalServiceRequest", () => {
 				pageCount: 1,
 			},
 		},
+		{
+			serviceId: "choicemind-html-parser",
+			request: documentRequest("text/html", "PG1haW4+Q2hvaWNlTWluZDwvbWFpbj4="),
+			response: {
+				contractType: "local-service-result",
+				contractVersion: "1.0",
+				requestId: "request-document-text/html",
+				port: "DOCUMENT_PARSER",
+				ok: true,
+				output: {
+					parser: "choicemind-html-parser-1.0",
+					text: "ChoiceMind",
+					pageCount: 1,
+				},
+			},
+			expectedPath: "/v1/document/parse",
+			expectedOutput: {
+				parser: "choicemind-html-parser-1.0",
+				text: "ChoiceMind",
+				pageCount: 1,
+			},
+		},
 	])(
 		"把 $serviceId 的固定成功响应映射为公共合同",
 		async ({ serviceId, request, response, expectedPath, expectedOutput }) => {
@@ -284,7 +306,7 @@ function rerankerRequest(): LocalServiceRequestV1 {
 }
 
 function documentRequest(
-	mediaType: "application/pdf" | "image/png",
+	mediaType: "application/pdf" | "image/png" | "text/html",
 	dataBase64: string,
 ): LocalServiceRequestV1 {
 	return {

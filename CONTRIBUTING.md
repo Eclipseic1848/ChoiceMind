@@ -45,6 +45,16 @@ fnm exec --using=22.22.1 -- pnpm.cmd verify
 - 受保护路由必须使用服务端派生的 Principal 和对象所有权检查；不得信任请求正文、查询参数或浏览器自报的 User ID 与角色。
 - 凭据只能通过 CredentialVault 的受控接口保存和使用；访问或变更必须先形成审计事实，Secret 不得进入返回值、异常、RunEvent 或日志。
 - 外部访问必须先经过 RiskPolicy 与 EgressGuard；EgressRecord 只记录必要元数据，不得保存请求正文、响应内容或 Secret。
+- Evidence 采集改动必须覆盖 allowlist、HTTPS、DNS/SSRF、手动重定向、MIME、声明大小与实际正文大小；失败必须形成结构化 Evidence Gap，不能用占位文本伪造 Evidence。
+- 真实公开来源冒烟必须在执行前写明精确 URL、HTTP 方法、出站内容、对象存储位置和本地模型目标，并取得单独授权。固定离线 fixture、mock、模型 smoke 与真实 URL 采集是不同证据层级。
+
+Evidence ingestion 的本地工程检查可使用：
+
+```powershell
+fnm exec --using=22.22.1 -- pnpm.cmd --filter @choicemind/evidence-ingestion test
+fnm exec --using=22.22.1 -- pnpm.cmd --filter @choicemind/evidence-ingestion typecheck
+uv run --frozen --project services/data-worker pytest services/data-worker/tests -q
+```
 
 ## Phase 完成同步门禁
 

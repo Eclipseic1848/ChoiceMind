@@ -14,7 +14,8 @@ export type LocalServiceProtocolV1 =
 	| "OPENAI_EMBEDDINGS"
 	| "RERANK"
 	| "PADDLEOCR_VL"
-	| "MINERU";
+	| "MINERU"
+	| "CHOICEMIND_DOCUMENT_PARSER";
 
 export type LocalServiceTargetV1 = Readonly<{
 	serviceId:
@@ -22,7 +23,8 @@ export type LocalServiceTargetV1 = Readonly<{
 		| "qwen-embedding"
 		| "qwen-reranker"
 		| "paddleocr-vl"
-		| "mineru";
+		| "mineru"
+		| "choicemind-html-parser";
 	port: LocalServicePortV1;
 	baseUrl: string;
 	model?: string | undefined;
@@ -142,6 +144,20 @@ export function loadLocalServiceConfiguration(
 				timeoutMs: sharedTimeoutMs,
 				capabilities: ["PDF 文档解析"],
 				limitations: ["仅验证固定单页合成 PDF"],
+			},
+			{
+				serviceId: "choicemind-html-parser",
+				port: "DOCUMENT_PARSER",
+				baseUrl: readBaseUrl(
+					environment.CHOICEMIND_DATA_WORKER_BASE_URL,
+					"http://127.0.0.1:3300/v1",
+					"CHOICEMIND_DATA_WORKER_BASE_URL",
+				),
+				protocol: "CHOICEMIND_DOCUMENT_PARSER",
+				timeoutMs: sharedTimeoutMs,
+				limits: { maxInputBytes: 1_500_000 },
+				capabilities: ["HTML 文本解析"],
+				limitations: ["P0 仅接受 UTF-8 HTML"],
 			},
 		],
 	};

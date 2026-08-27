@@ -92,6 +92,21 @@ importers:
         specifier: 4.4.3
         version: 4.4.3
 
+  packages/evidence-ingestion:
+    dependencies:
+      '@choicemind/contracts':
+        specifier: workspace:*
+        version: link:../contracts
+      '@choicemind/local-services':
+        specifier: workspace:*
+        version: link:../local-services
+      '@choicemind/security':
+        specifier: workspace:*
+        version: link:../security
+      '@choicemind/task-persistence':
+        specifier: workspace:*
+        version: link:../task-persistence
+
   packages/local-services:
     dependencies:
       '@choicemind/contracts':

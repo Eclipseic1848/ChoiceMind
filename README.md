@@ -101,6 +101,26 @@ corepack pnpm dev
 
 页面使用固定合成需求与证据，不访问真实商品、价格或用户凭据。
 
+### Evidence 采集候选链路（P0-11，待产品验收）
+
+当前分支提供独立的 Evidence ingestion 入口，不改变现有 synthetic Decision Runtime。链路为：精确批准的 HTTPS URL → SSRF/DNS/MIME/大小/Egress 门禁 → SHA-256 内容寻址对象存储 → data-worker 本地 HTML 解析 → 可定位 Public Web Evidence → 本地 Embedding → pgvector → 本地 Reranker。Postgres 只保存来源、locator、哈希、对象引用和向量元数据，不保存网页原始正文。
+
+仓库内固定 HTML 快照用于离线测试。真实公开 URL 冒烟会产生一次 `GET` 外传，必须先明确目标 URL，并单独取得授权；工程测试通过不代表该真实冒烟、产品验收或生产认证已经完成。
+
+```powershell
+$env:CHOICEMIND_DATABASE_URL = "postgresql://..."
+$env:CHOICEMIND_EVIDENCE_SOURCE_URL = "https://已批准的精确地址/"
+fnm exec --using=22.22.1 -- pnpm.cmd --filter @choicemind/evidence-ingestion smoke
+```
+
+Compose 按需入口使用 `evidence-smoke` profile，默认不会随基础服务启动：
+
+```bash
+docker compose --profile evidence-smoke -f deploy/compose/compose.yaml run --rm evidence-smoke
+```
+
+冒烟报告只输出状态、ID、URL、哈希、parser 版本和检索结果，不输出网页正文或凭据。对象文件保存在独立 `evidence-objects` 卷中。
+
 ### 完整工程检查
 
 ```powershell

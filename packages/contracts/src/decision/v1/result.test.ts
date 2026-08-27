@@ -16,6 +16,58 @@ type MutableFixture<Value> = Value extends readonly (infer Item)[]
     : Value;
 
 describe("decodeDecisionTaskResultV1", () => {
+  it("accepts public-web Evidence with a content-addressed raw artifact and parser provenance", () => {
+    const draft = buildClaimEvidenceAuthorityDraft();
+    (draft.bundle.evidence as unknown as unknown[])[0] = {
+      contractType: "evidence",
+      contractVersion: "1.0",
+      evidenceId: "evidence-contract-test",
+      decisionTaskId: "task-contract-test",
+      synthetic: false,
+      source: {
+        sourceKind: "PUBLIC_WEB",
+        sourceId: "source-public-fixture",
+        title: "ChoiceMind P0 public fixture",
+        url: "https://example.com/choicemind/p0-fixture"
+      },
+      capturedAt: "2026-08-12T12:00:00.000Z",
+      locator: { section: "specifications", field: "memory" },
+      excerpt: "Memory capacity is 32 GiB.",
+      excerptHash: { algorithm: "sha256", digest: "a".repeat(64) },
+      parserVersion: "local-html-parser@1.0.0",
+      rawArtifact: {
+        algorithm: "sha256",
+        digest: "b".repeat(64),
+        objectKey: `evidence-raw/sha256/${"b".repeat(64)}`
+      },
+      validUntil: "2026-09-12T12:00:00.000Z"
+    };
+
+    const finalized = finalizeSuccessfulDecisionTaskResultV1(draft);
+
+    expect(finalized).toMatchObject({
+      ok: true,
+      value: {
+        bundle: {
+          evidence: [
+            {
+              excerptHash: { algorithm: "sha256", digest: "a".repeat(64) },
+              parserVersion: "local-html-parser@1.0.0",
+              rawArtifact: {
+                objectKey: `evidence-raw/sha256/${"b".repeat(64)}`
+              },
+              source: {
+                sourceKind: "PUBLIC_WEB",
+                url: "https://example.com/choicemind/p0-fixture"
+              },
+              synthetic: false
+            }
+          ]
+        }
+      }
+    });
+  });
+
   it("finalizes Runtime Claim/Evidence links into a canonical Claim Assessment", () => {
     const finalized = finalizeSuccessfulDecisionTaskResultV1(
       buildClaimEvidenceAuthorityDraft()

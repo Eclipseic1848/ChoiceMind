@@ -30,6 +30,12 @@ import { Pool, type PoolClient } from "pg";
 import { migratePersistentDecisionTasks } from "./migration.js";
 
 export {
+  openEvidenceIndexStore,
+  type EvidenceIndexRecord,
+  type EvidenceIndexStore
+} from "./evidence-index.js";
+
+export {
   openRunEventNotificationPublisher,
   type RunEventNotificationPublisher,
   type RunEventNotificationPublisherBatchResult

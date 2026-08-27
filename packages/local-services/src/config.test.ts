@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { loadLocalServiceConfiguration } from "./index.js";
 
 describe("loadLocalServiceConfiguration", () => {
-	it("从一个入口提供五个本地服务目标，并默认使用已冻结的 Qwen3.8", () => {
+	it("从一个入口提供六个本地服务目标，并默认使用已冻结的 Qwen3.8", () => {
 		const configuration = loadLocalServiceConfiguration({});
 
 		expect(configuration.targets).toEqual([
@@ -34,6 +34,11 @@ describe("loadLocalServiceConfiguration", () => {
 				serviceId: "mineru",
 				port: "DOCUMENT_PARSER",
 				baseUrl: "http://192.168.121.33:8000",
+			}),
+			expect.objectContaining({
+				serviceId: "choicemind-html-parser",
+				port: "DOCUMENT_PARSER",
+				baseUrl: "http://127.0.0.1:3300/v1",
 			}),
 		]);
 	});

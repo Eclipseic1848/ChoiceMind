@@ -11,6 +11,7 @@ import type {
 	LocalServiceTargetV1,
 } from "./index.js";
 import {
+	HTML_SMOKE_BASE64,
 	MINERU_SMOKE_PDF_BASE64,
 	PADDLE_SMOKE_JPEG_BASE64,
 } from "./smoke-fixtures.js";
@@ -143,6 +144,18 @@ function fixedRequest(target: LocalServiceTargetV1): LocalServiceRequestV1 {
 				document: {
 					mediaType: "image/jpeg",
 					dataBase64: PADDLE_SMOKE_JPEG_BASE64,
+				},
+			},
+		};
+	}
+	if (target.serviceId === "choicemind-html-parser") {
+		return {
+			...header,
+			port: "DOCUMENT_PARSER",
+			input: {
+				document: {
+					mediaType: "text/html",
+					dataBase64: HTML_SMOKE_BASE64,
 				},
 			},
 		};
