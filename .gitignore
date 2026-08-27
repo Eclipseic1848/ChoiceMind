@@ -9,6 +9,8 @@ test-results/
 apps/orchestrator/.artifacts/
 .artifacts/coremind-compat/
 .artifacts/evidence-objects/
+.artifacts/p0-gold*/
+.artifacts/p0-12-local-services-smoke.json
 .venv/
 __pycache__/
 .pytest_cache/
