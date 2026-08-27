@@ -1,7 +1,6 @@
 import type { AgentRuntimePort } from "./port.js";
 import type { EgressGuard } from "@choicemind/security";
 import type { RuntimeRecoveryStore } from "@choicemind/task-persistence";
-import { createCoreMindAgentRuntimeAdapter } from "./coremind-agent-runtime-adapter.js";
 import { createFakeAgentRuntimeAdapter } from "./fake-agent-runtime-adapter.js";
 
 type AgentRuntimeFactoryOptions = Readonly<{
@@ -25,9 +24,9 @@ type AgentRuntimeFactoryOptions = Readonly<{
   >;
 }>;
 
-export function createAgentRuntimeAdapter(
+export async function createAgentRuntimeAdapter(
   options: AgentRuntimeFactoryOptions = {}
-): AgentRuntimePort {
+): Promise<AgentRuntimePort> {
   const env = options.env ?? process.env;
   const runtime = env.CHOICEMIND_RUNTIME ?? "fake";
 
@@ -50,6 +49,10 @@ export function createAgentRuntimeAdapter(
   if (options.egressGuard === undefined) {
     throw new Error("CoreMind Runtime 缺少服务端 EgressGuard");
   }
+
+  const { createCoreMindAgentRuntimeAdapter } = await import(
+    "./coremind-agent-runtime-adapter.js"
+  );
 
   return createCoreMindAgentRuntimeAdapter({
     providerBaseUrl,

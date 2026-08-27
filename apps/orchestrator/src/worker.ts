@@ -16,7 +16,7 @@ const egressGuard = createEgressGuard({
 	now: () => new Date(),
 });
 const executor = createDecisionTaskExecutor({
-	runtime: createAgentRuntimeAdapter({ recoveryStore, egressGuard }),
+	runtime: await createAgentRuntimeAdapter({ recoveryStore, egressGuard }),
 });
 let worker: Awaited<ReturnType<typeof openPersistentDecisionTaskWorker>>;
 try {

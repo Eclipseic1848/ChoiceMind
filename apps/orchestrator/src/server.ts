@@ -4,7 +4,7 @@ import { createAgentRuntimeAdapter } from "./runtime/agent-runtime-factory.js";
 
 const app = buildOrchestratorApp({
   decisionTaskExecutor: createDecisionTaskExecutor({
-    runtime: createAgentRuntimeAdapter()
+    runtime: await createAgentRuntimeAdapter()
   })
 });
 const port = Number(process.env.PORT ?? 3200);
