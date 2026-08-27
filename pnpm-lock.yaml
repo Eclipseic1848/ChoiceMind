@@ -113,6 +113,12 @@ importers:
         specifier: workspace:*
         version: link:../contracts
 
+  packages/p0-gold-gate:
+    dependencies:
+      '@choicemind/contracts':
+        specifier: workspace:*
+        version: link:../contracts
+
   packages/security: {}
 
   packages/task-persistence:

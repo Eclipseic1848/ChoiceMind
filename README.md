@@ -4,9 +4,9 @@
 
 **把消费问题转化为可审查、可验证、可恢复的个人决策。**
 
-[![status](https://img.shields.io/badge/status-P0%20foundation-1f6feb)](#phase-路线) [![phase](https://img.shields.io/badge/phase-P0--06%20complete-2da44e)](#phase-路线) [![Node.js](https://img.shields.io/badge/Node.js-22.22.1-339933?logo=nodedotjs&logoColor=white)](#本地开发) [![pnpm](https://img.shields.io/badge/pnpm-11.21.0-f69220?logo=pnpm&logoColor=white)](#本地开发) [![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-8250df)](#本地开发) [![license](https://img.shields.io/badge/license-MIT-2da44e)](LICENSE)
+[![status](https://img.shields.io/badge/status-P0%20foundation-1f6feb)](#phase-路线) [![phase](https://img.shields.io/badge/phase-P0--12%20validation-d29922)](#phase-路线) [![Node.js](https://img.shields.io/badge/Node.js-22.22.1-339933?logo=nodedotjs&logoColor=white)](#本地开发) [![pnpm](https://img.shields.io/badge/pnpm-11.21.0-f69220?logo=pnpm&logoColor=white)](#本地开发) [![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-8250df)](#本地开发) [![license](https://img.shields.io/badge/license-MIT-2da44e)](LICENSE)
 
-Requirement · Claim/Evidence · Decision · Persistent Task · User Isolation · CredentialVault · RiskPolicy/Egress
+Requirement · Claim/Evidence · Decision · Persistent Task · Safe Recovery · Category Package · Gold Gate
 
 [项目定位](#项目定位) · [已验证能力](#已验证能力) · [Phase 路线](#phase-路线) · [本地开发](#本地开发) · [参与贡献](CONTRIBUTING.md) · [安全策略](SECURITY.md) · [行为准则](CODE_OF_CONDUCT.md)
 
@@ -16,7 +16,7 @@ Requirement · Claim/Evidence · Decision · Persistent Task · User Isolation �
 
 ChoiceMind 是面向单个消费者的智能消费决策 Agent。它把需求、候选方案、可定位证据、约束、风险和未决信息组织成可审查的 Decision；目标不是生成商品榜单，也不代替用户下单。
 
-> 当前处于 **P0：合同、边界、安全、持久化、恢复和可验证底座**。P0-01/02/03、P0-07A、P0-04、P0-05 与 P0-06 已闭环，下一切片是 [P0-07B](https://github.com/Eclipseic1848/ChoiceMind/issues/17)。该状态不代表 P0 整体完成、P1 已开始、生产认证或正式发布。
+> 当前处于 **P0：合同、边界、安全、持久化、恢复和可验证底座** 的最终切片 [P0-12](https://github.com/Eclipseic1848/ChoiceMind/issues/12)。P0-01 至 P0-11 的保留范围均已闭环；P0-12 的合成 Category、统一 Gold Gate、机器可读证据索引与固定六服务 smoke 已形成工程验收候选，产品验收、合并和 Issue 关闭仍待完成。该状态不代表 P0 整体完成、P1 已开始、生产认证或正式发布。
 
 本仓库公开代码与工程配置；内部 ADR、规格书、验收证据和 handoff 按仓库策略保留在本地，不随公开仓库发布。
 
@@ -34,6 +34,9 @@ ChoiceMind 是面向单个消费者的智能消费决策 Agent。它把需求、
 - CredentialVault 为每条 Secret 生成独立数据密钥并使用信封加密，主密钥不进入数据库密文；Secret 无法序列化或从受控使用回调逸出，凭据访问先写审计再释放明文。
 - RiskPolicy 区分 `ALLOW`、`DENY` 与 `REQUIRE_CONFIRMATION`；CoreMind Provider 调用缺少绑定用户与操作的确认或 EgressGuard 时失败关闭，获准调用只留下不含正文、响应或 Secret 的最小 EgressRecord。
 - P0-06 根级验证、真实 Postgres/Redis、Compose 隔离与故障矩阵、独立双轴复审和产品验收通过；[PR #35](https://github.com/Eclipseic1848/ChoiceMind/pull/35) 已合并，[Issue #6](https://github.com/Eclipseic1848/ChoiceMind/issues/6) 已关闭。
+- RuntimeSnapshot、EffectReceipt、Checkpoint 和恢复许可共同约束暂停、恢复、取消与副作用结果复用；started/unknown 副作用保持人工核验或拒绝自动恢复。[Issue #17](https://github.com/Eclipseic1848/ChoiceMind/issues/17) 与 [Issue #9](https://github.com/Eclipseic1848/ChoiceMind/issues/9) 已关闭。
+- Qwen、Embedding、Reranker、PaddleOCR-VL 与 MinerU 的统一版本化合同和固定样本 smoke 已通过产品验收；[PR #39](https://github.com/Eclipseic1848/ChoiceMind/pull/39) 已合并。
+- 受控公开网页可经 Egress/SSRF/MIME/大小门禁、本地 HTML parser、内容寻址对象、pgvector 与本地 Reranker 形成可定位 Evidence；[PR #40](https://github.com/Eclipseic1848/ChoiceMind/pull/40) 已合并，[Issue #11](https://github.com/Eclipseic1848/ChoiceMind/issues/11) 已关闭。
 
 这些是当前代码与验收范围内的证据，不等于真实消费数据质量、完整 Provider 认证、生产安全或发布资格。
 
@@ -69,8 +72,10 @@ Postgres（权威任务状态与持久 RunEvent）
 | [P0-04](https://github.com/Eclipseic1848/ChoiceMind/issues/4) | 已完成 | 持久任务、同事务 Outbox、Redis Streams、幂等 Worker |
 | [P0-05](https://github.com/Eclipseic1848/ChoiceMind/issues/5) | 已完成 | 持久 RunEvent、单调游标、SSE `Last-Event-ID` 回放与 Web 恢复 |
 | [P0-06](https://github.com/Eclipseic1848/ChoiceMind/issues/6) | 已完成 | 服务端身份与 User 隔离、CredentialVault、RiskPolicy、EgressRecord 与审计路径 |
-| [P0-07B](https://github.com/Eclipseic1848/ChoiceMind/issues/17) | 下一切片 | Runtime 事件、恢复与副作用安全 |
-| 后续 P0 | 未开始或待裁决 | 真实模型认证、服务合同、Evidence 最小链路与 Gold Gate |
+| [P0-07B](https://github.com/Eclipseic1848/ChoiceMind/issues/17) / [P0-09](https://github.com/Eclipseic1848/ChoiceMind/issues/9) | 已完成 | Runtime 事件、快照、收据、恢复许可与副作用安全 |
+| [P0-10](https://github.com/Eclipseic1848/ChoiceMind/issues/10) | 已完成 | 五个本地模型/解析服务的版本化合同与真实固定样本 smoke |
+| [P0-11](https://github.com/Eclipseic1848/ChoiceMind/issues/11) | 已完成 | 受控公开来源、本地 HTML 解析、对象引用、可定位 Evidence 与本地检索 |
+| [P0-12](https://github.com/Eclipseic1848/ChoiceMind/issues/12) | 验收候选 | 合成 Category Package、core 零差异、统一 Gold Gate、EvaluationReport、证据索引与固定六服务 smoke 已通过；待产品验收与合并 |
 
 每个 Phase 切片只有在工程证据、独立审查、产品验收、代码合并和 Issue 证据同步分别完成后，才能标记为“已完成”。Phase 完成时必须同步更新本表、上方状态说明、已验证能力、必要的社区文档和 GitHub About；详细清单见[贡献指南](CONTRIBUTING.md#phase-完成同步门禁)。
 
@@ -101,11 +106,11 @@ corepack pnpm dev
 
 页面使用固定合成需求与证据，不访问真实商品、价格或用户凭据。
 
-### Evidence 采集候选链路（P0-11，待产品验收）
+### Evidence 采集链路（P0-11，已完成）
 
-当前分支提供独立的 Evidence ingestion 入口，不改变现有 synthetic Decision Runtime。链路为：精确批准的 HTTPS URL → SSRF/DNS/MIME/大小/Egress 门禁 → SHA-256 内容寻址对象存储 → data-worker 本地 HTML 解析 → 可定位 Public Web Evidence → 本地 Embedding → pgvector → 本地 Reranker。Postgres 只保存来源、locator、哈希、对象引用和向量元数据，不保存网页原始正文。
+Evidence ingestion 入口不改变现有 synthetic Decision Runtime。链路为：精确批准的 HTTPS URL → SSRF/DNS/MIME/大小/Egress 门禁 → SHA-256 内容寻址对象存储 → data-worker 本地 HTML 解析 → 可定位 Public Web Evidence → 本地 Embedding → pgvector → 本地 Reranker。Postgres 只保存来源、locator、哈希、对象引用和向量元数据，不保存网页原始正文。
 
-仓库内固定 HTML 快照用于离线测试。真实公开 URL 冒烟会产生一次 `GET` 外传，必须先明确目标 URL，并单独取得授权；工程测试通过不代表该真实冒烟、产品验收或生产认证已经完成。
+仓库内固定 HTML 快照用于离线测试。P0-11 已对获批的 `https://example.com/` 完成一次真实闭环并通过产品验收；再次访问或更换来源仍必须明确目标 URL 并单独取得授权，历史验收不自动授权新的外传。
 
 ```powershell
 $env:CHOICEMIND_DATABASE_URL = "postgresql://..."
@@ -120,6 +125,19 @@ docker compose --profile evidence-smoke -f deploy/compose/compose.yaml run --rm 
 ```
 
 冒烟报告只输出状态、ID、URL、哈希、parser 版本和检索结果，不输出网页正文或凭据。对象文件保存在独立 `evidence-objects` 卷中。
+
+### P0 Gold Gate（P0-12，验收候选）
+
+统一入口使用合成折叠露营桌 Category Package 经过现有 `DecisionTaskExecutor` 生成合法 Decision，并把合同正反例、失败语义、用户隔离、秘密脱敏、事件重放/恢复、core 零差异及当前六服务合同结果汇总为机器可读 `evaluation-report.json` 与 `evidence-index.json`。任一阻断门禁失败时整体返回 `P0_FAILED`。
+
+```powershell
+$env:CHOICEMIND_LOCAL_SMOKE_REPORT_PATH = ".artifacts/p0-12-local-services-smoke.json"
+fnm exec --using=22.22.1 -- pnpm.cmd smoke:local-services
+fnm exec --using=22.22.1 -- pnpm.cmd p0:gold `
+  --local-service-report ".artifacts/p0-12-local-services-smoke.json"
+```
+
+当前六项为 Qwen 模型、Embedding、Reranker、PaddleOCR-VL、MinerU 和 ChoiceMind HTML parser。2026-08-26 已在获批范围内各执行一次固定合成样本 smoke，六项均通过；随后统一 Gold Gate 返回 `P0_PASSED` 且无阻断项。该结果只构成 Issue #12 的工程验收候选，不替代产品验收、生产能力认证、合并或 Issue 关闭。再次运行真实 smoke 仍必须单独确认精确端点；旧五服务报告会被明确拒绝。
 
 ### 完整工程检查
 
