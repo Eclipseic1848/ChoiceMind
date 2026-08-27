@@ -4,7 +4,7 @@
 
 **把消费问题转化为可审查、可验证、可恢复的个人决策。**
 
-[![status](https://img.shields.io/badge/status-P0%20foundation-1f6feb)](#phase-路线) [![phase](https://img.shields.io/badge/phase-P0--12%20validation-d29922)](#phase-路线) [![Node.js](https://img.shields.io/badge/Node.js-22.22.1-339933?logo=nodedotjs&logoColor=white)](#本地开发) [![pnpm](https://img.shields.io/badge/pnpm-11.21.0-f69220?logo=pnpm&logoColor=white)](#本地开发) [![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-8250df)](#本地开发) [![license](https://img.shields.io/badge/license-MIT-2da44e)](LICENSE)
+[![status](https://img.shields.io/badge/status-P0%20complete-2da44e)](#phase-路线) [![phase](https://img.shields.io/badge/phase-P1%20not%20started-6e7781)](#phase-路线) [![Node.js](https://img.shields.io/badge/Node.js-22.22.1-339933?logo=nodedotjs&logoColor=white)](#本地开发) [![pnpm](https://img.shields.io/badge/pnpm-11.21.0-f69220?logo=pnpm&logoColor=white)](#本地开发) [![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-8250df)](#本地开发) [![license](https://img.shields.io/badge/license-MIT-2da44e)](LICENSE)
 
 Requirement · Claim/Evidence · Decision · Persistent Task · Safe Recovery · Category Package · Gold Gate
 
@@ -16,7 +16,7 @@ Requirement · Claim/Evidence · Decision · Persistent Task · Safe Recovery ·
 
 ChoiceMind 是面向单个消费者的智能消费决策 Agent。它把需求、候选方案、可定位证据、约束、风险和未决信息组织成可审查的 Decision；目标不是生成商品榜单，也不代替用户下单。
 
-> 当前处于 **P0：合同、边界、安全、持久化、恢复和可验证底座** 的最终切片 [P0-12](https://github.com/Eclipseic1848/ChoiceMind/issues/12)。P0-01 至 P0-11 的保留范围均已闭环；P0-12 的合成 Category、统一 Gold Gate、机器可读证据索引与固定六服务 smoke 已形成工程验收候选，产品验收、合并和 Issue 关闭仍待完成。该状态不代表 P0 整体完成、P1 已开始、生产认证或正式发布。
+> **P0：合同、边界、安全、持久化、恢复和可验证底座已完成。** P0-01 至 P0-12 均已完成产品验收、代码合并和 Issue 关闭。项目当前停止在 P0/P1 决策边界，P1 尚未启动；该状态不代表 V1.0 完成、生产认证或正式发布。
 
 本仓库公开代码与工程配置；内部 ADR、规格书、验收证据和 handoff 按仓库策略保留在本地，不随公开仓库发布。
 
@@ -75,7 +75,7 @@ Postgres（权威任务状态与持久 RunEvent）
 | [P0-07B](https://github.com/Eclipseic1848/ChoiceMind/issues/17) / [P0-09](https://github.com/Eclipseic1848/ChoiceMind/issues/9) | 已完成 | Runtime 事件、快照、收据、恢复许可与副作用安全 |
 | [P0-10](https://github.com/Eclipseic1848/ChoiceMind/issues/10) | 已完成 | 五个本地模型/解析服务的版本化合同与真实固定样本 smoke |
 | [P0-11](https://github.com/Eclipseic1848/ChoiceMind/issues/11) | 已完成 | 受控公开来源、本地 HTML 解析、对象引用、可定位 Evidence 与本地检索 |
-| [P0-12](https://github.com/Eclipseic1848/ChoiceMind/issues/12) | 验收候选 | 合成 Category Package、core 零差异、统一 Gold Gate、EvaluationReport、证据索引与固定六服务 smoke 已通过；待产品验收与合并 |
+| [P0-12](https://github.com/Eclipseic1848/ChoiceMind/issues/12) | 已完成 | 合成 Category Package、core 零差异、统一 Gold Gate、EvaluationReport、证据索引与固定六服务 smoke；[PR #41](https://github.com/Eclipseic1848/ChoiceMind/pull/41) 已合并 |
 
 每个 Phase 切片只有在工程证据、独立审查、产品验收、代码合并和 Issue 证据同步分别完成后，才能标记为“已完成”。Phase 完成时必须同步更新本表、上方状态说明、已验证能力、必要的社区文档和 GitHub About；详细清单见[贡献指南](CONTRIBUTING.md#phase-完成同步门禁)。
 
@@ -126,7 +126,7 @@ docker compose --profile evidence-smoke -f deploy/compose/compose.yaml run --rm 
 
 冒烟报告只输出状态、ID、URL、哈希、parser 版本和检索结果，不输出网页正文或凭据。对象文件保存在独立 `evidence-objects` 卷中。
 
-### P0 Gold Gate（P0-12，验收候选）
+### P0 Gold Gate（P0-12，已完成）
 
 统一入口使用合成折叠露营桌 Category Package 经过现有 `DecisionTaskExecutor` 生成合法 Decision，并把合同正反例、失败语义、用户隔离、秘密脱敏、事件重放/恢复、core 零差异及当前六服务合同结果汇总为机器可读 `evaluation-report.json` 与 `evidence-index.json`。任一阻断门禁失败时整体返回 `P0_FAILED`。
 
@@ -137,7 +137,7 @@ fnm exec --using=22.22.1 -- pnpm.cmd p0:gold `
   --local-service-report ".artifacts/p0-12-local-services-smoke.json"
 ```
 
-当前六项为 Qwen 模型、Embedding、Reranker、PaddleOCR-VL、MinerU 和 ChoiceMind HTML parser。2026-08-26 已在获批范围内各执行一次固定合成样本 smoke，六项均通过；随后统一 Gold Gate 返回 `P0_PASSED` 且无阻断项。该结果只构成 Issue #12 的工程验收候选，不替代产品验收、生产能力认证、合并或 Issue 关闭。再次运行真实 smoke 仍必须单独确认精确端点；旧五服务报告会被明确拒绝。
+当前六项为 Qwen 模型、Embedding、Reranker、PaddleOCR-VL、MinerU 和 ChoiceMind HTML parser。2026-08-26 已在获批范围内各执行一次固定合成样本 smoke，六项均通过；随后统一 Gold Gate 返回 `P0_PASSED` 且无阻断项，Issue #12 已完成产品验收并通过 PR #41 合入。该结果不等于生产能力认证、V1.0 完成或正式发布。再次运行真实 smoke 仍必须单独确认精确端点；旧五服务报告会被明确拒绝。
 
 ### 完整工程检查
 
