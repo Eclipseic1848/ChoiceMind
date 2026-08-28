@@ -1,3 +1,4 @@
+import { openPostgresConversation } from "@choicemind/conversation";
 import type { ExecuteDecisionTaskCommandV1 } from "@choicemind/contracts/decision/v1";
 import {
 	openPostgresIdentityAccess,
@@ -40,9 +41,13 @@ describe.skipIf(databaseUrl === undefined)(
 				databaseUrl: isolated,
 				now: () => now,
 			});
+			const conversation = await openPostgresConversation({
+				databaseUrl: isolated,
+				now: () => now,
+			});
 			const worker = await openPostgresIdentityLifecycleWorker({
 				databaseUrl: isolated,
-				handle: createIdentityLifecycleHandler(tasks),
+				handle: createIdentityLifecycleHandler(tasks, conversation),
 				now: () => now,
 			});
 			try {
@@ -90,6 +95,16 @@ describe.skipIf(databaseUrl === undefined)(
 				await tasks.saveEncryptedCredential(
 					buildCredential(other.account.accountId, "other-key"),
 				);
+				const targetSession = await conversation.execute({
+					type: "CREATE_SESSION",
+					clientRequestId: "target-session",
+					ownerUserId: target.account.accountId,
+				});
+				const otherSession = await conversation.execute({
+					type: "CREATE_SESSION",
+					clientRequestId: "other-session",
+					ownerUserId: other.account.accountId,
+				});
 
 				await identity.execute({
 					type: "SET_ACCOUNT_STATUS",
@@ -148,8 +163,27 @@ describe.skipIf(databaseUrl === undefined)(
 				await expect(
 					tasks.loadEncryptedCredential("other-key", other.account.accountId),
 				).resolves.toBeDefined();
+				await expect(
+					conversation.read({
+						type: "GET_SESSION",
+						ownerUserId: target.account.accountId,
+						sessionId: targetSession.sessionId,
+					}),
+				).resolves.toBeUndefined();
+				await expect(
+					conversation.read({
+						type: "GET_SESSION",
+						ownerUserId: other.account.accountId,
+						sessionId: otherSession.sessionId,
+					}),
+				).resolves.toEqual(otherSession);
 			} finally {
-				await Promise.all([worker.close(), tasks.close(), identity.close()]);
+				await Promise.all([
+					worker.close(),
+					tasks.close(),
+					conversation.close(),
+					identity.close(),
+				]);
 			}
 		}, 30_000);
 	},

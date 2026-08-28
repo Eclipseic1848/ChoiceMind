@@ -11,7 +11,7 @@ const repositoryRoot = resolve(
 	"../..",
 );
 describe("start_all.bat", () => {
-	test("本地开发使用持久身份并监听 Identity 包源码", () => {
+	test("本地开发使用持久身份并监听 Identity 与 Conversation 包源码", () => {
 		const startScript = readFileSync(
 			resolve(repositoryRoot, "scripts/start-all/start-all.ps1"),
 			"utf8",
@@ -22,6 +22,12 @@ describe("start_all.bat", () => {
 		const identityManifest = JSON.parse(
 			readFileSync(
 				resolve(repositoryRoot, "packages/identity-access/package.json"),
+				"utf8",
+			),
+		) as { scripts: Record<string, string> };
+		const conversationManifest = JSON.parse(
+			readFileSync(
+				resolve(repositoryRoot, "packages/conversation/package.json"),
 				"utf8",
 			),
 		) as { scripts: Record<string, string> };
@@ -38,13 +44,18 @@ describe("start_all.bat", () => {
 		expect(rootManifest.scripts.predev).toContain(
 			"@choicemind/identity-access build",
 		);
+		expect(rootManifest.scripts.predev).toContain(
+			"@choicemind/conversation build",
+		);
 		expect(rootManifest.scripts.dev).toContain(
 			"@choicemind/identity-access dev",
 		);
+		expect(rootManifest.scripts.dev).toContain("@choicemind/conversation dev");
 		expect(rootManifest.scripts.dev).toContain(
 			"src/identity-lifecycle-worker.ts",
 		);
 		expect(identityManifest.scripts.dev).toContain("--watch");
+		expect(conversationManifest.scripts.dev).toContain("--watch");
 		expect(apiManifest.scripts["start:identity-lifecycle"]).toContain(
 			"identity-lifecycle-worker.js",
 		);

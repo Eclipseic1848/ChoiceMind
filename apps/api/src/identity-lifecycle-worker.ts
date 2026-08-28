@@ -1,3 +1,4 @@
+import { openPostgresConversation } from "@choicemind/conversation";
 import {
 	openPostgresIdentityAccess,
 	openPostgresIdentityLifecycleWorker,
@@ -10,9 +11,10 @@ const databaseUrl = requireEnvironment("CHOICEMIND_DATABASE_URL");
 const identityAccess = await openPostgresIdentityAccess({ databaseUrl });
 await identityAccess.close();
 const taskPersistence = await openPersistentDecisionTaskModule({ databaseUrl });
+const conversation = await openPostgresConversation({ databaseUrl });
 const worker = await openPostgresIdentityLifecycleWorker({
 	databaseUrl,
-	handle: createIdentityLifecycleHandler(taskPersistence),
+	handle: createIdentityLifecycleHandler(taskPersistence, conversation),
 });
 const pollIntervalMs = Number(
 	process.env.CHOICEMIND_IDENTITY_LIFECYCLE_POLL_MS ?? 500,
@@ -34,7 +36,11 @@ try {
 } finally {
 	process.off("SIGINT", requestStop);
 	process.off("SIGTERM", requestStop);
-	await Promise.all([worker.close(), taskPersistence.close()]);
+	await Promise.all([
+		worker.close(),
+		taskPersistence.close(),
+		conversation.close(),
+	]);
 }
 
 function requireEnvironment(name: string): string {

@@ -32,6 +32,9 @@ importers:
       '@choicemind/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
+      '@choicemind/conversation':
+        specifier: workspace:*
+        version: link:../../packages/conversation
       '@choicemind/identity-access':
         specifier: workspace:*
         version: link:../../packages/identity-access
@@ -86,6 +89,9 @@ importers:
         specifier: 19.2.8
         version: 19.2.8(react@19.2.8)
     devDependencies:
+      '@choicemind/conversation':
+        specifier: workspace:*
+        version: link:../../packages/conversation
       '@choicemind/identity-access':
         specifier: workspace:*
         version: link:../../packages/identity-access
@@ -110,6 +116,16 @@ importers:
       zod:
         specifier: 4.4.3
         version: 4.4.3
+
+  packages/conversation:
+    dependencies:
+      pg:
+        specifier: 8.23.0
+        version: 8.23.0
+    devDependencies:
+      '@types/pg':
+        specifier: 8.23.1
+        version: 8.23.1
 
   packages/evidence-ingestion:
     dependencies:

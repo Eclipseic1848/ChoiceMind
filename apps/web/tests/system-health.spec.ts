@@ -13,6 +13,7 @@ import {
   openRuntimeRecoveryStore
 } from "../../../packages/task-persistence/src/index.js";
 import { resetPersistentDecisionTaskTestData } from "../../../packages/task-persistence/tests/integration/support.js";
+import { isSyntheticDevelopmentPageEnabled } from "../src/app/dev/synthetic-decision/access";
 
 let apiServer: Server;
 let decisionResponseStatus = 200;
@@ -30,6 +31,16 @@ let runtimeControlRequests: Array<{
 let verticalApiUrl: string | undefined;
 
 test.describe.configure({ mode: "serial" });
+
+test("keeps the synthetic verification page disabled outside development by default", () => {
+  expect(isSyntheticDevelopmentPageEnabled({ NODE_ENV: "production" })).toBe(false);
+  expect(
+    isSyntheticDevelopmentPageEnabled({
+      NODE_ENV: "production",
+      CHOICEMIND_ENABLE_SYNTHETIC_DEV_PAGE: "true"
+    })
+  ).toBe(true);
+});
 
 test.beforeEach(() => {
   decisionResponseStatus = 200;
@@ -166,7 +177,7 @@ test.afterAll(async () => {
 });
 
 test("shows the four process states returned by the API", async ({ page }) => {
-  await page.goto("/");
+  await page.goto("/dev/synthetic-decision");
 
   await expect(page.getByRole("heading", { name: "系统健康" })).toBeVisible();
   await expect(page.getByText("全部正常")).toBeVisible();
@@ -179,7 +190,7 @@ test("shows the four process states returned by the API", async ({ page }) => {
 test("shows a reviewable decision with conditions, risk and synthetic evidence", async ({
   page
 }) => {
-  await page.goto("/");
+  await page.goto("/dev/synthetic-decision");
   await page.getByRole("button", { name: "运行合成决策" }).click();
 
   await expect(page.getByText("合成测试数据，不代表真实商品、价格或购买建议")).toBeVisible();
@@ -211,7 +222,7 @@ test("shows a reviewable decision with conditions, risk and synthetic evidence",
 test("opens the exact source URL from expanded public-web Evidence", async ({ page }) => {
   decisionResponseFactory = buildPublicEvidenceDecisionResult;
 
-  await page.goto("/");
+  await page.goto("/dev/synthetic-decision");
   await page.getByRole("button", { name: "运行合成决策" }).click();
 
   const sourceLink = page.getByRole("link", { name: "打开原始来源" });
@@ -224,7 +235,7 @@ test("opens the exact source URL from expanded public-web Evidence", async ({ pa
 });
 
 test("forwards the server-owned synthetic authorization to the API", async ({ page }) => {
-  await page.goto("/");
+  await page.goto("/dev/synthetic-decision");
   await page.getByRole("button", { name: "运行合成决策" }).click();
 
   await expect.poll(() => decisionAuthorizationHeaders[0]).toBe("Bearer web-test-token");
@@ -238,7 +249,7 @@ test("forwards the browser session Cookie to decision APIs", async ({ page, cont
       url: "http://127.0.0.1:3000"
     }
   ]);
-  await page.goto("/");
+  await page.goto("/dev/synthetic-decision");
   await page.getByRole("button", { name: "运行合成决策" }).click();
 
   await expect.poll(() => decisionCookieHeaders[0]).toContain(
@@ -308,7 +319,7 @@ test("stores the accepted task in the URL and restores persisted events after re
     });
   });
 
-  await page.goto("/");
+  await page.goto("/dev/synthetic-decision");
   await page.getByRole("button", { name: "运行合成决策" }).click();
 
   await expect.poll(() => taskId).toMatch(/^task-/);
@@ -381,7 +392,7 @@ test("deduplicates and orders replayed events while treating disconnect as recon
     });
   });
 
-  await page.goto(`/?decisionTaskId=${taskId}`);
+  await page.goto(`/dev/synthetic-decision?decisionTaskId=${taskId}`);
   const progress = page.getByRole("region", { name: "任务进度" });
 
   await expect(progress.getByRole("listitem")).toHaveText(["第一阶段", "第二阶段"]);
@@ -410,7 +421,7 @@ test("reconnects after SSE is temporarily unavailable and replays the recovered 
     });
   });
 
-  await page.goto(`/?decisionTaskId=${sseRecoveryTaskId}`);
+  await page.goto(`/dev/synthetic-decision?decisionTaskId=${sseRecoveryTaskId}`);
 
   await expect.poll(() => sseRecoveryCursors.slice(0, 3)).toEqual([null, "301", "301"]);
   await expect(page.getByRole("region", { name: "任务进度" })).toContainText(
@@ -500,7 +511,7 @@ test("shows a paused reason and sends owner-controlled resume and cancel command
     });
   });
 
-  await page.goto(`/?decisionTaskId=${taskId}`);
+  await page.goto(`/dev/synthetic-decision?decisionTaskId=${taskId}`);
 
   await page.getByRole("button", { name: "安全恢复" }).click();
   await expect(page.getByText("恢复中")).toBeVisible();
@@ -538,7 +549,7 @@ test("shows a paused reason and sends owner-controlled resume and cancel command
 });
 
 test("proxies strict runtime controls with server-owned authorization", async ({ page }) => {
-  await page.goto("/");
+  await page.goto("/dev/synthetic-decision");
   const responses = await page.evaluate(async () => {
     const resume = await fetch("/api/decision-tasks/task-web-proxy-control/resume", {
       method: "POST",
@@ -809,7 +820,7 @@ test("replays one local browser-to-runtime recovery through real Postgres and Re
 
   try {
     verticalApiUrl = await app.listen({ host: "127.0.0.1", port: 0 });
-    await page.goto("/");
+    await page.goto("/dev/synthetic-decision");
     await page.getByRole("button", { name: "运行合成决策" }).click();
     await expect(page).toHaveURL(/decisionTaskId=task-/);
     await publisher.runOnce();
@@ -854,7 +865,7 @@ test("does not label a task observation failure as a business task failure", asy
     });
   });
 
-  await page.goto(`/?decisionTaskId=${taskId}`);
+  await page.goto(`/dev/synthetic-decision?decisionTaskId=${taskId}`);
 
   await expect(page.getByText("任务状态暂时无法读取")).toBeVisible();
   await expect(page.getByRole("heading", { name: "决策任务失败" })).not.toBeVisible();
@@ -874,7 +885,7 @@ test("does not mark Evidence expired when validUntil equals Decision validFrom w
       body: JSON.stringify(result)
     });
   });
-  await page.goto("/");
+  await page.goto("/dev/synthetic-decision");
   await page.getByRole("button", { name: "运行合成决策" }).click();
 
   await expect(page.getByRole("heading", { name: "有条件购买" })).toBeVisible();
@@ -889,7 +900,7 @@ test("shows the preference question when multiple Candidates remain feasible", a
       body: JSON.stringify(buildPreferenceDecisionResult())
     });
   });
-  await page.goto("/");
+  await page.goto("/dev/synthetic-decision");
   await page.getByRole("button", { name: "运行合成决策" }).click();
 
   await expect(page.getByRole("heading", { name: "需要补充信息" })).toBeVisible();
@@ -903,7 +914,7 @@ test("does not render a successful decision when the API status contradicts its 
   page
 }) => {
   decisionResponseStatus = 500;
-  await page.goto("/");
+  await page.goto("/dev/synthetic-decision");
   await page.getByRole("button", { name: "运行合成决策" }).click();
 
   await expect(page.getByRole("heading", { name: "决策任务失败" })).toBeVisible();
@@ -918,7 +929,7 @@ test("does not trust a successful body received with a failed Web response", asy
       body: JSON.stringify(buildSyntheticDecisionResult())
     });
   });
-  await page.goto("/");
+  await page.goto("/dev/synthetic-decision");
   await page.getByRole("button", { name: "运行合成决策" }).click();
 
   await expect(page.getByRole("heading", { name: "决策任务失败" })).toBeVisible();
@@ -936,7 +947,7 @@ test("does not render a Decision with an unsupported contract version", async ({
       })
     });
   });
-  await page.goto("/");
+  await page.goto("/dev/synthetic-decision");
   await page.getByRole("button", { name: "运行合成决策" }).click();
 
   await expect(page.getByRole("heading", { name: "决策任务失败" })).toBeVisible();
@@ -955,7 +966,7 @@ test("does not render a Decision with a forged Claim Assessment", async ({ page 
     });
   });
 
-  await page.goto("/");
+  await page.goto("/dev/synthetic-decision");
   await page.getByRole("button", { name: "运行合成决策" }).click();
 
   await expect(page.getByRole("heading", { name: "决策任务失败" })).toBeVisible();
@@ -970,7 +981,7 @@ test("shows an explicit failure when the Web decision response is not JSON", asy
       body: "{"
     });
   });
-  await page.goto("/");
+  await page.goto("/dev/synthetic-decision");
   await page.getByRole("button", { name: "运行合成决策" }).click();
 
   await expect(page.getByRole("heading", { name: "决策任务失败" })).toBeVisible();
@@ -979,7 +990,7 @@ test("shows an explicit failure when the Web decision response is not JSON", asy
 });
 
 test("keeps the P0 synthetic requirement fixed and read-only", async ({ page }) => {
-  await page.goto("/");
+  await page.goto("/dev/synthetic-decision");
 
   const requirement = page.getByRole("textbox", { name: "合成消费需求" });
   await expect(requirement).toHaveValue("预算不超过 8000 元，至少 32 GiB 内存和 1 TiB 存储。");
@@ -988,7 +999,7 @@ test("keeps the P0 synthetic requirement fixed and read-only", async ({ page }) 
 });
 
 test("returns a versioned contract error for malformed decision JSON", async ({ page }) => {
-  await page.goto("/");
+  await page.goto("/dev/synthetic-decision");
   const response = await page.evaluate(async () => {
     const result = await fetch("/api/decision-tasks/execute", {
       method: "POST",
@@ -1026,7 +1037,7 @@ test("shows an explicit failure when the API cannot be reached", async ({ page }
   });
   await closeApiServer();
 
-  await page.goto("/");
+  await page.goto("/dev/synthetic-decision");
 
   await expect(page.getByRole("heading", { name: "系统健康" })).toBeVisible();
   await expect(page.getByText("健康状态不可用")).toBeVisible();

@@ -1,4 +1,5 @@
 import Fastify from "fastify";
+import type { Conversation } from "@choicemind/conversation";
 import type { IdentityAccess } from "@choicemind/identity-access";
 import {
   createContractRejectedDecisionTaskResultV1,
@@ -9,6 +10,7 @@ import type { DecisionTaskEventNotificationsPort } from "./decision-tasks/event-
 import type { DecisionTaskPersistencePort } from "./decision-tasks/persistence-port.js";
 import type { DecisionTaskRuntimeControlPort } from "./decision-tasks/runtime-control-port.js";
 import { registerDecisionTaskRoutes } from "./decision-tasks/routes.js";
+import { registerConversationRoutes } from "./conversation/routes.js";
 import { registerIdentityAccessRoutes } from "./identity-access/routes.js";
 import type { AuditLogPort } from "./security/audit.js";
 import type { IdentityResolver } from "./security/identity.js";
@@ -25,6 +27,7 @@ type ComponentHealth = {
 
 export type ApiAppOptions = {
   auditLog?: AuditLogPort;
+  conversation?: Conversation;
   decisionTaskEventNotifications?: DecisionTaskEventNotificationsPort;
   decisionTaskEventPollIntervalMs?: number;
   decisionTaskPersistence?: DecisionTaskPersistencePort;
@@ -132,6 +135,13 @@ export function buildApiApp(options: ApiAppOptions = {}) {
   });
 
   registerIdentityAccessRoutes(app, options.identityAccess);
+
+  registerConversationRoutes(
+    app,
+    options.conversation,
+    identityResolver,
+    options.decisionTaskPersistence
+  );
 
   registerDecisionTaskRoutes(
     app,

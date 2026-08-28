@@ -2,6 +2,7 @@ import {
   openPersistentDecisionTaskModule,
   openRunEventNotificationSubscriber
 } from "@choicemind/task-persistence";
+import { openPostgresConversation } from "@choicemind/conversation";
 import { openPostgresIdentityAccess } from "@choicemind/identity-access";
 
 import { buildApiApp } from "./app.js";
@@ -18,6 +19,7 @@ if (databaseUrl === undefined || databaseUrl.length === 0) {
 }
 
 const identityAccess = await openPostgresIdentityAccess({ databaseUrl });
+const conversation = await openPostgresConversation({ databaseUrl });
 const identityResolver = loadIdentityResolver(identityAccess);
 const decisionTaskPersistence = await openPersistentDecisionTaskModule({ databaseUrl });
 const redisUrl = process.env.CHOICEMIND_REDIS_URL;
@@ -41,6 +43,7 @@ const app = buildApiApp({
   auditLog: {
     append: async (record) => decisionTaskPersistence.appendAuditRecord(record)
   },
+  conversation,
   decisionTaskPersistence,
   decisionTaskRuntimeControl: {
     requestResume: async (input) =>
@@ -72,6 +75,7 @@ const app = buildApiApp({
 
 app.addHook("onClose", async () => {
   await Promise.all([
+    conversation.close(),
     decisionTaskPersistence.close(),
     decisionTaskEventNotifications?.close(),
     identityAccess.close()
