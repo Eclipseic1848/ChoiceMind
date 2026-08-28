@@ -7,7 +7,7 @@ export default defineConfig({
     baseURL: "http://127.0.0.1:3000"
   },
   webServer: {
-    command: "pnpm dev",
+    command: "pnpm exec next dev --hostname 127.0.0.1 --port 3000",
     env: {
       CHOICEMIND_API_URL: "http://127.0.0.1:3199",
       CHOICEMIND_API_AUTHORIZATION: "Bearer web-test-token"

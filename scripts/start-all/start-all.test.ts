@@ -489,7 +489,7 @@ describe("start_all.bat", () => {
 			expect(output).toContain(
 				"依赖检查：Node.js 22.22.1、pnpm 11.21.0、uv、Docker Compose 均可用",
 			);
-			expect(output).toContain("Web：http://127.0.0.1:3000");
+			expect(output).toContain("Web：http://192.168.50.123:1029");
 			expect(output).toContain("API：http://127.0.0.1:3100");
 			expect(output).toContain("Orchestrator：http://127.0.0.1:3200");
 			expect(output).toContain("Data Worker：http://127.0.0.1:3300");
@@ -538,7 +538,7 @@ describe("start_all.bat", () => {
 		const occupiedPort = createServer();
 		await new Promise<void>((resolveListen, reject) => {
 			occupiedPort.once("error", reject);
-			occupiedPort.listen(3000, "127.0.0.1", resolveListen);
+			occupiedPort.listen(1029, "127.0.0.1", resolveListen);
 		});
 
 		try {
@@ -550,7 +550,7 @@ describe("start_all.bat", () => {
 
 			expect(result.status).not.toBe(0);
 			expect(`${result.stdout}${result.stderr}`).toContain(
-				"Web 端口 3000 已被占用",
+				"Web 端口 1029 已被占用",
 			);
 		} finally {
 			await new Promise<void>((resolveClose) =>
@@ -760,7 +760,7 @@ describe("start_all.bat", () => {
 			healthServerPath,
 			[
 				'import { createServer } from "node:http";',
-				"const servers = [3000, 3100, 3200, 3300].map((port) => createServer((_request, response) => { response.writeHead(200, { 'content-type': 'application/json' }); response.end('{\"status\":\"healthy\"}'); }).listen(port, '127.0.0.1'));",
+				"const servers = [1029, 3100, 3200, 3300].map((port) => createServer((_request, response) => { response.writeHead(200, { 'content-type': 'application/json' }); response.end('{\"status\":\"healthy\"}'); }).listen(port, '127.0.0.1'));",
 				"setTimeout(() => Promise.all(servers.map((server) => new Promise((resolveClose) => server.close(resolveClose)))).then(() => process.exit(0)), 1800);",
 			].join("\n"),
 			"utf8",
@@ -818,7 +818,7 @@ describe("start_all.bat", () => {
 			expect(result.status).toBe(0);
 			expect(output).toContain("ChoiceMind Alpha 已启动，前端开发热更新已启用");
 			expect(output).toContain("Identity Lifecycle Worker 后台进程：运行中");
-			expect(output).toContain("Web 健康：http://127.0.0.1:3000/health/live");
+			expect(output).toContain("Web 健康：http://127.0.0.1:1029/health/live");
 			expect(output).toContain("API Publisher 后台进程：运行中");
 			expect(output).toContain("Orchestrator Worker 后台进程：运行中");
 			expect(dockerLog).toContain("stop postgres redis");
