@@ -19,6 +19,15 @@ if ($actualNodeVersion -ne $requiredNodeVersion) {
     $fnmCommand = Get-Command fnm -ErrorAction SilentlyContinue
     if ($null -ne $fnmCommand -and $env:CHOICEMIND_FNM_RELAUNCHED -ne '1') {
         Write-Output "检测到 Node.js 版本不匹配，正在通过 fnm 使用项目要求的 $requiredNodeVersion…"
+        $previousErrorActionPreference = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        & $fnmCommand.Source exec "--using=$requiredNodeVersion" -- node --version 2> $null | Out-Null
+        $fnmValidationExitCode = $LASTEXITCODE
+        $ErrorActionPreference = $previousErrorActionPreference
+        if ($fnmValidationExitCode -ne 0) {
+            [Console]::Error.WriteLine("错误：fnm 无法使用项目要求的 Node.js $requiredNodeVersion。请先执行 fnm install $requiredNodeVersion，再重新双击 start_all.bat。")
+            exit $fnmValidationExitCode
+        }
         $env:CHOICEMIND_FNM_RELAUNCHED = '1'
         $relaunchArguments = @(
             'exec',
@@ -37,9 +46,6 @@ if ($actualNodeVersion -ne $requiredNodeVersion) {
         }
         & $fnmCommand.Source @relaunchArguments
         $fnmExitCode = $LASTEXITCODE
-        if ($fnmExitCode -ne 0) {
-            [Console]::Error.WriteLine("错误：fnm 无法使用项目要求的 Node.js $requiredNodeVersion。请先执行 fnm install $requiredNodeVersion，再重新双击 start_all.bat。")
-        }
         exit $fnmExitCode
     }
 
@@ -94,6 +100,70 @@ $servicePorts = [ordered]@{
     'Redis' = 6379
 }
 
+$testPortOffset = 0
+if (-not [string]::IsNullOrWhiteSpace($env:CHOICEMIND_START_ALL_TEST_PORT_OFFSET)) {
+    if (-not [int]::TryParse($env:CHOICEMIND_START_ALL_TEST_PORT_OFFSET, [ref]$testPortOffset) -or $testPortOffset -lt 0) {
+        [Console]::Error.WriteLine('错误：CHOICEMIND_START_ALL_TEST_PORT_OFFSET 必须是非负整数。')
+        exit 1
+    }
+    foreach ($serviceName in @($servicePorts.Keys)) {
+        $servicePorts[$serviceName] = $servicePorts[$serviceName] + $testPortOffset
+    }
+}
+
+$existingHealthUrls = @(
+    "http://127.0.0.1:$($servicePorts['Web'])/health/live",
+    "http://127.0.0.1:$($servicePorts['API'])/health/live",
+    "http://127.0.0.1:$($servicePorts['Orchestrator'])/health/live",
+    "http://127.0.0.1:$($servicePorts['Data Worker'])/health/live"
+)
+
+function Test-ChoiceMindServicesHealthy {
+    param([string[]]$HealthUrls)
+
+    foreach ($healthUrl in $HealthUrls) {
+        try {
+            $response = Invoke-WebRequest -Uri $healthUrl -UseBasicParsing -TimeoutSec 3
+            if ($response.StatusCode -lt 200 -or $response.StatusCode -ge 300) {
+                return $false
+            }
+        }
+        catch {
+            return $false
+        }
+    }
+    return $true
+}
+
+$activeLaunch = $null
+if (-not $PreflightOnly -and -not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+    $existingStateDirectory = Join-Path $env:LOCALAPPDATA 'ChoiceMind\development'
+    $activeLaunch = Get-ChildItem -LiteralPath $existingStateDirectory -Filter 'start-all-*.pid' -File -ErrorAction SilentlyContinue |
+        Where-Object {
+            $parentPidText = $_.BaseName.Substring('start-all-'.Length)
+            $applicationPidText = (Get-Content -LiteralPath $_.FullName -Raw -Encoding ascii -ErrorAction SilentlyContinue).Trim()
+            $parentPid = 0
+            $applicationPid = 0
+            [int]::TryParse($parentPidText, [ref]$parentPid) -and
+                [int]::TryParse($applicationPidText, [ref]$applicationPid) -and
+                $null -ne (Get-Process -Id $parentPid -ErrorAction SilentlyContinue) -and
+                $null -ne (Get-Process -Id $applicationPid -ErrorAction SilentlyContinue)
+        } |
+        Select-Object -First 1
+}
+
+if (-not $PreflightOnly -and $null -ne $activeLaunch) {
+    $allServicesHealthy = Test-ChoiceMindServicesHealthy -HealthUrls $existingHealthUrls
+    if ($allServicesHealthy) {
+        Write-Output 'ChoiceMind 已经在运行，无需重复启动。'
+        Write-Output '前端页面：http://192.168.50.123:1029'
+        exit 0
+    }
+    Write-Output 'ChoiceMind 已经在运行，部分服务仍在启动或暂未响应，请稍后刷新页面。'
+    Write-Output '前端页面：http://192.168.50.123:1029'
+    exit 0
+}
+
 foreach ($serviceName in $servicePorts.Keys) {
     $port = $servicePorts[$serviceName]
     $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $port)
@@ -101,6 +171,11 @@ foreach ($serviceName in $servicePorts.Keys) {
         $listener.Start()
     }
     catch {
+        if (-not $PreflightOnly -and (Test-ChoiceMindServicesHealthy -HealthUrls $existingHealthUrls)) {
+            Write-Output 'ChoiceMind 已经在运行，无需重复启动。'
+            Write-Output '前端页面：http://192.168.50.123:1029'
+            exit 0
+        }
         [Console]::Error.WriteLine("错误：$serviceName 端口 $port 已被占用。请停止占用该端口的程序后重试。")
         exit 1
     }
