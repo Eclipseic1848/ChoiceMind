@@ -303,6 +303,7 @@ export function ConversationWorkbench({
 								<li key={summary.sessionId}>
 									<button
 										type="button"
+										disabled={pending !== null}
 										aria-current={
 											summary.sessionId === session?.sessionId
 												? "page"

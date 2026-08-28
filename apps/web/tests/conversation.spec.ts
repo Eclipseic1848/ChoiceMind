@@ -535,6 +535,44 @@ test("快速切换 Session 时较慢的旧响应不会覆盖最后选择", async
 	await expect(page).toHaveURL(new RegExp(`session=${first.sessionId}$`));
 });
 
+test("写入当前 Session 期间不允许切换到另一项决策", async ({ page }) => {
+	const first = buildSession();
+	first.title = "第一项决策";
+	const second = buildSession();
+	second.sessionId = "session-web-2";
+	second.title = "第二项决策";
+	let releaseTurn: (() => void) | undefined;
+	const turnMayFinish = new Promise<void>((resolve) => {
+		releaseTurn = resolve;
+	});
+	await page.route(/\/api\/conversations(?:\/.*)?$/, async (route) => {
+		const request = route.request();
+		const path = new URL(request.url()).pathname;
+		if (path === "/api/conversations") {
+			await json(route, 200, [summary(first), summary(second)]);
+			return;
+		}
+		if (request.method() === "POST" && path.endsWith("/turns")) {
+			await turnMayFinish;
+			const body = request.postDataJSON() as {
+				requirementUpdate: Record<string, unknown>;
+				text: string;
+			};
+			await json(route, 200, appendTurn(first, body.text, body.requirementUpdate));
+			return;
+		}
+		await json(route, 200, path.endsWith(first.sessionId) ? first : second);
+	});
+
+	await page.goto(`/?session=${first.sessionId}`);
+	await page.getByLabel("这次想解决什么消费问题？").fill("购买显示器");
+	await page.getByRole("button", { name: "发送并记录目标" }).click();
+	const secondButton = page.getByRole("button", { name: /第二项决策/ });
+	await expect(secondButton).toBeDisabled();
+	releaseTurn?.();
+	await expect(secondButton).toBeEnabled();
+});
+
 function buildSession() {
 	return {
 		sessionId: "session-web-1",
