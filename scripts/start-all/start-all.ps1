@@ -86,7 +86,7 @@ if (-not (Test-Path -LiteralPath $concurrentlyCommand -PathType Leaf)) {
 }
 
 $servicePorts = [ordered]@{
-    'Web' = 3000
+    'Web' = 1029
     'API' = 3100
     'Orchestrator' = 3200
     'Data Worker' = 3300
@@ -110,7 +110,7 @@ foreach ($serviceName in $servicePorts.Keys) {
 }
 
 Write-Output "依赖检查：Node.js $actualNodeVersion、pnpm $actualPnpmVersion、uv、Docker Compose 均可用"
-Write-Output 'Web：http://127.0.0.1:3000'
+Write-Output 'Web：http://192.168.50.123:1029'
 Write-Output 'API：http://127.0.0.1:3100'
 Write-Output 'Orchestrator：http://127.0.0.1:3200'
 Write-Output 'Data Worker：http://127.0.0.1:3300'
@@ -190,6 +190,7 @@ $env:CHOICEMIND_DATABASE_URL = "postgres://choicemind:$databasePassword@127.0.0.
 $env:CHOICEMIND_REDIS_URL = 'redis://127.0.0.1:6379'
 $env:CHOICEMIND_IDENTITY_MODE = 'persistent'
 $env:CHOICEMIND_CREDENTIAL_MASTER_KEY_BASE64 = $credentialMasterKeyBase64
+$env:WEB_HEALTH_URL = 'http://127.0.0.1:1029/health/live'
 $composeFile = Join-Path $RepositoryRoot 'deploy\compose\compose.yaml'
 $developmentComposeFile = Join-Path $RepositoryRoot 'deploy\compose\compose.dev.yaml'
 $applicationPidPath = Join-Path $developmentStateDirectory "start-all-$PID.pid"
@@ -215,7 +216,7 @@ if ($LASTEXITCODE -ne 0) {
 Remove-Item Env:CHOICEMIND_CREDENTIAL_MASTER_KEY_BASE64 -ErrorAction SilentlyContinue
 
 $healthUrls = [ordered]@{
-    'Web' = 'http://127.0.0.1:3000/health/live'
+    'Web' = 'http://127.0.0.1:1029/health/live'
     'API' = 'http://127.0.0.1:3100/health/live'
     'Orchestrator' = 'http://127.0.0.1:3200/health/live'
     'Data Worker' = 'http://127.0.0.1:3300/health/live'
