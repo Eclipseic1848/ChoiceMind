@@ -112,6 +112,7 @@ export type PersistentDecisionTaskModule = Readonly<{
     credentialId: string,
     ownerUserId: string
   ): Promise<EncryptedCredentialRecord | undefined>;
+  deleteEncryptedCredential(credentialId: string, ownerUserId: string): Promise<boolean>;
   appendEgressRecord(record: EgressRecord): Promise<void>;
   listEgressRecords(correlationId: string): Promise<readonly EgressRecord[]>;
   claimNext(
@@ -131,7 +132,7 @@ export type PersistentDecisionTaskModule = Readonly<{
 export type PersistentAuditRecordInput = Readonly<{
   actor: Readonly<{
     principalId: string;
-    role: "USER" | "ADMIN" | "SUPERADMIN";
+    role: "USER" | "ADMIN" | "SUPERADMIN" | "SYSTEM";
     userId: string;
   }>;
   action: string;
@@ -365,7 +366,7 @@ type RunEventRow = Readonly<{
 type AuditRecordRow = Readonly<{
   actor_principal_id: string;
   actor_user_id: string;
-  actor_role: "USER" | "ADMIN" | "SUPERADMIN";
+  actor_role: "USER" | "ADMIN" | "SUPERADMIN" | "SYSTEM";
   action: string;
   object_type: string;
   object_id: string;
@@ -2163,6 +2164,18 @@ export async function openPersistentDecisionTaskModule(
               wrappedDataKeyIv: row.wrapped_data_key_iv,
               wrappedDataKeyTag: row.wrapped_data_key_tag
             };
+      } catch {
+        throw new PersistenceUnavailableError();
+      }
+    },
+    async deleteEncryptedCredential(credentialId, ownerUserId) {
+      assertOpen(closed);
+      try {
+        const result = await pool.query(
+          "DELETE FROM encrypted_credentials WHERE owner_user_id = $1 AND credential_id = $2",
+          [ownerUserId, credentialId]
+        );
+        return result.rowCount === 1;
       } catch {
         throw new PersistenceUnavailableError();
       }

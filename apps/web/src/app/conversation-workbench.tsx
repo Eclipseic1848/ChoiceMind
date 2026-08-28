@@ -4,6 +4,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { type FormEvent, useEffect, useRef, useState } from "react";
 
 import { ConversationTaskProgress } from "./conversation-task-progress";
+import { SourceResearchPanel } from "./source-research-panel";
 
 type RequirementMissingKey =
 	| "CONSUMPTION_GOAL"
@@ -401,10 +402,12 @@ export function ConversationWorkbench({
 							</ol>
 							<form
 								className="conversation-composer"
+								noValidate
 								onSubmit={(event) => void submitTurn(event)}
 							>
 								<label htmlFor="conversation-draft">{prompt.label}</label>
 								<textarea
+									className="resize-none"
 									ref={draftRef}
 									id="conversation-draft"
 									rows={prompt.key === "HARD_CONSTRAINTS" ? 4 : 3}
@@ -455,6 +458,15 @@ export function ConversationWorkbench({
 								decisionTaskId={latestTask.decisionTaskId}
 							/>
 						)}
+					</section>
+					<section aria-labelledby="source-research-heading">
+						<p className="eyebrow">Source route</p>
+						<h2 id="source-research-heading">来源研究</h2>
+						<SourceResearchPanel
+							key={session?.sessionId ?? "empty-session"}
+							decisionTaskId={latestTask?.decisionTaskId}
+							requirement={session?.currentRequirement ?? null}
+						/>
 					</section>
 					<p
 						className={`system-pulse system-pulse-${systemHealth}`}

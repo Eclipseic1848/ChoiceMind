@@ -20,6 +20,7 @@ export interface CredentialStoragePort {
     credentialId: string,
     ownerUserId: string
   ): Promise<EncryptedCredentialRecord | undefined>;
+  delete?(credentialId: string, ownerUserId: string): Promise<boolean>;
 }
 
 export type StoreCredentialInput = Readonly<{
@@ -33,12 +34,18 @@ export type StoreCredentialInput = Readonly<{
 
 export type SecurityActor = Readonly<{
   userId: string;
-  role: "USER" | "ADMIN" | "SUPERADMIN";
+  role: "USER" | "ADMIN" | "SUPERADMIN" | "SYSTEM";
+}>;
+
+export type SystemCredentialAccess = Readonly<{
+  actor: Readonly<{ userId: string; role: "SYSTEM" }>;
+  secretType: "SOURCE_CREDENTIAL";
+  actions: readonly ("USE" | "DELETE")[];
 }>;
 
 export type CredentialAuditRecord = Readonly<{
   actor: SecurityActor;
-  action: "CREDENTIAL_STORE" | "CREDENTIAL_USE";
+  action: "CREDENTIAL_STORE" | "CREDENTIAL_USE" | "CREDENTIAL_DELETE";
   object: Readonly<{ type: "CREDENTIAL"; id: string }>;
   result: "STARTED" | "ALLOWED" | "DENIED" | "FAILED";
   correlationId: string;
@@ -59,6 +66,12 @@ export type CredentialVault = Readonly<{
     }>,
     operation: (secret: SecretValue) => Promise<unknown> | unknown
   ): Promise<void>;
+  delete(input: Readonly<{
+    credentialId: string;
+    ownerUserId: string;
+    actor: SecurityActor;
+    correlationId: string;
+  }>): Promise<Readonly<{ deleted: boolean }>>;
 }>;
 
 export class SecretValue {
@@ -98,6 +111,7 @@ export function createCredentialVault(options: Readonly<{
   masterKey: Uint8Array;
   storage: CredentialStoragePort;
   appendAuditRecord(record: CredentialAuditRecord): Promise<void>;
+  systemAccess?: SystemCredentialAccess;
   now?: () => Date;
 }>): CredentialVault {
   if (options.masterKey.byteLength !== 32) {
@@ -109,7 +123,7 @@ export function createCredentialVault(options: Readonly<{
 
   return {
     async store(input) {
-      if (input.actor.userId !== input.ownerUserId) {
+      if (input.actor.role === "SYSTEM" || input.actor.userId !== input.ownerUserId) {
         await appendCredentialAudit(options, input, "CREDENTIAL_STORE", "DENIED", now());
         throw new Error("CREDENTIAL_OWNER_MISMATCH");
       }
@@ -146,7 +160,12 @@ export function createCredentialVault(options: Readonly<{
       return { credentialId: input.credentialId, status: "STORED" };
     },
     async use(input, operation) {
-      if (input.actor.userId !== input.ownerUserId) {
+      const systemAccess = input.actor.role === "SYSTEM";
+      if (
+        systemAccess
+          ? !allowsSystemAccess(options.systemAccess, input.actor, "USE")
+          : input.actor.userId !== input.ownerUserId
+      ) {
         await appendCredentialAudit(options, input, "CREDENTIAL_USE", "DENIED", now());
         throw new Error("CREDENTIAL_NOT_FOUND");
       }
@@ -163,7 +182,8 @@ export function createCredentialVault(options: Readonly<{
       if (
         record === undefined ||
         record.ownerUserId !== input.ownerUserId ||
-        record.credentialId !== input.credentialId
+        record.credentialId !== input.credentialId ||
+        (systemAccess && record.secretType !== options.systemAccess?.secretType)
       ) {
         await appendCredentialAudit(options, input, "CREDENTIAL_USE", "DENIED", now());
         throw new Error("CREDENTIAL_NOT_FOUND");
@@ -215,8 +235,57 @@ export function createCredentialVault(options: Readonly<{
       if (operationError !== undefined) {
         throw operationError;
       }
+    },
+    async delete(input) {
+      const systemAccess = input.actor.role === "SYSTEM";
+      if (
+        systemAccess
+          ? !allowsSystemAccess(options.systemAccess, input.actor, "DELETE")
+          : input.actor.userId !== input.ownerUserId
+      ) {
+        await appendCredentialAudit(options, input, "CREDENTIAL_DELETE", "DENIED", now());
+        throw new Error("CREDENTIAL_NOT_FOUND");
+      }
+      if (systemAccess) {
+        let record: EncryptedCredentialRecord | undefined;
+        try {
+          record = await options.storage.load(input.credentialId, input.ownerUserId);
+        } catch {
+          await appendCredentialAudit(options, input, "CREDENTIAL_DELETE", "FAILED", now());
+          throw new Error("CREDENTIAL_DELETE_FAILED");
+        }
+        if (record?.secretType !== options.systemAccess?.secretType) {
+          await appendCredentialAudit(options, input, "CREDENTIAL_DELETE", "DENIED", now());
+          throw new Error("CREDENTIAL_NOT_FOUND");
+        }
+      }
+      await appendCredentialAudit(options, input, "CREDENTIAL_DELETE", "STARTED", now());
+      try {
+        if (options.storage.delete === undefined) {
+          throw new Error("CREDENTIAL_DELETE_UNSUPPORTED");
+        }
+        const deleted = await options.storage.delete(input.credentialId, input.ownerUserId);
+        await appendCredentialAudit(options, input, "CREDENTIAL_DELETE", "ALLOWED", now());
+        return { deleted };
+      } catch {
+        await appendCredentialAudit(options, input, "CREDENTIAL_DELETE", "FAILED", now());
+        throw new Error("CREDENTIAL_DELETE_FAILED");
+      }
     }
   };
+}
+
+function allowsSystemAccess(
+  access: SystemCredentialAccess | undefined,
+  actor: SecurityActor,
+  action: "USE" | "DELETE"
+): boolean {
+  return (
+    access !== undefined &&
+    actor.role === "SYSTEM" &&
+    actor === access.actor &&
+    access.actions.includes(action)
+  );
 }
 
 async function appendCredentialAudit(

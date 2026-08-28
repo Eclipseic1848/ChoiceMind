@@ -1,0 +1,19 @@
+{
+  "name": "@choicemind/source-worker",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc --project tsconfig.build.json",
+    "dev": "tsx watch src/main.ts",
+    "start": "node dist/main.js",
+    "test": "vitest run",
+    "typecheck": "tsc --project tsconfig.json"
+  },
+  "dependencies": {
+    "@choicemind/security": "workspace:*",
+    "@choicemind/source-access": "workspace:*",
+    "@choicemind/source-research": "workspace:*",
+    "@choicemind/task-persistence": "workspace:*"
+  }
+}

@@ -574,6 +574,108 @@ test("写入当前 Session 期间不允许切换到另一项决策", async ({ pa
 	await expect(secondButton).toBeEnabled();
 });
 
+test("在 Session 同页连接来源并启动可恢复的来源研究", async ({ page }) => {
+	const session = buildSession();
+	session.currentRequirement = {
+		revisionId: "revision-ready",
+		revisionNumber: 1,
+		consumptionGoal: "购买通勤耳机",
+		primaryScenario: "每天地铁通勤",
+		hardConstraints: ["降噪"],
+		missingKeys: [],
+		readiness: "READY_FOR_RESEARCH",
+		createdAt: "2026-08-27T23:00:00.000Z",
+	};
+	session.decisionTasks = [
+		{ decisionTaskId: "task-source-web", linkedAt: "2026-08-27T23:01:00.000Z" },
+	];
+	await page.route(/\/api\/conversations(?:\/.*)?$/, async (route) => {
+		const path = new URL(route.request().url()).pathname;
+		await json(route, 200, path === "/api/conversations" ? [summary(session)] : session);
+	});
+	await page.route("**/api/decision-tasks/task-source-web/events*", async (route) => {
+		await route.fulfill({ status: 200, contentType: "text/event-stream", body: "" });
+	});
+	await page.route("**/api/decision-tasks/task-source-web", async (route) => {
+		await json(route, 200, buildTaskSnapshot("task-source-web", "RUNNING"));
+	});
+	let sourceStatusAvailable = false;
+	await page.route("**/api/sources", async (route) => {
+		if (!sourceStatusAvailable) {
+			await json(route, 503, { error: { code: "UNAVAILABLE" } });
+			return;
+		}
+		await json(route, 200, [{
+			ownerUserId: "user-a",
+			sourceId: "fixture",
+			sourceAccountId: "default",
+			status: "ACTIVE",
+			updatedAt: "2026-08-27T23:02:00.000Z",
+		}]);
+	});
+	const createBodies: Record<string, unknown>[] = [];
+	let storedBatch: Record<string, unknown> | undefined;
+	let recoveryAvailable = false;
+	await page.route(/\/api\/source-research\/batches(?:\?.*)?$/, async (route) => {
+		if (route.request().method() === "GET") {
+			if (!recoveryAvailable) {
+				await json(route, 503, { error: { code: "UNAVAILABLE" } });
+				return;
+			}
+			await json(
+				route,
+				storedBatch === undefined ? 404 : 200,
+				storedBatch ?? { error: { code: "SOURCE_RESEARCH_NOT_FOUND" } },
+			);
+			return;
+		}
+		const createBody = route.request().postDataJSON() as Record<string, unknown>;
+		createBodies.push(createBody);
+		if (createBodies.length === 1) {
+			await json(route, 503, { error: { code: "UNAVAILABLE" } });
+			return;
+		}
+		storedBatch = {
+			batchId: createBody.batchId,
+			ownerUserId: "user-a",
+			decisionTaskId: "task-source-web",
+			query: createBody.query,
+			state: "QUEUED",
+			costUnits: 0,
+			jobs: [{ jobId: "job-a", sourceId: "fixture", sourceAccountId: "default", state: "QUEUED" }],
+			results: [],
+			createdAt: "2026-08-27T23:02:00.000Z",
+			updatedAt: "2026-08-27T23:02:00.000Z",
+		};
+		await json(route, 201, storedBatch);
+	});
+
+	await page.goto("/?session=session-web-1");
+	await expect(page.getByRole("heading", { name: "来源研究" })).toBeVisible();
+	await expect(page.getByRole("button", { name: "重试来源状态" })).toBeVisible();
+	await expect(page.getByRole("button", { name: "重试恢复研究状态" })).toBeVisible();
+	await page.waitForLoadState("networkidle");
+	sourceStatusAvailable = true;
+	recoveryAvailable = true;
+	await page.getByRole("button", { name: "重试来源状态" }).click();
+	await page.getByRole("button", { name: "重试恢复研究状态" }).click();
+	await expect(page.getByText("受控测试来源已连接")).toBeVisible();
+	await page.getByRole("button", { name: "开始来源研究" }).click();
+	await expect(page.getByText("无法启动来源研究", { exact: true })).toBeVisible();
+	await page.getByRole("button", { name: "开始来源研究" }).click();
+	await expect(page.getByText("研究已排队")).toBeVisible();
+	expect(createBodies[1]).toMatchObject({
+		decisionTaskId: "task-source-web",
+		sources: [{ sourceId: "fixture", sourceAccountId: "default" }],
+	});
+	expect(createBodies[1]?.query).toContain("购买通勤耳机");
+	expect(createBodies[1]?.batchId).toBe(createBodies[0]?.batchId);
+	expect(createBodies[1]?.idempotencyKey).toBe(createBodies[0]?.idempotencyKey);
+	await page.reload();
+	await expect(page.getByText("研究已排队")).toBeVisible();
+	await expect(page.getByRole("button", { name: "开始来源研究" })).toBeDisabled();
+});
+
 function buildSession() {
 	return {
 		sessionId: "session-web-1",

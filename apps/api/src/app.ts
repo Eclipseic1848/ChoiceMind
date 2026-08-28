@@ -1,6 +1,8 @@
 import Fastify from "fastify";
 import type { Conversation } from "@choicemind/conversation";
 import type { IdentityAccess } from "@choicemind/identity-access";
+import type { SourceAccess } from "@choicemind/source-access";
+import type { SourceResearch } from "@choicemind/source-research";
 import {
   createContractRejectedDecisionTaskResultV1,
   getDecisionTaskResultHttpStatusV1
@@ -15,6 +17,7 @@ import { registerIdentityAccessRoutes } from "./identity-access/routes.js";
 import type { AuditLogPort } from "./security/audit.js";
 import type { IdentityResolver } from "./security/identity.js";
 import { createPersistentIdentityResolver } from "./security/identity.js";
+import { registerSourceRoutes } from "./sources/routes.js";
 
 type DependencyService = "web" | "orchestrator" | "data-worker";
 
@@ -37,6 +40,8 @@ export type ApiAppOptions = {
   identityAccess?: IdentityAccess;
   now?: () => Date;
   probe?: (service: DependencyService) => Promise<ComponentHealth>;
+  sourceAccess?: SourceAccess;
+  sourceResearch?: SourceResearch;
 };
 
 const dependencyServices: DependencyService[] = ["web", "orchestrator", "data-worker"];
@@ -139,6 +144,14 @@ export function buildApiApp(options: ApiAppOptions = {}) {
   registerConversationRoutes(
     app,
     options.conversation,
+    identityResolver,
+    options.decisionTaskPersistence
+  );
+
+  registerSourceRoutes(
+    app,
+    options.sourceAccess,
+    options.sourceResearch,
     identityResolver,
     options.decisionTaskPersistence
   );
