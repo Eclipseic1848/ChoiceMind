@@ -1,5 +1,11 @@
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
@@ -323,6 +329,49 @@ describe("start_all.bat", () => {
 				"exec --using=22.22.1 --",
 			);
 			expect(readFileSync(fnmLogPath, "utf8")).toContain("-PreflightOnly");
+		} finally {
+			rmSync(commandDirectory, { force: true, recursive: true });
+		}
+	});
+
+	test("fnm 重启标记存在时不会再次重启脚本", () => {
+		const windowsRoot = process.env.SystemRoot ?? "C:\\Windows";
+		const commandDirectory = mkdtempSync(
+			resolve(tmpdir(), "choicemind-start-all-"),
+		);
+		const fnmLogPath = resolve(commandDirectory, "fnm.log");
+		writeFileSync(
+			resolve(commandDirectory, "node.cmd"),
+			"@echo v24.16.0\r\n",
+			"utf8",
+		);
+		writeFileSync(
+			resolve(commandDirectory, "fnm.cmd"),
+			`@echo %*>>"${fnmLogPath}"\r\n@exit /b 37\r\n`,
+			"utf8",
+		);
+		const environment = { ...process.env };
+		delete environment.PATH;
+		delete environment.Path;
+		environment.PATH = [
+			commandDirectory,
+			resolve(windowsRoot, "System32"),
+			resolve(windowsRoot, "System32/WindowsPowerShell/v1.0"),
+		].join(";");
+		environment.CHOICEMIND_FNM_RELAUNCHED = "1";
+
+		try {
+			const result = spawnSync(
+				process.env.ComSpec ?? resolve(windowsRoot, "System32/cmd.exe"),
+				["/d", "/c", "start_all.bat --preflight-only"],
+				{ cwd: repositoryRoot, encoding: "utf8", env: environment },
+			);
+
+			expect(result.status).toBe(1);
+			expect(existsSync(fnmLogPath)).toBe(false);
+			expect(`${result.stdout}${result.stderr}`).toContain(
+				"无法通过 fnm 自动切换",
+			);
 		} finally {
 			rmSync(commandDirectory, { force: true, recursive: true });
 		}
