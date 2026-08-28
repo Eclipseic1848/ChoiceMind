@@ -4,6 +4,9 @@ import {
 } from "@choicemind/task-persistence";
 import { openPostgresConversation } from "@choicemind/conversation";
 import { openPostgresIdentityAccess } from "@choicemind/identity-access";
+import { createCredentialVault } from "@choicemind/security";
+import { openPostgresSourceAccess } from "@choicemind/source-access";
+import { openPostgresSourceResearch } from "@choicemind/source-research";
 
 import { buildApiApp } from "./app.js";
 import {
@@ -22,6 +25,40 @@ const identityAccess = await openPostgresIdentityAccess({ databaseUrl });
 const conversation = await openPostgresConversation({ databaseUrl });
 const identityResolver = loadIdentityResolver(identityAccess);
 const decisionTaskPersistence = await openPersistentDecisionTaskModule({ databaseUrl });
+const credentialMasterKey = Buffer.from(
+  requireEnvironment("CHOICEMIND_CREDENTIAL_MASTER_KEY_BASE64"),
+  "base64"
+);
+if (credentialMasterKey.byteLength !== 32) {
+  throw new Error("CHOICEMIND_CREDENTIAL_MASTER_KEY_BASE64 解码后必须是 32 字节");
+}
+const credentialVault = createCredentialVault({
+  masterKey: credentialMasterKey,
+  storage: {
+    save: async (record) => decisionTaskPersistence.saveEncryptedCredential(record),
+    load: async (credentialId, ownerUserId) =>
+      decisionTaskPersistence.loadEncryptedCredential(credentialId, ownerUserId),
+    delete: async (credentialId, ownerUserId) =>
+      decisionTaskPersistence.deleteEncryptedCredential(credentialId, ownerUserId)
+  },
+  appendAuditRecord: async (record) =>
+    decisionTaskPersistence.appendAuditRecord({
+      actor: {
+        principalId: record.actor.userId,
+        role: record.actor.role,
+        userId: record.actor.userId
+      },
+      action: record.action,
+      object: record.object,
+      result: record.result,
+      correlationId: record.correlationId
+    })
+});
+const sourceAccess = await openPostgresSourceAccess({
+  databaseUrl,
+  vault: credentialVault
+});
+const sourceResearch = await openPostgresSourceResearch({ databaseUrl });
 const redisUrl = process.env.CHOICEMIND_REDIS_URL;
 let decisionTaskEventNotifications:
   | Awaited<ReturnType<typeof openRunEventNotificationSubscriber>>
@@ -70,6 +107,8 @@ const app = buildApiApp({
     web: process.env.WEB_HEALTH_URL ?? "http://127.0.0.1:3000/health/live"
   },
   identityAccess,
+  sourceAccess,
+  sourceResearch,
   ...(identityResolver === undefined ? {} : { identityResolver })
 });
 
@@ -78,14 +117,23 @@ app.addHook("onClose", async () => {
     conversation.close(),
     decisionTaskPersistence.close(),
     decisionTaskEventNotifications?.close(),
-    identityAccess.close()
+    identityAccess.close(),
+    sourceAccess.close(),
+    sourceResearch.close()
   ]);
+  credentialMasterKey.fill(0);
 });
 
 const port = Number(process.env.PORT ?? 3100);
 const host = process.env.HOST ?? "127.0.0.1";
 
 await app.listen({ host, port });
+
+function requireEnvironment(name: string): string {
+  const value = process.env[name];
+  if (value === undefined || value.length === 0) throw new Error(`${name} 未配置`);
+  return value;
+}
 
 function loadIdentityResolver(
   persistentIdentity: Parameters<typeof createPersistentIdentityResolver>[0]

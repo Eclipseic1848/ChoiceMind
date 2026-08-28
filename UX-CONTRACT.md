@@ -19,6 +19,7 @@
 | CRUD | `admin-pages.tsx` + Identity BFF/API | GitHub Issue #56 | 账号、邀请 | `identity.spec.ts` 与真实 Postgres 集成测试 |
 | Conversation | `conversation-workbench.tsx` + Conversation BFF/API | GitHub Issue #57 | Session、消息、Requirement Revision | `conversation.spec.ts` 与真实 Postgres 浏览器纵向 |
 | Task Progress | `TaskProgress` 权威投影 | Decision Task Snapshot、Result 与 Persisted Run Event | 产品工作台与 P0 开发验证页 | 断线重连、暂停/恢复/取消和失败浏览器测试 |
+| Source Research | `SourceResearchPanel` + Source Access/Research BFF/API | GitHub Issue #58、#51、#54 | Session 同页状态、独立官方登录层、受控 Fixture | `conversation.spec.ts`、Source Access/Research 真实 Postgres 集成测试 |
 
 ## 路由与可见性
 
@@ -28,6 +29,7 @@
 | `/login` | 未登录用户 | 用户名密码登录 | 默认、提交、错误、节流、强制改密、删除待定 |
 | `/register?code=` | 持有效邀请者 | 创建 USER 账号 | 缺码、有效表单、无效/过期/已使用、成功 |
 | `/` | 已登录用户 | 对话决策工作台 | Session 空态/创建/恢复、MVR 澄清、任务进度/失败/重连、服务降级 |
+| `/source-login/[loginSessionId]` | 已登录且持有该登录会话的用户 | 在独立层完成来源官方登录挑战；P1-58 仅提供明确标注的 Fixture | 等待、确认、成功、失败原地重试 |
 | `/dev/synthetic-decision` | 已登录开发者 | 保留 P0 固定合成纵向的开发验证入口 | 提交、事件重放、暂停/恢复/取消、Decision/失败 |
 | `/security` | 已登录用户 | 密码与会话管理 | 改密、退出当前、退出全部、删除等待期 |
 | `/admin/accounts` | ADMIN、SUPERADMIN | 账号管理 | 表格、创建、重置、停用、删除、空态、失败与权限拒绝 |
@@ -62,6 +64,17 @@
 - Session、消息、Revision 和任务链接绑定服务端 Principal。客户端提交的 User ID 或 Role 一律不参与授权。
 - 任务进度只读取权威 Snapshot、Result 和 Persisted Run Event；断线显示重连，任务失败显示真实原因和安全下一步，不伪装为 Decision。
 - 账号真正到期删除时，生命周期 Worker 必须在删除账号事实前清理该 User 的 Conversation 私有数据；任一步失败都保留事件供重试。
+
+## 来源登录与研究契约
+
+- Session 同页显示来源连接和 Research Batch 权威状态；需要扫码、短信或验证码时显示“等待用户”，不得伪装成失败或零结果。
+- 来源登录在独立页面完成。Web 不接收或持久化 Cookie、Token、密码等秘密；普通 API 响应、日志、错误和 Evidence 不得包含秘密。
+- Source Credential 按 User、来源和平台账号隔离；API 只信任服务端 Principal，忽略客户端提交的 Owner 信息。
+- Source Research Job、检查点、租约、结果幂等键与 Outbox 以 Postgres 为事实源；Worker 或电脑重启后从过期租约和检查点恢复。
+- Session 刷新或切换回来时，来源研究按当前 User 与 Decision Task 恢复最新批次；提交失败可原地重试，服务端幂等键与请求指纹共同阻止重复成本。
+- 用户可从 Session 同页主动断开来源连接；运行期凭据失效时，研究状态返回新的独立登录入口，不把挑战误报为失败。
+- 本阶段只允许明确标注的受控 Fixture Adapter，用于证明骨架可运行，不代表任何真实购物或内容平台已获支持或认证。
+- Fixture 登录成功后，等待同一 User/来源/账号的作业自动恢复；账号到期删除时，生命周期 Worker 先清理来源批次和凭据元数据，再清理加密凭据。
 
 ## 权限与隐私
 

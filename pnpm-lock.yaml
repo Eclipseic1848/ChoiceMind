@@ -38,6 +38,15 @@ importers:
       '@choicemind/identity-access':
         specifier: workspace:*
         version: link:../../packages/identity-access
+      '@choicemind/security':
+        specifier: workspace:*
+        version: link:../../packages/security
+      '@choicemind/source-access':
+        specifier: workspace:*
+        version: link:../../packages/source-access
+      '@choicemind/source-research':
+        specifier: workspace:*
+        version: link:../../packages/source-research
       '@choicemind/task-persistence':
         specifier: workspace:*
         version: link:../../packages/task-persistence
@@ -73,6 +82,21 @@ importers:
       '@redis/client':
         specifier: 6.2.1
         version: 6.2.1(@opentelemetry/api@1.9.0)
+
+  apps/source-worker:
+    dependencies:
+      '@choicemind/security':
+        specifier: workspace:*
+        version: link:../../packages/security
+      '@choicemind/source-access':
+        specifier: workspace:*
+        version: link:../../packages/source-access
+      '@choicemind/source-research':
+        specifier: workspace:*
+        version: link:../../packages/source-research
+      '@choicemind/task-persistence':
+        specifier: workspace:*
+        version: link:../../packages/task-persistence
 
   apps/web:
     dependencies:
@@ -165,6 +189,35 @@ importers:
         version: link:../contracts
 
   packages/security: {}
+
+  packages/source-access:
+    dependencies:
+      '@choicemind/security':
+        specifier: workspace:*
+        version: link:../security
+      pg:
+        specifier: 8.23.0
+        version: 8.23.0
+    devDependencies:
+      '@choicemind/task-persistence':
+        specifier: workspace:*
+        version: link:../task-persistence
+      '@types/pg':
+        specifier: 8.23.1
+        version: 8.23.1
+
+  packages/source-research:
+    dependencies:
+      '@redis/client':
+        specifier: 6.2.1
+        version: 6.2.1(@opentelemetry/api@1.9.0)
+      pg:
+        specifier: 8.23.0
+        version: 8.23.0
+    devDependencies:
+      '@types/pg':
+        specifier: 8.23.1
+        version: 8.23.1
 
   packages/task-persistence:
     dependencies:

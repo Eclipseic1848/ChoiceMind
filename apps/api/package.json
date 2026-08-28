@@ -16,6 +16,9 @@
     "@choicemind/conversation": "workspace:*",
     "@choicemind/contracts": "workspace:*",
     "@choicemind/identity-access": "workspace:*",
+    "@choicemind/security": "workspace:*",
+    "@choicemind/source-access": "workspace:*",
+    "@choicemind/source-research": "workspace:*",
     "@choicemind/task-persistence": "workspace:*",
     "fastify": "5.11.3"
   },

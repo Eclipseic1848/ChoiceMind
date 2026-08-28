@@ -10,11 +10,14 @@ WORKDIR /workspace
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json ./
 COPY apps/api/package.json apps/api/package.json
 COPY apps/orchestrator/package.json apps/orchestrator/package.json
+COPY apps/source-worker/package.json apps/source-worker/package.json
 COPY apps/web/package.json apps/web/package.json
 COPY packages/contracts/package.json packages/contracts/package.json
 COPY packages/evidence-ingestion/package.json packages/evidence-ingestion/package.json
 COPY packages/local-services/package.json packages/local-services/package.json
 COPY packages/security/package.json packages/security/package.json
+COPY packages/source-access/package.json packages/source-access/package.json
+COPY packages/source-research/package.json packages/source-research/package.json
 COPY packages/task-persistence/package.json packages/task-persistence/package.json
 RUN --mount=type=cache,id=choicemind-pnpm-store,target=/pnpm/store \
     corepack pnpm install --frozen-lockfile

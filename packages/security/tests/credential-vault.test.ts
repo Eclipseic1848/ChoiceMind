@@ -176,6 +176,104 @@ describe("CredentialVault", () => {
     );
   });
 
+  it("limits configured system access to source credential use and delete", async () => {
+    const records = new Map<string, EncryptedCredentialRecord>();
+    const systemActor = Object.freeze({
+      userId: "source-worker:worker-a",
+      role: "SYSTEM" as const
+    });
+    const vault = createCredentialVault({
+      masterKey: Buffer.alloc(32, 21),
+      systemAccess: {
+        actor: systemActor,
+        secretType: "SOURCE_CREDENTIAL",
+        actions: ["USE", "DELETE"]
+      },
+      appendAuditRecord: async () => undefined,
+      storage: {
+        async save(record) { records.set(record.credentialId, record); },
+        async load(credentialId, ownerUserId) {
+          const record = records.get(credentialId);
+          return record?.ownerUserId === ownerUserId ? record : undefined;
+        },
+        async delete(credentialId, ownerUserId) {
+          const record = records.get(credentialId);
+          if (record?.ownerUserId !== ownerUserId) return false;
+          return records.delete(credentialId);
+        }
+      }
+    });
+    await vault.store({
+      credentialId: "source-a",
+      ownerUserId: "user-a",
+      secret: "source-secret",
+      secretType: "SOURCE_CREDENTIAL",
+      actor: { userId: "user-a", role: "USER" },
+      correlationId: "store-source"
+    });
+    await vault.store({
+      credentialId: "provider-a",
+      ownerUserId: "user-a",
+      secret: "provider-secret",
+      secretType: "PROVIDER_CREDENTIAL",
+      actor: { userId: "user-a", role: "USER" },
+      correlationId: "store-provider"
+    });
+
+    await expect(
+      vault.store({
+        credentialId: "system-store",
+        ownerUserId: "user-a",
+        secret: "forbidden",
+        secretType: "SOURCE_CREDENTIAL",
+        actor: systemActor,
+        correlationId: "system-store"
+      })
+    ).rejects.toThrowError("CREDENTIAL_OWNER_MISMATCH");
+    await expect(
+      vault.use(
+        {
+          credentialId: "provider-a",
+          ownerUserId: "user-a",
+          actor: systemActor,
+          correlationId: "system-provider-use"
+        },
+        async () => undefined
+      )
+    ).rejects.toThrowError("CREDENTIAL_NOT_FOUND");
+    await expect(
+      vault.use(
+        {
+          credentialId: "source-a",
+          ownerUserId: "user-a",
+          actor: { userId: "source-worker:worker-a", role: "SYSTEM" },
+          correlationId: "wrong-system-use"
+        },
+        async () => undefined
+      )
+    ).rejects.toThrowError("CREDENTIAL_NOT_FOUND");
+    await expect(
+      vault.use(
+        {
+          credentialId: "source-a",
+          ownerUserId: "user-a",
+          actor: systemActor,
+          correlationId: "system-source-use"
+        },
+        async (secret) => expect(secret.reveal()).toBe("source-secret")
+      )
+    ).resolves.toBeUndefined();
+    await expect(
+      vault.delete({
+        credentialId: "source-a",
+        ownerUserId: "user-a",
+        actor: systemActor,
+        correlationId: "system-source-delete"
+      })
+    ).resolves.toEqual({ deleted: true });
+    expect(records.has("provider-a")).toBe(true);
+  });
+
   it("does not save or release a secret when the initial audit record fails", async () => {
     let saves = 0;
     let operations = 0;

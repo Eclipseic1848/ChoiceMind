@@ -6,6 +6,7 @@ dist/
 coverage/
 playwright-report/
 test-results/
+premium-audit.json
 apps/orchestrator/.artifacts/
 .artifacts/coremind-compat/
 .artifacts/evidence-objects/

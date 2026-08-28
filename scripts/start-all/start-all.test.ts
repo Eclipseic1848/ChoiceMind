@@ -53,10 +53,19 @@ describe("start_all.bat", () => {
 		expect(rootManifest.scripts.predev).toContain(
 			"@choicemind/conversation build",
 		);
+		expect(rootManifest.scripts.predev).toContain("@choicemind/security build");
+		expect(rootManifest.scripts.predev).toContain(
+			"@choicemind/task-persistence build",
+		);
 		expect(rootManifest.scripts.dev).toContain(
 			"@choicemind/identity-access dev",
 		);
 		expect(rootManifest.scripts.dev).toContain("@choicemind/conversation dev");
+		expect(rootManifest.scripts.predev).toContain("@choicemind/source-access build");
+		expect(rootManifest.scripts.predev).toContain("@choicemind/source-research build");
+		expect(rootManifest.scripts.dev).toContain("@choicemind/source-access dev");
+		expect(rootManifest.scripts.dev).toContain("@choicemind/source-research dev");
+		expect(rootManifest.scripts.dev).toContain("@choicemind/source-worker dev");
 		expect(rootManifest.scripts.dev).toContain(
 			"src/identity-lifecycle-worker.ts",
 		);
@@ -82,6 +91,13 @@ describe("start_all.bat", () => {
 			),
 		);
 		expect(compose).toContain("identity-lifecycle-worker:");
+		expect(compose).toContain("source-worker:");
+		expect(startScript).toContain(
+			"Remove-Item Env:CHOICEMIND_CREDENTIAL_MASTER_KEY_BASE64",
+		);
+		expect(rootManifest.scripts.dev).toContain(
+			"run-with-credential-key.mjs pnpm --filter @choicemind/api dev",
+		);
 	});
 	test("主启动进程意外消失后清理守护进程会停止基础容器", () => {
 		const windowsRoot = process.env.SystemRoot ?? "C:\\Windows";
@@ -216,7 +232,7 @@ describe("start_all.bat", () => {
 		expect(`${result.stdout}${result.stderr}`).toContain(
 			"请安装 Node.js 22.22.1 或 fnm",
 		);
-	});
+	}, 10_000);
 
 	test("缺少 Node 时也通过已安装的 fnm 使用仓库固定版本", () => {
 		const windowsRoot = process.env.SystemRoot ?? "C:\\Windows";

@@ -50,6 +50,7 @@ services:
       postgres:
         condition: service_healthy
     environment:
+      CHOICEMIND_CREDENTIAL_MASTER_KEY_BASE64: "${CHOICEMIND_CREDENTIAL_MASTER_KEY_BASE64:?CHOICEMIND_CREDENTIAL_MASTER_KEY_BASE64 is required}"
       CHOICEMIND_DATABASE_URL: "${CHOICEMIND_DATABASE_URL:?CHOICEMIND_DATABASE_URL is required}"
       CHOICEMIND_IDENTITY_MODE: ${CHOICEMIND_IDENTITY_MODE:-persistent}
       CHOICEMIND_REDIS_URL: redis://redis:6379
@@ -90,7 +91,22 @@ services:
       postgres:
         condition: service_healthy
     environment:
+      CHOICEMIND_CREDENTIAL_MASTER_KEY_BASE64: "${CHOICEMIND_CREDENTIAL_MASTER_KEY_BASE64:?CHOICEMIND_CREDENTIAL_MASTER_KEY_BASE64 is required}"
       CHOICEMIND_DATABASE_URL: "${CHOICEMIND_DATABASE_URL:?CHOICEMIND_DATABASE_URL is required}"
+    restart: unless-stopped
+
+  source-worker:
+    <<: *node-runtime
+    command: ["corepack", "pnpm", "--filter", "@choicemind/source-worker", "start"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      CHOICEMIND_CREDENTIAL_MASTER_KEY_BASE64: "${CHOICEMIND_CREDENTIAL_MASTER_KEY_BASE64:?CHOICEMIND_CREDENTIAL_MASTER_KEY_BASE64 is required}"
+      CHOICEMIND_DATABASE_URL: "${CHOICEMIND_DATABASE_URL:?CHOICEMIND_DATABASE_URL is required}"
+      CHOICEMIND_FIXTURE_LOGIN_URL: http://web:3000/source-login/fixture
+      CHOICEMIND_REDIS_URL: redis://redis:6379
+      CHOICEMIND_SOURCE_WORKER_ID: source-worker-1
     restart: unless-stopped
 
   orchestrator:

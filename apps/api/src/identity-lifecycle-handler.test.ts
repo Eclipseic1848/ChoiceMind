@@ -59,14 +59,34 @@ describe("Identity lifecycle handler", () => {
 				return { deletedSessions: 0 };
 			}),
 		};
+		const sourceAccess = {
+			purgePrivateDataForOwner: vi.fn(async () => {
+				calls.push("source-access");
+				return { deleted: 0 };
+			}),
+		};
+		const sourceResearch = {
+			purgePrivateDataForOwner: vi.fn(async () => {
+				calls.push("source-research");
+				return { deletedBatches: 0 };
+			}),
+		};
 		const handle = createIdentityLifecycleHandler(
 			taskPersistence,
 			conversation,
+			sourceAccess,
+			sourceResearch,
 		);
 
 		await handle({ ...baseEvent, eventType: "DELETE_ACCOUNT" });
 
-		expect(calls).toEqual(["cancel", "tasks", "conversation"]);
+		expect(calls).toEqual([
+			"cancel",
+			"source-research",
+			"source-access",
+			"tasks",
+			"conversation",
+		]);
 	});
 
 	it("Conversation 清理失败时抛错，让生命周期事件重试", async () => {

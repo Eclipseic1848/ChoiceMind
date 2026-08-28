@@ -841,7 +841,7 @@ thead th {
 	width: 100%;
 	min-height: 92px;
 	padding: 14px;
-	resize: vertical;
+	resize: none;
 	border: 1px solid var(--line);
 	border-radius: var(--radius-small);
 	background: var(--paper);
@@ -930,6 +930,133 @@ thead th {
 .research-state > p:last-child {
 	color: var(--muted);
 	line-height: 1.7;
+}
+
+.source-research-panel {
+	display: grid;
+	gap: 12px;
+	margin-top: 20px;
+}
+
+.source-route {
+	display: grid;
+	grid-template-columns: 10px minmax(28px, 1fr) 10px;
+	align-items: center;
+	width: min(100%, 164px);
+}
+
+.source-node {
+	width: 10px;
+	height: 10px;
+	border: 2px solid var(--line);
+	border-radius: 50%;
+	background: var(--paper);
+}
+
+.source-node-active {
+	border-color: var(--success);
+	background: var(--success);
+}
+
+.source-route-line {
+	height: 1px;
+	background: var(--line);
+}
+
+.source-status-copy,
+.source-login-prompt,
+.source-batch-state p,
+.source-error {
+	margin: 0;
+	font-size: 14px;
+	line-height: 1.65;
+}
+
+.source-status-copy {
+	color: var(--muted);
+}
+
+.inline-action,
+.source-login-prompt a {
+	justify-self: start;
+	padding: 0;
+	border: 0;
+	border-bottom: 1px solid currentColor;
+	background: transparent;
+	color: var(--copper);
+	font: inherit;
+	font-weight: 700;
+	cursor: pointer;
+}
+
+.inline-action:disabled {
+	cursor: not-allowed;
+	opacity: 0.55;
+}
+
+.source-login-prompt {
+	color: var(--muted);
+}
+
+.source-login-prompt a {
+	display: inline-block;
+	margin-top: 8px;
+	text-decoration: none;
+}
+
+.source-start-action {
+	width: 100%;
+	margin-top: 4px;
+}
+
+.source-batch-state {
+	padding-left: 14px;
+	border-left: 2px solid var(--copper);
+}
+
+.source-batch-state strong {
+	font-family: var(--font-data);
+	font-size: 12px;
+}
+
+.source-batch-state p {
+	margin-top: 6px;
+}
+
+.source-error {
+	color: var(--danger);
+}
+
+.source-login-layer {
+	display: grid;
+	width: min(100% - 40px, 620px);
+	min-height: 100svh;
+	margin: 0 auto;
+	padding: clamp(64px, 12vh, 128px) 0;
+	align-content: start;
+	justify-items: start;
+	gap: 20px;
+}
+
+.source-login-layer h1 {
+	max-width: 12ch;
+	margin: 0;
+	font-size: clamp(36px, 7vw, 64px);
+	letter-spacing: -0.045em;
+	line-height: 1.05;
+}
+
+.source-login-layer > p:not(.eyebrow) {
+	max-width: 52ch;
+	margin: 0;
+	color: var(--muted);
+	line-height: 1.75;
+}
+
+.source-login-layer .source-login-success {
+	padding-left: 16px;
+	border-left: 2px solid var(--success);
+	color: var(--success);
 }
 
 .system-pulse {

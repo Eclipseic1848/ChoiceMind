@@ -128,6 +128,7 @@ if ($PreflightOnly) {
 
 $developmentStateDirectory = Join-Path $env:LOCALAPPDATA 'ChoiceMind\development'
 $databasePasswordPath = Join-Path $developmentStateDirectory 'postgres-password.txt'
+$credentialMasterKeyPath = Join-Path $developmentStateDirectory 'credential-master-key.txt'
 New-Item -ItemType Directory -Path $developmentStateDirectory -Force | Out-Null
 
 function Get-OrCreateLocalSecret {
@@ -158,10 +159,37 @@ function Get-OrCreateLocalSecret {
 
 $databasePassword = Get-OrCreateLocalSecret -Path $databasePasswordPath
 
+if (Test-Path -LiteralPath $credentialMasterKeyPath -PathType Leaf) {
+    $credentialMasterKeyBase64 = (Get-Content -LiteralPath $credentialMasterKeyPath -Raw -Encoding ascii).Trim()
+}
+else {
+    $credentialMasterKeyBytes = New-Object byte[] 32
+    $credentialRandomNumberGenerator = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $credentialRandomNumberGenerator.GetBytes($credentialMasterKeyBytes)
+        $credentialMasterKeyBase64 = [Convert]::ToBase64String($credentialMasterKeyBytes)
+        Set-Content -LiteralPath $credentialMasterKeyPath -Value $credentialMasterKeyBase64 -Encoding ascii -NoNewline
+    }
+    finally {
+        [Array]::Clear($credentialMasterKeyBytes, 0, $credentialMasterKeyBytes.Length)
+        $credentialRandomNumberGenerator.Dispose()
+    }
+}
+
+try {
+    if ([Convert]::FromBase64String($credentialMasterKeyBase64).Length -ne 32) {
+        throw '密钥长度无效'
+    }
+}
+catch {
+    throw "本地 Credential Vault 密钥无效：$credentialMasterKeyPath"
+}
+
 $env:CHOICEMIND_POSTGRES_PASSWORD = $databasePassword
 $env:CHOICEMIND_DATABASE_URL = "postgres://choicemind:$databasePassword@127.0.0.1:5432/choicemind"
 $env:CHOICEMIND_REDIS_URL = 'redis://127.0.0.1:6379'
 $env:CHOICEMIND_IDENTITY_MODE = 'persistent'
+$env:CHOICEMIND_CREDENTIAL_MASTER_KEY_BASE64 = $credentialMasterKeyBase64
 $composeFile = Join-Path $RepositoryRoot 'deploy\compose\compose.yaml'
 $developmentComposeFile = Join-Path $RepositoryRoot 'deploy\compose\compose.dev.yaml'
 $applicationPidPath = Join-Path $developmentStateDirectory "start-all-$PID.pid"
@@ -184,6 +212,7 @@ if ($LASTEXITCODE -ne 0) {
     Stop-LocalInfrastructure
     exit 1
 }
+Remove-Item Env:CHOICEMIND_CREDENTIAL_MASTER_KEY_BASE64 -ErrorAction SilentlyContinue
 
 $healthUrls = [ordered]@{
     'Web' = 'http://127.0.0.1:3000/health/live'
@@ -195,7 +224,7 @@ $applicationProcess = $null
 $scriptExitCode = 0
 
 try {
-        Write-Output '正在启动应用服务；日志统一显示在当前窗口，并带有 contracts/conversation/identity/web/api/api-publisher/identity-lifecycle/orchestrator/orchestrator-worker/data-worker 前缀。'
+        Write-Output '正在启动应用服务；日志统一显示在当前窗口，并带有 contracts/conversation/identity/source-access/source-research/web/api/api-publisher/identity-lifecycle/orchestrator/orchestrator-worker/source-worker/data-worker 前缀。'
     $processStartInfo = [System.Diagnostics.ProcessStartInfo]::new()
     $processStartInfo.FileName = $env:ComSpec
     $processStartInfo.Arguments = '/d /c "pnpm.cmd dev"'
@@ -258,6 +287,7 @@ try {
     Write-Output 'API Publisher 后台进程：运行中（由 pnpm dev 进程组监护）'
     Write-Output 'Identity Lifecycle Worker 后台进程：运行中（由 pnpm dev 进程组监护）'
     Write-Output 'Orchestrator Worker 后台进程：运行中（由 pnpm dev 进程组监护）'
+    Write-Output 'Source Worker 后台进程：运行中（由 pnpm dev 进程组监护）'
 
     $applicationProcess.WaitForExit()
     $scriptExitCode = $applicationProcess.ExitCode
