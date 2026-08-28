@@ -702,10 +702,14 @@ thead th {
 		background-color var(--transition-fast);
 }
 
-.session-list button:hover,
+.session-list button:not(:disabled):hover,
 .session-list button[aria-current="page"] {
 	border-left-color: var(--copper);
 	background: color-mix(in srgb, var(--copper) 7%, transparent);
+}
+
+.session-list button:disabled {
+	cursor: not-allowed;
 }
 
 .session-list span {

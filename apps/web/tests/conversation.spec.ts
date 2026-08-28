@@ -569,6 +569,7 @@ test("写入当前 Session 期间不允许切换到另一项决策", async ({ pa
 	await page.getByRole("button", { name: "发送并记录目标" }).click();
 	const secondButton = page.getByRole("button", { name: /第二项决策/ });
 	await expect(secondButton).toBeDisabled();
+	await expect(secondButton).toHaveCSS("cursor", "not-allowed");
 	releaseTurn?.();
 	await expect(secondButton).toBeEnabled();
 });
