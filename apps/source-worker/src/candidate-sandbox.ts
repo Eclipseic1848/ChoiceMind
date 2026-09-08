@@ -207,7 +207,8 @@ export async function recoverCandidateSandbox(): Promise<
 		!/^[a-f0-9]{64}$/.test(labels?.["choicemind.candidate.artifact"] ?? "") ||
 		!Number.isSafeInteger(deadline) ||
 		!Number.isFinite(createdAt) ||
-		deadline < createdAt ||
+		// 创建可能排队到预算耗尽；截止时间早于 Created 的自有槽位仍须回收。
+		deadline <= 0 ||
 		deadline - createdAt > 600_000 ||
 		slot.Mounts.length !== 0
 	)

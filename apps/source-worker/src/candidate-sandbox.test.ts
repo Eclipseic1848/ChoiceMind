@@ -37,6 +37,63 @@ it("启动任何进程前拒绝制品变化、越界预算与已取消作业", a
 describe.runIf(process.env.CHOICEMIND_RUN_CANDIDATE_SANDBOX === "1")(
 	"本机 Docker 合成候选",
 	() => {
+		it("创建阶段已耗尽预算的自有容器仍可安全回收", async () => {
+			expect(await recoverCandidateSandbox()).toBe("EMPTY");
+			const runDocker = (args: string[]) =>
+				promisify(execFile)("docker", ["--context", "desktop-linux", ...args], {
+					windowsHide: true,
+					timeout: 30_000,
+					encoding: "utf8",
+				});
+			let ownedId: string | undefined;
+			try {
+				const created = await runDocker([
+					"create",
+					"--name",
+					"choicemind-adapter-candidate-slot",
+					"--pull",
+					"never",
+					"--label",
+					`choicemind.candidate.owner=${randomUUID()}`,
+					"--label",
+					`choicemind.candidate.deadline=${Date.now() - 1000}`,
+					"--label",
+					"choicemind.candidate.policy=local-node-sandbox.v1",
+					"--label",
+					`choicemind.candidate.artifact=${input("1").artifactSha256}`,
+					"--network",
+					"none",
+					"--read-only",
+					"--user",
+					"65534:65534",
+					"--cap-drop",
+					"ALL",
+					"--security-opt",
+					"no-new-privileges=true",
+					"--cpus",
+					"2",
+					"--memory",
+					"2g",
+					"--memory-swap",
+					"2g",
+					"--pids-limit",
+					"64",
+					"node@sha256:4f77a690f2f8946ab16fe1e791a3ac0667ae1c3575c3e4d0d4589e9ed5bfaf3d",
+					"node",
+					"-e",
+					"1",
+				]);
+				const id = created.stdout.trim();
+				if (!/^[a-f0-9]{64}$/.test(id)) throw new Error("测试容器创建未确认");
+				ownedId = id;
+				expect(await recoverCandidateSandbox()).toBe("RECOVERED");
+				ownedId = undefined;
+				expect(await recoverCandidateSandbox()).toBe("EMPTY");
+			} finally {
+				if (ownedId !== undefined) await runDocker(["rm", "--force", ownedId]);
+			}
+		}, 30_000);
+
 		it("控制器被强制终止后不抢占有效租约，过期回收再运行", async () => {
 			expect(await recoverCandidateSandbox()).toBe("EMPTY");
 			const source = `// ${randomUUID()}\nsetInterval(()=>{},1000)`;
