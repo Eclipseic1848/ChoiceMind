@@ -3,6 +3,12 @@ import { parseAdapterCandidateSource } from "@choicemind/source-research/adapter
 
 const IDLE_TIMEOUT = Symbol("candidate-acquisition-idle");
 
+export class PypiProjectNotFound extends Error {
+	constructor() {
+		super("CANDIDATE_PROJECT_NOT_FOUND");
+	}
+}
+
 // 索引只提供公开候选，不代表依赖闭包或安全审查结论。
 export async function readPypiProjectMetadata(
 	packageName: string,
@@ -18,18 +24,21 @@ export async function readPypiProjectMetadata(
 	const timeout = AbortSignal.timeout(30_000);
 	const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
 	try {
-		const bytes = await read(
-			await request(
-				`https://pypi.org/pypi/${encodeURIComponent(source.packageName)}/json`,
-				combined,
-			),
-			4 * 1024 * 1024,
+		const response = await request(
+			`https://pypi.org/pypi/${encodeURIComponent(source.packageName)}/json`,
 			combined,
 		);
+		if (response.status === 404) {
+			await response.body?.cancel();
+			combined.throwIfAborted();
+			throw new PypiProjectNotFound();
+		}
+		const bytes = await read(response, 4 * 1024 * 1024, combined);
 		combined.throwIfAborted();
 		return { packageName: source.packageName, bytes, sha256: hash(bytes) };
-	} catch {
+	} catch (error) {
 		signal?.throwIfAborted();
+		if (error instanceof PypiProjectNotFound) throw error;
 		throw new Error("CANDIDATE_INDEX_UNAVAILABLE");
 	}
 }

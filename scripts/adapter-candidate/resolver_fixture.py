@@ -1,7 +1,9 @@
 """仅生成依赖求解的合成 wheel，不执行包代码。"""
 
 import base64
+import hashlib
 import io
+import json
 import sys
 import zipfile
 
@@ -35,15 +37,29 @@ if mode == "conflict":
 if mode == "direct":
     requires[0] = "helper @ https://example.invalid/helper.whl"
 output = io.BytesIO()
+wheels = []
 with zipfile.ZipFile(output, "w") as archive:
     for name, version, dependencies in [
         ("candidate", "1.0", requires),
         ("helper", "1.0", ["candidate==1.0"]),
-        ("helper", "2.0", []),
+        ("helper", "2.0", ["missing==1"] if mode == "missing" else []),
         ("other", "1.0", ["helper<2"]),
         ("fast", "1.0", []),
     ]:
-        archive.writestr(
-            f"{name}-{version}-py3-none-any.whl", wheel(name, version, dependencies)
+        data = wheel(name, version, dependencies)
+        filename = f"{name}-{version}-py3-none-any.whl"
+        archive.writestr(filename, data)
+        wheels.append(
+            {
+                "name": name,
+                "version": version,
+                "filename": filename,
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "bytes": base64.b64encode(data).decode("ascii"),
+            }
         )
-print(base64.b64encode(output.getvalue()).decode("ascii"))
+print(
+    json.dumps(wheels)
+    if "--catalogue" in sys.argv
+    else base64.b64encode(output.getvalue()).decode("ascii")
+)

@@ -68,12 +68,58 @@ export async function acquireCandidateWheelBundle(
 		artifacts.push(result.artifact);
 		acquisitions.push(result.receipt);
 	}
+	const packed = await packCandidateWheels(
+		items.map((item, index) => ({
+			filename: item.filename,
+			sha256: item.source.artifactSha256,
+			bytes: artifacts[index] as Buffer,
+		})),
+		combined,
+	);
+	if (packed.bundle.length + lockBytes.length + 8 > limit)
+		throw new Error("CANDIDATE_WHEEL_PACK_FAILED");
+	return { ...packed, locked, acquisitions };
+}
+
+// 候选目录可含同包多版本；最终安装集合仍由上层强制包名唯一。
+export async function packCandidateWheels(
+	input: readonly { filename: string; sha256: string; bytes: Uint8Array }[],
+	signal?: AbortSignal,
+) {
+	const limit = 64 * 1024 * 1024;
+	if (!Array.isArray(input) || input.length === 0 || input.length > 1000)
+		throw new Error("CANDIDATE_WHEEL_SET_INVALID");
+	const names = new Set<string>();
+	let bytes = 0;
+	const items = input
+		.map((item) => {
+			if (
+				!item ||
+				typeof item.filename !== "string" ||
+				!/^[A-Za-z0-9_][A-Za-z0-9_.+-]{0,239}\.whl$/.test(item.filename) ||
+				!(item.bytes instanceof Uint8Array) ||
+				item.bytes.length === 0 ||
+				names.has(item.filename.toLowerCase())
+			)
+				throw new Error("CANDIDATE_WHEEL_SET_INVALID");
+			bytes += item.bytes.length;
+			if (bytes > limit) throw new Error("CANDIDATE_WHEEL_SET_LIMIT");
+			names.add(item.filename.toLowerCase());
+			const copy = Buffer.from(item.bytes);
+			if (hash(copy) !== item.sha256)
+				throw new Error("CANDIDATE_HASH_MISMATCH");
+			return { filename: item.filename, sha256: item.sha256, bytes: copy };
+		})
+		.sort((a, b) =>
+			a.filename < b.filename ? -1 : a.filename > b.filename ? 1 : 0,
+		);
+	const artifacts = items.map((item) => item.bytes);
 	const header = Buffer.from(
 		JSON.stringify(
 			items.map((item, index) => ({
 				filename: item.filename,
 				size: artifacts[index]?.length,
-				sha256: item.source.artifactSha256,
+				sha256: item.sha256,
 			})),
 		),
 		"utf8",
@@ -93,21 +139,19 @@ export async function acquireCandidateWheelBundle(
 		artifactSha256: hash(code),
 		runtime: "PYTHON_BUILD",
 		stdin: Buffer.concat([length, header, ...artifacts]),
-		signal: combined,
+		...(signal ? { signal } : {}),
 	});
-	combined.throwIfAborted();
+	signal?.throwIfAborted();
 	if (
 		result.report.outcome !== "EXITED" ||
 		result.report.exitCode !== 0 ||
 		result.untrustedStdout.length === 0 ||
-		result.untrustedStdout.length + lockBytes.length + 8 > limit
+		result.untrustedStdout.length > limit
 	)
 		throw new Error("CANDIDATE_WHEEL_PACK_FAILED");
 	return {
 		bundle: result.untrustedStdout,
 		sha256: hash(result.untrustedStdout),
-		locked,
-		acquisitions,
 		execution: result.report,
 		reportSha256: result.reportSha256,
 		reviewStatus: "NOT_RUN" as const,
