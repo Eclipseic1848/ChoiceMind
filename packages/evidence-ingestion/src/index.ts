@@ -68,6 +68,60 @@ export type DataSourceCollectionResultWithResponseMetadata =
   | (DataSourceCollectionSuccess & Readonly<{ response: DataSourceResponseMetadata }>)
   | DataSourceCollectionFailure;
 
+export type EvidenceSourceRole = "OFFICIAL" | "OFFER" | "INDEPENDENT";
+
+export type EvidenceSubject =
+  | Readonly<{
+      subjectType: "CANDIDATE";
+      candidateId: string;
+    }>
+  | Readonly<{
+      subjectType: "OFFER";
+      candidateId: string;
+      offerId: string;
+      channel: string;
+      sku: string;
+    }>;
+
+export type EvidenceRawArtifact = DataSourceArtifactRef &
+  (
+    | Readonly<{ lifecycle: "TRANSIENT_PLATFORM"; expiresAt: string }>
+    | Readonly<{ lifecycle: "PRIVATE_FILE" }>
+  );
+
+export type EvidenceSource =
+  | Readonly<{
+      sourceType: "LIVE_PLATFORM";
+      sourceId: string;
+      platform: string;
+      title: string;
+      url: string;
+      contentId?: string;
+    }>
+  | Readonly<{
+      sourceType: "PRIVATE_FILE";
+      sourceId: string;
+      fileId: string;
+      title: string;
+      mediaType: string;
+    }>;
+
+export type ResearchEvidenceMaterial = Readonly<{
+  capturedAt: string;
+  validUntil: string;
+  excerpt: string;
+  locator: Readonly<{ section: string; field: string }>;
+  parserVersion: string;
+  rawArtifact: EvidenceRawArtifact;
+  source: EvidenceSource;
+  sourceRole: EvidenceSourceRole;
+  subject: EvidenceSubject;
+  claimLinks: readonly Readonly<{
+    claimId: string;
+    direction: "SUPPORTS" | "REFUTES";
+  }>[];
+}>;
+
 export interface DataSourceConnector<
   TResult extends DataSourceCollectionResult = DataSourceCollectionResult
 > {
@@ -1075,3 +1129,4 @@ function abortable<T>(operation: Promise<T>, signal?: AbortSignal): Promise<T> {
   });
 }
 
+export * from "./static-public-web.js";
