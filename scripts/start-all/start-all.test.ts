@@ -978,7 +978,7 @@ describe("start_all.bat", () => {
 			const output = `${result.stdout}${result.stderr}`;
 			const dockerLog = readFileSync(dockerLogPath, "utf8");
 
-			expect(result.status).toBe(0);
+			expect(result.status, output).toBe(0);
 			expect(output).toContain("ChoiceMind Alpha 已启动，前端开发热更新已启用");
 			expect(output).toContain("Identity Lifecycle Worker 后台进程：运行中");
 			expect(output).toContain("Web 健康：http://127.0.0.1:1029/health/live");

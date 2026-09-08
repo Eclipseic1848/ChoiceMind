@@ -2546,7 +2546,7 @@ async function listWindowsDescendantPids(rootPid: number): Promise<number[]> {
   const script = [
     "$ErrorActionPreference = 'Stop'",
     `$rootPid = [uint32]${rootPid}`,
-    "$processes = @(Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId)",
+    "$processes = @(Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId | Select-Object ProcessId, ParentProcessId)",
     "$pending = @($rootPid)",
     "$descendants = @()",
     "while ($pending.Count -gt 0) {",
