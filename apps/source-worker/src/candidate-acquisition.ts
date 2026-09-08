@@ -46,6 +46,7 @@ async function acquire(
 	const metadataSha256: string[] = [];
 	try {
 		let artifactUrl: string;
+		let filename: string | undefined;
 		let npmDigest:
 			| {
 					algorithm: "sha512" | "sha1";
@@ -153,6 +154,8 @@ async function acquire(
 				if (
 					matches.length !== 1 ||
 					!object(matches[0]) ||
+					typeof matches[0].filename !== "string" ||
+					!/^[A-Za-z0-9][A-Za-z0-9._+-]{0,239}$/.test(matches[0].filename) ||
 					typeof matches[0].url !== "string" ||
 					!object(matches[0].digests) ||
 					typeof matches[0].digests.sha256 !== "string" ||
@@ -160,6 +163,7 @@ async function acquire(
 				)
 					throw new Error("INVALID");
 				expectedSha256 = matches[0].digests.sha256;
+				filename = matches[0].filename;
 				const url = new URL(matches[0].url);
 				if (
 					url.origin !== "https://files.pythonhosted.org" ||
@@ -194,7 +198,8 @@ async function acquire(
 		return {
 			artifact,
 			receipt: {
-				schemaVersion: "candidate-acquisition.v2",
+				schemaVersion: "candidate-acquisition.v3",
+				...(filename === undefined ? {} : { filename }),
 				policyVersion: "public-pinned-artifact.v1",
 				limits: {
 					metadataBytes: 4 * 1024 * 1024,

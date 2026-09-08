@@ -67,6 +67,7 @@ def wheel(name, dependency=None):
 
 buffer = io.BytesIO()
 locked = []
+wheels = []
 candidate_artifact = None
 with zipfile.ZipFile(buffer, "w") as bundle:
     for name in ["candidate"] if sys.argv[1] == "missing" else ["candidate", "helper"]:
@@ -74,6 +75,9 @@ with zipfile.ZipFile(buffer, "w") as bundle:
         if name == "candidate":
             candidate_artifact = base64.b64encode(data).decode("ascii")
         filename = f"{name}-1.0-py3-none-any.whl"
+        wheels.append(
+            {"filename": filename, "bytes": base64.b64encode(data).decode("ascii")}
+        )
         bundle.writestr(filename, data)
         locked.append(
             {
@@ -119,6 +123,7 @@ print(
             "bundle": base64.b64encode(buffer.getvalue()).decode("ascii"),
             "artifact": candidate_artifact,
             "locked": locked,
+            "wheels": wheels,
             "source": source,
         }
     )
