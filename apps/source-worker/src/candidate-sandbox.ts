@@ -1,0 +1,310 @@
+import { spawn } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
+
+const IMAGE =
+	"node@sha256:4f77a690f2f8946ab16fe1e791a3ac0667ae1c3575c3e4d0d4589e9ed5bfaf3d";
+const SLOT = "choicemind-adapter-candidate-slot";
+const LIMIT = 65_536;
+const POLICY = "local-node-sandbox.v1";
+const OWNER_LABEL = "choicemind.candidate.owner";
+const DEADLINE_LABEL = "choicemind.candidate.deadline";
+const POLICY_LABEL = "choicemind.candidate.policy";
+
+type Outcome = "EXITED" | "TIMED_OUT" | "CANCELLED" | "OUTPUT_LIMIT";
+
+// 仅执行已物化的有界 Node 制品；不是下载器、审查器或正式 Adapter 加载器。
+export async function executeCandidateSandbox(input: {
+	artifact: Uint8Array;
+	artifactSha256: string;
+	timeoutMs?: number;
+	signal?: AbortSignal;
+}) {
+	const timeoutMs = input.timeoutMs ?? 600_000;
+	if (
+		!(input.artifact instanceof Uint8Array) ||
+		input.artifact.byteLength === 0 ||
+		input.artifact.byteLength > LIMIT ||
+		!/^[a-f0-9]{64}$/.test(input.artifactSha256) ||
+		!Number.isSafeInteger(timeoutMs) ||
+		timeoutMs < 100 ||
+		timeoutMs > 600_000
+	) {
+		throw new Error("CANDIDATE_INPUT_INVALID");
+	}
+	// 先复制再校验，调用方修改原缓冲区不能改变实际执行内容。
+	const artifact = Buffer.from(input.artifact);
+	if (digest(artifact) !== input.artifactSha256)
+		throw new Error("CANDIDATE_HASH_MISMATCH");
+	if (input.signal?.aborted) throw new Error("CANDIDATE_CANCELLED");
+	if ((await recoverCandidateSandbox()) === "ACTIVE")
+		throw new Error("CANDIDATE_SLOT_BUSY");
+	await docker(["image", "inspect", IMAGE, "--format", "{{.Id}}"]);
+	const owner = randomUUID();
+	const deadline = Date.now() + timeoutMs;
+	let containerId: string | undefined;
+	try {
+		// 固定槽位让 Docker 原子拒绝跨进程并发；已有槽位绝不抢占或删除。
+		const created = await docker([
+			"create",
+			"--name",
+			SLOT,
+			"--label",
+			`${OWNER_LABEL}=${owner}`,
+			"--label",
+			`${DEADLINE_LABEL}=${deadline}`,
+			"--label",
+			`${POLICY_LABEL}=${POLICY}`,
+			"--label",
+			`choicemind.candidate.artifact=${input.artifactSha256}`,
+			"--pull",
+			"never",
+			"--interactive",
+			"--network",
+			"none",
+			"--read-only",
+			"--user",
+			"65534:65534",
+			"--cap-drop",
+			"ALL",
+			"--security-opt",
+			"no-new-privileges=true",
+			"--cpus",
+			"2",
+			"--memory",
+			"2g",
+			"--memory-swap",
+			"2g",
+			"--pids-limit",
+			"64",
+			"--tmpfs",
+			"/work:rw,nosuid,nodev,size=536870912,mode=1777",
+			"--workdir",
+			"/work",
+			"--log-driver",
+			"none",
+			IMAGE,
+			"node",
+			"--input-type=module",
+		]);
+		const id = created.stdout.toString("utf8").trim();
+		if (!/^[a-f0-9]{64}$/.test(id))
+			throw new Error("CANDIDATE_CREATE_UNCONFIRMED");
+		containerId = id;
+		const inspection = JSON.parse(
+			(await docker(["inspect", id])).stdout.toString("utf8"),
+		)[0];
+		const host = inspection.HostConfig;
+		if (
+			inspection.Config.Image !== IMAGE ||
+			inspection.Config.User !== "65534:65534" ||
+			!inspection.Config.OpenStdin ||
+			host.NetworkMode !== "none" ||
+			!host.ReadonlyRootfs ||
+			host.Privileged ||
+			inspection.Mounts.length !== 0 ||
+			host.Memory !== 2147483648 ||
+			host.MemorySwap !== 2147483648 ||
+			host.NanoCpus !== 2000000000 ||
+			host.PidsLimit !== 64 ||
+			!host.CapDrop.includes("ALL") ||
+			!host.SecurityOpt.includes("no-new-privileges=true") ||
+			host.Tmpfs["/work"] !== "rw,nosuid,nodev,size=536870912,mode=1777" ||
+			host.LogConfig.Type !== "none"
+		)
+			throw new Error("CANDIDATE_POLICY_MISMATCH");
+		if (input.signal?.aborted) throw new Error("CANDIDATE_CANCELLED");
+		const remainingMs = deadline - Date.now();
+		if (remainingMs <= 0) throw new Error("CANDIDATE_DEADLINE_EXPIRED");
+		const execution = await command(
+			["start", "--attach", "--interactive", id],
+			{
+				stdin: artifact,
+				timeoutMs: remainingMs,
+				...(input.signal === undefined ? {} : { signal: input.signal }),
+			},
+		);
+		let exitCode: number | null = null;
+		if (execution.outcome === "EXITED") {
+			const state = JSON.parse(
+				(
+					await docker(["inspect", id, "--format", "{{json .State}}"])
+				).stdout.toString("utf8"),
+			);
+			if (
+				state.Running ||
+				!Number.isInteger(state.ExitCode) ||
+				execution.code !== state.ExitCode
+			) {
+				throw new Error("CANDIDATE_EXIT_UNCONFIRMED");
+			}
+			exitCode = state.ExitCode;
+		}
+		const report = {
+			schemaVersion: "candidate-execution.v1",
+			policyVersion: POLICY,
+			artifactSha256: digest(artifact),
+			image: IMAGE,
+			outcome: execution.outcome,
+			exitCode,
+			stdoutSha256: digest(execution.stdout),
+			stderrSha256: digest(execution.stderr),
+			outputBytes: execution.bytes,
+			timeoutMs,
+			// 正常退出只说明进程执行完毕，绝不根据候选输出晋升。
+			reviewStatus: "NOT_RUN" as const,
+		};
+		return {
+			report,
+			reportSha256: digest(Buffer.from(JSON.stringify(report), "utf8")),
+			untrustedStdout: execution.stdout,
+		};
+	} finally {
+		try {
+			// create 的应答丢失也按本次 owner 查回，绝不按名称删除竞争者。
+			if (containerId === undefined) {
+				const slot = await inspectSlot();
+				if (slot?.Config.Labels?.[OWNER_LABEL] === owner) containerId = slot.Id;
+			}
+			if (containerId !== undefined) {
+				await docker(["rm", "--force", containerId]);
+			}
+		} catch {
+			// biome-ignore lint/correctness/noUnsafeFinally: 回收未确认必须覆盖成功结果，不能把残留容器报告为成功。
+			throw new Error("CANDIDATE_CLEANUP_UNCONFIRMED");
+		}
+	}
+}
+
+// 启动/恢复入口可重复调用；超时回收不等于候选成功，也不续用遗留输出。
+export async function recoverCandidateSandbox(): Promise<
+	"EMPTY" | "ACTIVE" | "RECOVERED"
+> {
+	const endpoint = await docker([
+		"context",
+		"inspect",
+		"desktop-linux",
+		"--format",
+		"{{.Endpoints.docker.Host}}",
+	]);
+	if (
+		endpoint.stdout.toString("utf8").trim() !==
+		"npipe:////./pipe/dockerDesktopLinuxEngine"
+	) {
+		throw new Error("CANDIDATE_LOCAL_DOCKER_REQUIRED");
+	}
+	const slot = await inspectSlot();
+	if (slot === undefined) return "EMPTY";
+	const labels = slot.Config.Labels;
+	const deadline = Number(labels?.[DEADLINE_LABEL]);
+	const createdAt = Date.parse(slot.Created);
+	if (
+		slot.Name !== `/${SLOT}` ||
+		slot.Config.Image !== IMAGE ||
+		labels?.[POLICY_LABEL] !== POLICY ||
+		!/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(
+			labels?.[OWNER_LABEL] ?? "",
+		) ||
+		!/^[a-f0-9]{64}$/.test(labels?.["choicemind.candidate.artifact"] ?? "") ||
+		!Number.isSafeInteger(deadline) ||
+		!Number.isFinite(createdAt) ||
+		deadline < createdAt ||
+		deadline - createdAt > 600_000 ||
+		slot.Mounts.length !== 0
+	)
+		throw new Error("CANDIDATE_SLOT_OWNERSHIP_UNCONFIRMED");
+	if (Date.now() < deadline) return "ACTIVE";
+	await docker(["rm", "--force", slot.Id]);
+	return "RECOVERED";
+}
+
+async function inspectSlot() {
+	const list = await docker([
+		"ps",
+		"--all",
+		"--no-trunc",
+		"--filter",
+		`name=^/${SLOT}$`,
+		"--format",
+		"{{.ID}}",
+	]);
+	const id = list.stdout.toString("utf8").trim();
+	if (id === "") return undefined;
+	if (!/^[a-f0-9]{64}$/.test(id))
+		throw new Error("CANDIDATE_SLOT_OWNERSHIP_UNCONFIRMED");
+	const slot = JSON.parse(
+		(await docker(["inspect", id])).stdout.toString("utf8"),
+	)[0];
+	if (slot?.Id !== id) throw new Error("CANDIDATE_SLOT_OWNERSHIP_UNCONFIRMED");
+	return slot;
+}
+
+function digest(bytes: Uint8Array): string {
+	return createHash("sha256").update(bytes).digest("hex");
+}
+
+async function docker(args: string[]) {
+	const result = await command(args, { timeoutMs: 30_000 });
+	if (result.outcome !== "EXITED" || result.code !== 0)
+		throw new Error("CANDIDATE_DOCKER_FAILED");
+	return result;
+}
+
+function command(
+	args: string[],
+	options: { stdin?: Buffer; timeoutMs: number; signal?: AbortSignal },
+) {
+	return new Promise<{
+		outcome: Outcome;
+		code: number | null;
+		stdout: Buffer;
+		stderr: Buffer;
+		bytes: number;
+	}>((resolve, reject) => {
+		const child = spawn("docker", ["--context", "desktop-linux", ...args], {
+			shell: false,
+			windowsHide: true,
+			stdio: ["pipe", "pipe", "pipe"],
+		});
+		let outcome: Outcome = "EXITED";
+		let bytes = 0;
+		const stdout: Buffer[] = [];
+		const stderr: Buffer[] = [];
+		const stop = (reason: Outcome) => {
+			if (outcome !== "EXITED") return;
+			outcome = reason;
+			child.kill("SIGKILL");
+		};
+		const cancel = () => stop("CANCELLED");
+		const timer = setTimeout(() => stop("TIMED_OUT"), options.timeoutMs);
+		options.signal?.addEventListener("abort", cancel, { once: true });
+		const collect = (target: Buffer[], chunk: Buffer) => {
+			const remaining = Math.max(0, LIMIT - bytes);
+			bytes += chunk.length;
+			if (remaining > 0) target.push(chunk.subarray(0, remaining));
+			if (bytes > LIMIT) stop("OUTPUT_LIMIT");
+		};
+		child.stdout.on("data", (chunk: Buffer) => collect(stdout, chunk));
+		child.stderr.on("data", (chunk: Buffer) => collect(stderr, chunk));
+		child.stdin.on("error", () => {
+			/* 提前退出时 EPIPE 由容器退出状态判定。 */
+		});
+		child.once("error", () => {
+			clearTimeout(timer);
+			options.signal?.removeEventListener("abort", cancel);
+			reject(new Error("CANDIDATE_DOCKER_LAUNCH_FAILED"));
+		});
+		child.once("close", (code) => {
+			clearTimeout(timer);
+			options.signal?.removeEventListener("abort", cancel);
+			resolve({
+				outcome,
+				code,
+				stdout: Buffer.concat(stdout),
+				stderr: Buffer.concat(stderr),
+				bytes,
+			});
+		});
+		child.stdin.end(options.stdin);
+		if (options.signal?.aborted) cancel();
+	});
+}
