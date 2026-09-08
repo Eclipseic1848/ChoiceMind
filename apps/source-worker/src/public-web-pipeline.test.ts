@@ -17,6 +17,7 @@ it.skipIf(process.env.CHOICEMIND_TEST_DATABASE_URL === undefined)(
   "公开网页经 Worker 落库且隔离用户，原始材料七天到期",
   async () => {
     const root = await mkdtemp(join(tmpdir(), "choicemind-public-pipeline-"));
+    if (!resolve(root).startsWith(`${resolve(tmpdir())}${sep}`)) throw new Error("临时目录越界");
     const research = await openPostgresSourceResearch({
       databaseUrl: process.env.CHOICEMIND_TEST_DATABASE_URL as string
     });
@@ -24,7 +25,7 @@ it.skipIf(process.env.CHOICEMIND_TEST_DATABASE_URL === undefined)(
     try {
       const now = () => new Date("2026-09-01T00:00:00.000Z");
       const objectStore = createFileRawEvidenceObjectStore({ rootDirectory: root });
-      const text = "产品规格说明。".repeat(40) + "该型号配备 32 GB 内存";
+      const text = `${"产品规格说明。".repeat(40)}该型号配备 32 GB 内存`;
       const bytes = new TextEncoder().encode(`<main>${text}</main>`);
       const url = "https://brand.example/product";
       const audited: string[] = [];
@@ -82,7 +83,6 @@ it.skipIf(process.env.CHOICEMIND_TEST_DATABASE_URL === undefined)(
       try { await research.purgePrivateDataForOwner(ownerUserId); }
       finally {
         await research.close();
-        if (!resolve(root).startsWith(resolve(tmpdir()) + sep)) throw new Error("临时目录越界");
         await rm(root, { recursive: true, force: true });
       }
     }
