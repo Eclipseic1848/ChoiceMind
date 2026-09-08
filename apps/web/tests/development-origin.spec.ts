@@ -1,7 +1,7 @@
-import { describe, expect, test } from "vitest";
+import { expect, test } from "@playwright/test";
 import nextConfig from "../next.config";
 
-describe("Next 开发来源", () => {
+test.describe("Next 开发来源", () => {
 	test("允许指定的局域网地址加载开发资源", () => {
 		expect(nextConfig.allowedDevOrigins).toContain("192.168.50.123");
 	});
