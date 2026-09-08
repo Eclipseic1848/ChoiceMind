@@ -3,6 +3,17 @@ import { readFile } from "node:fs/promises";
 import type { openPostgresCandidateStore } from "@choicemind/source-research/candidate-store";
 import { executeCandidateSandbox } from "./candidate-sandbox.js";
 
+export class CandidateWheelInstallFailure extends Error {
+	constructor(
+		readonly execution: Awaited<
+			ReturnType<typeof executeCandidateSandbox>
+		>["report"],
+		readonly reportSha256: string,
+	) {
+		super("CANDIDATE_WHEEL_INSTALL_REJECTED");
+	}
+}
+
 export async function buildAndStoreCandidateWheels(
 	input: Parameters<typeof installCandidateWheels>[0] & {
 		source: { archive: Uint8Array; sha256: string };
@@ -127,7 +138,10 @@ export async function installCandidateWheels(input: {
 		...(input.signal === undefined ? {} : { signal: input.signal }),
 	});
 	if (execution.report.outcome !== "EXITED" || execution.report.exitCode !== 0)
-		throw new Error("CANDIDATE_WHEEL_INSTALL_REJECTED");
+		throw new CandidateWheelInstallFailure(
+			execution.report,
+			execution.reportSha256,
+		);
 	const { summary, builtArtifact } = decodeCandidateWheelOutput(
 		execution.untrustedStdout,
 		input.source !== undefined,
