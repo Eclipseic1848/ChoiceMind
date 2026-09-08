@@ -612,6 +612,39 @@ describe("Evidence ingestion", () => {
     expect(JSON.stringify(normalized)).not.toContain("synthetic-secret");
   });
 
+  it.each(["source", "locator", "subject", "claimLinks"])(
+    "rejects oversized %s metadata instead of bypassing the Evidence bound",
+    (field) => {
+      const module = createEvidenceModule({
+        nextEvidenceId: () => "evidence-never",
+        nextGapId: () => "gap-oversized-material",
+        nextLinkId: () => "link-never"
+      });
+      const material = researchMaterial();
+      const oversized = "中".repeat(22_000);
+      const untrusted = {
+        ...material,
+        ...(field === "source" ? { source: { ...material.source, title: oversized } } : {}),
+        ...(field === "locator" ? { locator: { ...material.locator, section: oversized } } : {}),
+        ...(field === "subject" ? { subject: { ...material.subject, candidateId: oversized } } : {}),
+        ...(field === "claimLinks" ? { claimLinks: [{ claimId: oversized, direction: "SUPPORTS" }] } : {})
+      };
+      const normalized = module.normalizeResearchBatch({
+        ownerUserId: "user-a",
+        decisionTaskId: "task-a",
+        claimIds: ["claim-price", oversized],
+        batch: {
+          ownerUserId: "user-a",
+          decisionTaskId: "task-a",
+          results: [{ resultKey: "source:oversized", material: untrusted }]
+        }
+      });
+      expect(normalized.evidence.length).toBe(0);
+      expect(normalized.claimEvidenceLinks.length).toBe(0);
+      expect(normalized.gaps).toMatchObject([{ code: "EVIDENCE_MATERIAL_INVALID" }]);
+    }
+  );
+
   it("enforces hard CoreMind limits even when configured limits are larger", () => {
     let evidenceSequence = 0;
     let linkSequence = 0;

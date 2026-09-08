@@ -141,6 +141,7 @@ export type NormalizedClaimEvidenceLink = Readonly<{
 }>;
 
 const MAX_EVIDENCE_EXCERPT_CHARACTERS = 8_000;
+const MAX_EVIDENCE_MATERIAL_BYTES = 64 * 1_024;
 const MAX_COREMIND_EVIDENCE = 20;
 const MAX_COREMIND_EXCERPT_CHARACTERS = 2_000;
 
@@ -678,7 +679,7 @@ function decodeResearchEvidenceMaterial(value: unknown): ResearchEvidenceMateria
           channel: value.subject.channel,
           sku: value.subject.sku
         };
-  return {
+  const material: ResearchEvidenceMaterial = {
     capturedAt: value.capturedAt,
     validUntil: value.validUntil,
     excerpt: value.excerpt,
@@ -696,6 +697,10 @@ function decodeResearchEvidenceMaterial(value: unknown): ResearchEvidenceMateria
       direction: link.direction
     }))
   };
+  // 同时限制元数据与关联，避免通过非摘录字段传入完整原文。
+  return Buffer.byteLength(JSON.stringify(material), "utf8") <= MAX_EVIDENCE_MATERIAL_BYTES
+    ? material
+    : undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
