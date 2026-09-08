@@ -20,10 +20,24 @@ def wheel(name, dependency=None):
     }
     if name == "helper" and sys.argv[1] == "source-shadow":
         files["pip.py"] = "raise RuntimeError('candidate replaced trusted pip')\n"
+    if name == "helper" and sys.argv[1] == "secret":
+        files["settings.txt"] = (
+            "token='"
+            + "ghp"
+            + "_"
+            + "Ab3dE5gH7jK9mN2pQ4sT6vW8xY0zB1cD3fG5"
+            + "' # gitleaks:allow\n"
+        )
+    if name == "helper" and sys.argv[1] == "binary":
+        files["compiled.bin"] = b"\x00\xff"
     files[f"{info}/RECORD"] = "\n".join(
         f"{path},," for path in [*files, f"{info}/RECORD"]
     )
     with zipfile.ZipFile(buffer, "w") as archive:
+        if name == "helper" and sys.argv[1] == "comment":
+            archive.comment = (
+                "ghp" + "_" + "Ab3dE5gH7jK9mN2pQ4sT6vW8xY0zB1cD3fG5"
+            ).encode("ascii")
         for path, content in files.items():
             archive.writestr(path, content)
     return buffer.getvalue()

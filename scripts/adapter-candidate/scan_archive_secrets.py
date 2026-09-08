@@ -2,6 +2,7 @@
 
 import hashlib
 import io
+import json
 import pathlib
 import re
 import subprocess
@@ -21,7 +22,39 @@ def scan_archive_secrets(data, expected_sha256, kind, inspect_archive):
         or hashlib.sha256(scanner).hexdigest() != SCANNER_SHA256
     ):
         raise ValueError("CANDIDATE_SCANNER_INVALID")
-    manifest = inspect_archive(data, expected_sha256, kind)
+    manifest = inspect_archive(
+        data, expected_sha256, "WHEEL" if kind == "WHEEL_BUNDLE" else kind
+    )
+    if kind != "WHEEL_BUNDLE":
+        return _scan_archive(data, expected_sha256, kind, manifest)
+    if len(manifest["entries"]) > 1000:
+        raise ValueError("CANDIDATE_SCAN_BUNDLE_LIMIT")
+    reports = [
+        _scan_archive(data, expected_sha256, "WHEEL", manifest, metadata_only=True)
+    ]
+    expanded = entries = 0
+    with zipfile.ZipFile(io.BytesIO(data)) as bundle:
+        for entry in manifest["entries"]:
+            if entry["directory"] or not entry["path"].endswith(".whl"):
+                raise ValueError("CANDIDATE_SCAN_BUNDLE_INVALID")
+            wheel = bundle.read(entry["path"])
+            checked = inspect_archive(wheel, entry["sha256"], "WHEEL")
+            expanded += checked["expandedBytes"]
+            entries += len(checked["entries"])
+            if expanded > 256 * 1024 * 1024 or entries > 10_000:
+                raise ValueError("CANDIDATE_SCAN_BUNDLE_LIMIT")
+            reports.append(_scan_archive(wheel, entry["sha256"], "WHEEL", checked))
+    return {
+        "schemaVersion": "candidate-wheel-bundle-secrets.v1",
+        "archiveSha256": expected_sha256,
+        "scannerSha256": SCANNER_SHA256,
+        "status": _status(reports),
+        "archives": reports,
+    }
+
+
+def _scan_archive(data, expected_sha256, kind, manifest, metadata_only=False):
+    executable = pathlib.Path("/usr/local/bin/gitleaks")
     results = []
 
     def scan(entry, content):
@@ -73,33 +106,57 @@ def scan_archive_secrets(data, expected_sha256, kind, inspect_archive):
                 "sha256": entry["sha256"],
                 "bytes": entry["bytes"],
                 "status": status,
+                "kind": entry.get("kind", "FILE"),
             }
         )
 
     by_path = {
         entry["path"]: entry for entry in manifest["entries"] if not entry["directory"]
     }
+    metadata = []
     if kind == "WHEEL":
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
-            for path, entry in by_path.items():
-                scan(entry, archive.read(path))
+            metadata.append(archive.comment)
+            for member in archive.infolist():
+                metadata.extend(
+                    [member.filename.encode("utf-8"), member.comment, member.extra]
+                )
+            if not metadata_only:
+                for path, entry in by_path.items():
+                    scan(entry, archive.read(path))
     else:
         with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as archive:
             for member in archive:
+                info = member.get_info()
+                info["type"] = member.type.decode("ascii")
+                metadata.append(json.dumps(info, sort_keys=True).encode("utf-8"))
                 if member.isfile():
                     with archive.extractfile(member) as stream:
                         scan(by_path[member.name], stream.read())
-    if len(results) != len(by_path):
+    if not metadata_only and len(results) != len(by_path):
         raise ValueError("CANDIDATE_SCAN_COVERAGE_INVALID")
-    status = "NO_FINDINGS"
-    if not results or any(item["status"] == "NOT_RUN" for item in results):
-        status = "NOT_RUN"
-    if any(item["status"] == "FINDINGS" for item in results):
-        status = "FINDINGS"
+    content = b"\n".join(metadata)
+    scan(
+        {
+            "path": "<archive-metadata>",
+            "bytes": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "kind": "METADATA",
+        },
+        content,
+    )
     return {
         "schemaVersion": "candidate-archive-secrets.v1",
         "archiveSha256": expected_sha256,
         "scannerSha256": SCANNER_SHA256,
-        "status": status,
+        "status": _status(results),
         "files": results,
     }
+
+
+def _status(results):
+    if any(item["status"] == "FINDINGS" for item in results):
+        return "FINDINGS"
+    if not results or any(item["status"] == "NOT_RUN" for item in results):
+        return "NOT_RUN"
+    return "NO_FINDINGS"

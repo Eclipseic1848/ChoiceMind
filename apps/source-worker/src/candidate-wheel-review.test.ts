@@ -21,6 +21,9 @@ describe.runIf(
 		["complete", "FAILED"],
 		["complete", "NOT_RUN"],
 		["missing", "NOT_RUN"],
+		["secret", "PASSED"],
+		["binary", "PASSED"],
+		["comment", "PASSED"],
 	])(
 		"%s / %s：报告来自实际执行，残缺检查不能启用",
 		async (mode, status) => {
@@ -72,15 +75,28 @@ describe.runIf(
 					{ saveArtifact, record: (input) => store.record(input) },
 				);
 				expect(report.lockedWheelInstallation).toBe(
-					mode === "complete" ? "PASSED" : "FAILED",
+					mode !== "missing" ? "PASSED" : "FAILED",
 				);
-				expect(report.execution.exitCode).toBe(mode === "complete" ? 0 : 2);
+				expect(report.execution.exitCode).toBe(mode !== "missing" ? 0 : 2);
 				expect(report.vulnerabilityScan.status).toBe(
-					mode === "complete" ? status : "NOT_RUN",
+					mode !== "missing" ? status : "NOT_RUN",
 				);
 				expect(stored.candidate.review.checks.dependencies.status).toBe(
-					mode === "complete" ? status : "FAILED",
+					mode !== "missing" ? status : "FAILED",
 				);
+				expect(stored.candidate.review.checks.secrets.status).toBe(
+					mode === "secret" || mode === "comment"
+						? "FAILED"
+						: mode === "binary" || mode === "missing"
+							? "NOT_RUN"
+							: "PASSED",
+				);
+				expect(saveArtifact).toHaveBeenCalledTimes(1);
+				for (const [bytes] of saveArtifact.mock.calls) {
+					expect(Buffer.from(bytes).toString("utf8")).not.toContain(
+						"Ab3dE5gH7jK9mN2pQ4sT6vW8xY0zB1cD3fG5",
+					);
+				}
 				expect(stored.candidate.review.checks.basicCollection.status).toBe(
 					"NOT_RUN",
 				);

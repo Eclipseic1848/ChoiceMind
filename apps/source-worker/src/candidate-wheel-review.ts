@@ -4,6 +4,7 @@ import {
 	createAdapterCandidate,
 } from "@choicemind/source-research/adapter-candidate";
 import type { openPostgresCandidateStore } from "@choicemind/source-research/candidate-store";
+import { scanCandidateArchiveSecrets } from "./candidate-archive-secret-scan.js";
 import { scanCandidateVulnerabilities } from "./candidate-vulnerability-scan.js";
 import {
 	CandidateWheelInstallFailure,
@@ -103,12 +104,21 @@ export async function reviewCandidateWheelDependencies(
 		receipt = error;
 	}
 	signal?.throwIfAborted();
+	const secretScan = installed
+		? await scanCandidateArchiveSecrets({
+				archive: bundle,
+				sha256: hash(bundle),
+				kind: "WHEEL_BUNDLE",
+				...(signal === undefined ? {} : { signal }),
+			})
+		: { status: "NOT_RUN" as const, checkCount: 0, findingCount: 0 };
+	signal?.throwIfAborted();
 	const vulnerabilityScan = installed
 		? await scanCandidateVulnerabilities(locked, signal)
 		: { status: "NOT_RUN" as const, findingCount: 0 };
 	signal?.throwIfAborted();
 	const report = {
-		schemaVersion: "candidate-wheel-dependency-review.v2",
+		schemaVersion: "candidate-wheel-dependency-review.v3",
 		source,
 		artifactSha256: hash(artifact),
 		bundleSha256: hash(bundle),
@@ -117,15 +127,14 @@ export async function reviewCandidateWheelDependencies(
 		controller: "isolated-locked-wheel-install.v1",
 		lockedWheelInstallation: installed ? "PASSED" : "FAILED",
 		vulnerabilityScan,
+		secretScan,
 		execution: receipt.execution,
 		executionReportSha256: receipt.reportSha256,
 	};
 	const reportBytes = Buffer.from(JSON.stringify(report), "utf8");
-	// 任一步入库失败都不发布审查记录；先存内容寻址的非敏感输入和回执。
-	for (const bytes of [artifact, bundle, lockManifest, reportBytes]) {
-		await store.saveArtifact(bytes);
-		signal?.throwIfAborted();
-	}
+	// 这里只完成部分审查；原制品留存交给完整安全审查，不能凭无命中提前保存。
+	await store.saveArtifact(reportBytes);
+	signal?.throwIfAborted();
 	// 发布请求开始后不承诺撤回数据库提交；发布前的取消不得生成新审查版本。
 	const stored = await store.record({
 		schemaVersion: "adapter-candidate.v1",
@@ -135,6 +144,17 @@ export async function reviewCandidateWheelDependencies(
 			reviewedAt: report.reviewedAt,
 			checks: {
 				...initial.review.checks,
+				secrets:
+					secretScan.status === "NOT_RUN"
+						? notRun
+						: {
+								status:
+									secretScan.status === "FINDINGS"
+										? ("FAILED" as const)
+										: ("PASSED" as const),
+								checkCount: secretScan.checkCount,
+								findingCount: secretScan.findingCount,
+							},
 				dependencies: installed
 					? vulnerabilityScan.status === "NOT_RUN"
 						? notRun

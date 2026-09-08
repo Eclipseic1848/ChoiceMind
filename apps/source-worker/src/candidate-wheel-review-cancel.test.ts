@@ -2,6 +2,17 @@ import { createHash } from "node:crypto";
 import { expect, it, vi } from "vitest";
 import { reviewCandidateWheelDependencies } from "./candidate-wheel-review.js";
 
+const secretScan = vi.hoisted(() =>
+	vi.fn(async () => ({
+		status: "NO_FINDINGS",
+		checkCount: 1,
+		findingCount: 0,
+	})),
+);
+vi.mock("./candidate-archive-secret-scan.js", () => ({
+	scanCandidateArchiveSecrets: secretScan,
+}));
+
 vi.mock("./candidate-vulnerability-scan.js", () => ({
 	scanCandidateVulnerabilities: vi.fn(async () => ({
 		status: "PASSED",
@@ -17,15 +28,20 @@ vi.mock("./candidate-wheel-install.js", async (importOriginal) => ({
 	})),
 }));
 
-it.each([1, 2, 3, 4])(
-	"第 %i 次归档等待中取消，不发布审查版本",
-	async (cancelAt) => {
+it.each(["scan-cancel", "scan-failure", "save-cancel"])(
+	"%s：中止或失败不发布审查版本",
+	async (stage) => {
 		const controller = new AbortController();
+		secretScan.mockImplementationOnce(async () => {
+			if (stage === "scan-cancel") controller.abort();
+			if (stage === "scan-failure")
+				throw new Error("SYNTHETIC_SCANNER_UNAVAILABLE");
+			return { status: "NO_FINDINGS", checkCount: 1, findingCount: 0 };
+		});
 		const artifact = Buffer.from("synthetic");
 		const sha256 = createHash("sha256").update(artifact).digest("hex");
-		let calls = 0;
 		const saveArtifact = vi.fn(async () => {
-			if (++calls === cancelAt) controller.abort();
+			if (stage === "save-cancel") controller.abort();
 			return sha256;
 		});
 		const record = vi.fn();
@@ -53,7 +69,7 @@ it.each([1, 2, 3, 4])(
 				{ saveArtifact, record },
 			),
 		).rejects.toThrow();
-		expect(saveArtifact).toHaveBeenCalledTimes(cancelAt);
+		expect(saveArtifact).toHaveBeenCalledTimes(stage === "save-cancel" ? 1 : 0);
 		expect(record).not.toHaveBeenCalled();
 	},
 );
