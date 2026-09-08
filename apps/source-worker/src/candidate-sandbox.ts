@@ -3,25 +3,47 @@ import { createHash, randomUUID } from "node:crypto";
 
 import { startCandidateSupervisor } from "./candidate-sandbox-guard.js";
 
-const IMAGE =
-	"node@sha256:4f77a690f2f8946ab16fe1e791a3ac0667ae1c3575c3e4d0d4589e9ed5bfaf3d";
+const RUNTIMES = {
+	NODE: {
+		image:
+			"node@sha256:4f77a690f2f8946ab16fe1e791a3ac0667ae1c3575c3e4d0d4589e9ed5bfaf3d",
+		policy: "local-node-sandbox.v1",
+		outputLimit: 65_536,
+		command: ["node", "--input-type=module"],
+	},
+	PYTHON: {
+		image:
+			"python@sha256:9d7f287598e1a5a978c015ee176d8216435aaf335ed69ac3c38dd1bbb10e8d64",
+		policy: "local-python-sandbox.v1",
+		// 10000 个最长路径条目及 JSON 转义仍有界；普通 Node 日志额度不变。
+		outputLimit: 32 * 1024 * 1024,
+		command: [
+			"python",
+			"-I",
+			"-c",
+			"import sys; n=int.from_bytes(sys.stdin.buffer.read(4),'big'); code=sys.stdin.buffer.read(n); exec(compile(code,'<candidate>','exec'))",
+		],
+	},
+} as const;
 const SLOT = "choicemind-adapter-candidate-slot";
 const LIMIT = 65_536;
-const POLICY = "local-node-sandbox.v1";
 const OWNER_LABEL = "choicemind.candidate.owner";
 const DEADLINE_LABEL = "choicemind.candidate.deadline";
 const POLICY_LABEL = "choicemind.candidate.policy";
 
 type Outcome = "EXITED" | "TIMED_OUT" | "CANCELLED" | "OUTPUT_LIMIT";
 
-// 仅执行已物化的有界 Node 制品；不是下载器、审查器或正式 Adapter 加载器。
+// 仅执行已物化的有界制品；不是下载器、审查器或正式 Adapter 加载器。
 export async function executeCandidateSandbox(input: {
 	artifact: Uint8Array;
 	artifactSha256: string;
 	timeoutMs?: number;
 	signal?: AbortSignal;
+	runtime?: keyof typeof RUNTIMES;
+	stdin?: Uint8Array;
 }) {
 	const timeoutMs = input.timeoutMs ?? 600_000;
+	const runtimeName = input.runtime ?? "NODE";
 	if (
 		!(input.artifact instanceof Uint8Array) ||
 		input.artifact.byteLength === 0 ||
@@ -29,18 +51,32 @@ export async function executeCandidateSandbox(input: {
 		!/^[a-f0-9]{64}$/.test(input.artifactSha256) ||
 		!Number.isSafeInteger(timeoutMs) ||
 		timeoutMs < 100 ||
-		timeoutMs > 600_000
+		timeoutMs > 600_000 ||
+		!Object.hasOwn(RUNTIMES, runtimeName) ||
+		(input.stdin !== undefined &&
+			(runtimeName !== "PYTHON" ||
+				!(input.stdin instanceof Uint8Array) ||
+				input.stdin.byteLength > 64 * 1024 * 1024))
 	) {
 		throw new Error("CANDIDATE_INPUT_INVALID");
 	}
 	// 先复制再校验，调用方修改原缓冲区不能改变实际执行内容。
 	const artifact = Buffer.from(input.artifact);
+	const data =
+		input.stdin === undefined ? Buffer.alloc(0) : Buffer.from(input.stdin);
+	const runtime = RUNTIMES[runtimeName];
+	let stdin = artifact;
+	if (runtimeName === "PYTHON") {
+		const length = Buffer.alloc(4);
+		length.writeUInt32BE(artifact.byteLength);
+		stdin = Buffer.concat([length, artifact, data]);
+	}
 	if (digest(artifact) !== input.artifactSha256)
 		throw new Error("CANDIDATE_HASH_MISMATCH");
 	if (input.signal?.aborted) throw new Error("CANDIDATE_CANCELLED");
 	if ((await recoverCandidateSandbox()) === "ACTIVE")
 		throw new Error("CANDIDATE_SLOT_BUSY");
-	await docker(["image", "inspect", IMAGE, "--format", "{{.Id}}"]);
+	await docker(["image", "inspect", runtime.image, "--format", "{{.Id}}"]);
 	const owner = randomUUID();
 	const deadline = Date.now() + timeoutMs;
 	let containerId: string | undefined;
@@ -58,7 +94,7 @@ export async function executeCandidateSandbox(input: {
 			"--label",
 			`${DEADLINE_LABEL}=${deadline}`,
 			"--label",
-			`${POLICY_LABEL}=${POLICY}`,
+			`${POLICY_LABEL}=${runtime.policy}`,
 			"--label",
 			`choicemind.candidate.artifact=${input.artifactSha256}`,
 			"--pull",
@@ -87,9 +123,8 @@ export async function executeCandidateSandbox(input: {
 			"/work",
 			"--log-driver",
 			"none",
-			IMAGE,
-			"node",
-			"--input-type=module",
+			runtime.image,
+			...runtime.command,
 		]);
 		const id = created.stdout.toString("utf8").trim();
 		if (!/^[a-f0-9]{64}$/.test(id))
@@ -100,7 +135,7 @@ export async function executeCandidateSandbox(input: {
 		)[0];
 		const host = inspection.HostConfig;
 		if (
-			inspection.Config.Image !== IMAGE ||
+			inspection.Config.Image !== runtime.image ||
 			inspection.Config.User !== "65534:65534" ||
 			!inspection.Config.OpenStdin ||
 			host.NetworkMode !== "none" ||
@@ -127,8 +162,9 @@ export async function executeCandidateSandbox(input: {
 		const execution = await command(
 			["start", "--attach", "--interactive", id],
 			{
-				stdin: artifact,
+				stdin,
 				timeoutMs: remainingMs,
+				maxOutputBytes: runtime.outputLimit,
 				signal: AbortSignal.any([
 					supervisor.signal,
 					...(input.signal === undefined ? [] : [input.signal]),
@@ -155,14 +191,16 @@ export async function executeCandidateSandbox(input: {
 		}
 		const report = {
 			schemaVersion: "candidate-execution.v1",
-			policyVersion: POLICY,
+			policyVersion: runtime.policy,
 			artifactSha256: digest(artifact),
-			image: IMAGE,
+			image: runtime.image,
+			...(runtimeName === "PYTHON" ? { inputSha256: digest(data) } : {}),
 			outcome: execution.outcome,
 			exitCode,
 			stdoutSha256: digest(execution.stdout),
 			stderrSha256: digest(execution.stderr),
 			outputBytes: execution.bytes,
+			outputLimitBytes: runtime.outputLimit,
 			timeoutMs,
 			// 正常退出只说明进程执行完毕，绝不根据候选输出晋升。
 			reviewStatus: "NOT_RUN" as const,
@@ -221,8 +259,11 @@ export async function recoverCandidateSandbox(
 	const createdAt = Date.parse(slot.Created);
 	if (
 		slot.Name !== `/${SLOT}` ||
-		slot.Config.Image !== IMAGE ||
-		labels?.[POLICY_LABEL] !== POLICY ||
+		!Object.values(RUNTIMES).some(
+			(runtime) =>
+				slot.Config.Image === runtime.image &&
+				labels?.[POLICY_LABEL] === runtime.policy,
+		) ||
 		!/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(
 			labels?.[OWNER_LABEL] ?? "",
 		) ||
@@ -304,7 +345,12 @@ async function docker(args: string[]) {
 
 function command(
 	args: string[],
-	options: { stdin?: Buffer; timeoutMs: number; signal?: AbortSignal },
+	options: {
+		stdin?: Buffer;
+		timeoutMs: number;
+		signal?: AbortSignal;
+		maxOutputBytes?: number;
+	},
 ) {
 	return new Promise<{
 		outcome: Outcome;
@@ -321,6 +367,7 @@ function command(
 		let outcome: Outcome = "EXITED";
 		let bytes = 0;
 		const stdout: Buffer[] = [];
+		const outputLimit = options.maxOutputBytes ?? LIMIT;
 		const stderr: Buffer[] = [];
 		const stop = (reason: Outcome) => {
 			if (outcome !== "EXITED") return;
@@ -331,10 +378,10 @@ function command(
 		const timer = setTimeout(() => stop("TIMED_OUT"), options.timeoutMs);
 		options.signal?.addEventListener("abort", cancel, { once: true });
 		const collect = (target: Buffer[], chunk: Buffer) => {
-			const remaining = Math.max(0, LIMIT - bytes);
+			const remaining = Math.max(0, outputLimit - bytes);
 			bytes += chunk.length;
 			if (remaining > 0) target.push(chunk.subarray(0, remaining));
-			if (bytes > LIMIT) stop("OUTPUT_LIMIT");
+			if (bytes > outputLimit) stop("OUTPUT_LIMIT");
 		};
 		child.stdout.on("data", (chunk: Buffer) => collect(stdout, chunk));
 		child.stderr.on("data", (chunk: Buffer) => collect(stderr, chunk));
