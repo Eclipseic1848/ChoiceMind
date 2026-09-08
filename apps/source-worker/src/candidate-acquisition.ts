@@ -2,6 +2,37 @@ import { createHash } from "node:crypto";
 import { parseAdapterCandidateSource } from "@choicemind/source-research/adapter-candidate";
 
 const IDLE_TIMEOUT = Symbol("candidate-acquisition-idle");
+
+// 索引只提供公开候选，不代表依赖闭包或安全审查结论。
+export async function readPypiProjectMetadata(
+	packageName: string,
+	signal?: AbortSignal,
+) {
+	const source = parseAdapterCandidateSource({
+		kind: "PYPI",
+		packageName,
+		version: "0",
+		artifactSha256: "0".repeat(64),
+	});
+	if (source.kind !== "PYPI") throw new Error("CANDIDATE_INDEX_INPUT_INVALID");
+	const timeout = AbortSignal.timeout(30_000);
+	const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
+	try {
+		const bytes = await read(
+			await request(
+				`https://pypi.org/pypi/${encodeURIComponent(source.packageName)}/json`,
+				combined,
+			),
+			4 * 1024 * 1024,
+			combined,
+		);
+		combined.throwIfAborted();
+		return { packageName: source.packageName, bytes, sha256: hash(bytes) };
+	} catch {
+		signal?.throwIfAborted();
+		throw new Error("CANDIDATE_INDEX_UNAVAILABLE");
+	}
+}
 // 只获取精确公开制品；不调用包管理器、不解压、不留存、不执行候选。
 export async function acquireCandidateArtifact(
 	input: unknown,
