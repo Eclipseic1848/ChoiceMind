@@ -13,24 +13,32 @@ import {
 } from "@choicemind/contracts/local-services/v1";
 import type { PublicWebEvidenceV1 } from "@choicemind/contracts/decision/v1";
 
+import { isPublicNetworkAddress } from "./public-network-policy.js";
+
 export type DataSourceArtifactRef = Readonly<{
   algorithm: "sha256";
   digest: string;
   objectKey: string;
 }>;
 
-export type DataSourceCollectionResult =
+export type DataSourceCollectionSuccess = Readonly<{
+  ok: true;
+  sourceFacts: Readonly<{
+    capturedAt: string;
+    collectorVersion?: string;
+    mediaType: string;
+    sourceId: string;
+    title: string;
+    url: string;
+  }>;
+  rawArtifact: DataSourceArtifactRef;
+  metrics: Readonly<{ bytesFetched: number; durationMs: number }>;
+}>;
+
+type DataSourceCollectionFailure =
   | Readonly<{
-      ok: true;
-      sourceFacts: Readonly<{
-        capturedAt: string;
-        collectorVersion?: string;
-        mediaType: string;
-        sourceId: string;
-        title: string;
-        url: string;
-      }>;
-      rawArtifact: DataSourceArtifactRef;
+      ok: false;
+      redirect: Readonly<{ location: string }>;
       metrics: Readonly<{ bytesFetched: number; durationMs: number }>;
     }>
   | Readonly<{
@@ -38,6 +46,7 @@ export type DataSourceCollectionResult =
       error: Readonly<{
         code:
           | "SOURCE_FETCH_FAILED"
+          | "SOURCE_ACCESS_CHALLENGE"
           | "SOURCE_MIME_REJECTED"
           | "SOURCE_SIZE_EXCEEDED"
           | "SOURCE_REDIRECT_REJECTED";
@@ -46,16 +55,33 @@ export type DataSourceCollectionResult =
       metrics: Readonly<{ bytesFetched: number; durationMs: number }>;
     }>;
 
-export interface DataSourceConnector {
+export type DataSourceCollectionResult =
+  | DataSourceCollectionSuccess
+  | DataSourceCollectionFailure;
+
+export type DataSourceResponseMetadata = Readonly<{
+  status: number;
+  headers: Readonly<Record<string, string>>;
+}>;
+
+export type DataSourceCollectionResultWithResponseMetadata =
+  | (DataSourceCollectionSuccess & Readonly<{ response: DataSourceResponseMetadata }>)
+  | DataSourceCollectionFailure;
+
+export interface DataSourceConnector<
+  TResult extends DataSourceCollectionResult = DataSourceCollectionResult
+> {
   collect(input: Readonly<{
     policy: Readonly<{
       allowedMediaTypes: readonly string[];
       maxBytes: number;
     }>;
+    resolvedAddress: string;
+    signal?: AbortSignal;
     sourceId: string;
     title: string;
     url: string;
-  }>): Promise<DataSourceCollectionResult>;
+  }>): Promise<TResult>;
 }
 
 export interface RawEvidenceObjectStore {
@@ -478,13 +504,17 @@ export function createLocalEvidenceRetrievalService(options: Readonly<{
   };
 }
 
-export function createHttpDataSourceConnector(options: Readonly<{
+type HttpDataSourceConnectorOptions = Readonly<{
+  collectorVersion?: string;
   fetch(input: Readonly<{
     redirect: "manual";
+    resolvedAddress: string;
+    signal: AbortSignal;
     url: string;
   }>): Promise<
     Readonly<{
       arrayBuffer(): Promise<ArrayBuffer>;
+      body?: ReadableStream<Uint8Array> | null;
       headers: Readonly<{ get(name: string): string | null }>;
       ok: boolean;
       status: number;
@@ -494,12 +524,33 @@ export function createHttpDataSourceConnector(options: Readonly<{
   now: () => Date;
   objectStore: RawEvidenceObjectStore;
   readDurationMs: () => number;
-}>): DataSourceConnector {
+  timeoutMs?: number;
+}>;
+
+export function createHttpDataSourceConnector(
+  options: HttpDataSourceConnectorOptions & Readonly<{ includeResponseMetadata: true }>
+): DataSourceConnector<DataSourceCollectionResultWithResponseMetadata>;
+export function createHttpDataSourceConnector(
+  options: HttpDataSourceConnectorOptions & Readonly<{ includeResponseMetadata?: false }>
+): DataSourceConnector;
+export function createHttpDataSourceConnector(
+  options: HttpDataSourceConnectorOptions & Readonly<{ includeResponseMetadata?: boolean }>
+): DataSourceConnector {
   return {
     async collect(input) {
       let response: Awaited<ReturnType<typeof options.fetch>>;
+      const timeoutSignal = AbortSignal.timeout(options.timeoutMs ?? 15_000);
+      const fetchSignal =
+        input.signal === undefined
+          ? timeoutSignal
+          : AbortSignal.any([input.signal, timeoutSignal]);
       try {
-        response = await options.fetch({ redirect: "manual", url: input.url });
+        response = await options.fetch({
+          redirect: "manual",
+          resolvedAddress: input.resolvedAddress,
+          signal: fetchSignal,
+          url: input.url
+        });
       } catch {
         return {
           ok: false,
@@ -508,6 +559,15 @@ export function createHttpDataSourceConnector(options: Readonly<{
         };
       }
       if (response.status >= 300 && response.status < 400) {
+        const location = response.headers.get("location");
+        await cancelResponseBody(response);
+        if (location !== null && location.trim() !== "") {
+          return {
+            ok: false,
+            redirect: { location },
+            metrics: { bytesFetched: 0, durationMs: options.readDurationMs() }
+          };
+        }
         return {
           ok: false,
           error: { code: "SOURCE_REDIRECT_REJECTED", retryable: false },
@@ -515,12 +575,32 @@ export function createHttpDataSourceConnector(options: Readonly<{
         };
       }
       if (!response.ok) {
+        await cancelResponseBody(response);
         return {
           ok: false,
           error: {
-            code: "SOURCE_FETCH_FAILED",
-            retryable: response.status >= 500
+            code:
+              response.status === 401 || response.status === 403
+                ? "SOURCE_ACCESS_CHALLENGE"
+                : "SOURCE_FETCH_FAILED",
+            retryable:
+              response.status !== 401 &&
+              response.status !== 403 &&
+              (response.status === 408 || response.status === 429 || response.status >= 500)
           },
+          metrics: { bytesFetched: 0, durationMs: options.readDurationMs() }
+        };
+      }
+      const contentEncoding = response.headers.get("content-encoding")?.trim();
+      if (
+        contentEncoding !== undefined &&
+        contentEncoding !== "" &&
+        contentEncoding.toLowerCase() !== "identity"
+      ) {
+        await cancelResponseBody(response);
+        return {
+          ok: false,
+          error: { code: "SOURCE_FETCH_FAILED", retryable: false },
           metrics: { bytesFetched: 0, durationMs: options.readDurationMs() }
         };
       }
@@ -529,6 +609,7 @@ export function createHttpDataSourceConnector(options: Readonly<{
         mediaType === undefined ||
         !input.policy.allowedMediaTypes.includes(mediaType)
       ) {
+        await cancelResponseBody(response);
         return {
           ok: false,
           error: { code: "SOURCE_MIME_REJECTED", retryable: false },
@@ -544,6 +625,7 @@ export function createHttpDataSourceConnector(options: Readonly<{
         Number.isFinite(contentLength) &&
         contentLength > input.policy.maxBytes
       ) {
+        await cancelResponseBody(response);
         return {
           ok: false,
           error: { code: "SOURCE_SIZE_EXCEEDED", retryable: false },
@@ -551,22 +633,39 @@ export function createHttpDataSourceConnector(options: Readonly<{
         };
       }
 
-      const bytes = new Uint8Array(await response.arrayBuffer());
-      if (bytes.byteLength > input.policy.maxBytes) {
+      let body: Awaited<ReturnType<typeof readBoundedResponseBody>>;
+      try {
+        body = await readBoundedResponseBody(response, input.policy.maxBytes, fetchSignal);
+      } catch {
+        return {
+          ok: false,
+          error: { code: "SOURCE_FETCH_FAILED", retryable: true },
+          metrics: { bytesFetched: 0, durationMs: options.readDurationMs() }
+        };
+      }
+      if (body.exceeded) {
         return {
           ok: false,
           error: { code: "SOURCE_SIZE_EXCEEDED", retryable: false },
           metrics: {
-            bytesFetched: bytes.byteLength,
+            bytesFetched: body.bytesFetched,
             durationMs: options.readDurationMs()
           }
         };
       }
-      const rawArtifact = await options.objectStore.put(bytes);
+      const bytes = body.bytes;
+      fetchSignal.throwIfAborted();
+      const capturedAt = options.now();
+      const rawArtifact = await options.objectStore.put(bytes, {
+        expiresAt: new Date(capturedAt.getTime() + 7 * 24 * 60 * 60 * 1_000).toISOString()
+      });
       return {
         ok: true,
         sourceFacts: {
-          capturedAt: options.now().toISOString(),
+          capturedAt: capturedAt.toISOString(),
+          ...(options.collectorVersion === undefined
+            ? {}
+            : { collectorVersion: options.collectorVersion }),
           mediaType,
           sourceId: input.sourceId,
           title: input.title,
@@ -576,63 +675,234 @@ export function createHttpDataSourceConnector(options: Readonly<{
         metrics: {
           bytesFetched: bytes.byteLength,
           durationMs: options.readDurationMs()
-        }
+        },
+        ...(options.includeResponseMetadata === true
+          ? {
+              response: {
+                status: response.status,
+                headers: selectBrowserResponseHeaders(response.headers)
+              }
+            }
+          : {})
       };
     }
   };
 }
 
-export function createEvidenceIngestionService(options: Readonly<{
+const BROWSER_RESPONSE_HEADER_NAMES = [
+  "access-control-allow-credentials",
+  "access-control-allow-origin",
+  "access-control-expose-headers",
+  "content-encoding",
+  "content-language",
+  "content-security-policy",
+  "content-type",
+  "cross-origin-embedder-policy",
+  "cross-origin-opener-policy",
+  "cross-origin-resource-policy",
+  "location",
+  "permissions-policy",
+  "referrer-policy",
+  "x-content-type-options",
+  "x-frame-options"
+] as const;
+
+function selectBrowserResponseHeaders(
+  headers: Readonly<{ get(name: string): string | null }>
+): Readonly<Record<string, string>> {
+  const selected: Record<string, string> = {};
+  for (const name of BROWSER_RESPONSE_HEADER_NAMES) {
+    const value = headers.get(name);
+    if (value !== null) selected[name] = value;
+  }
+  return selected;
+}
+
+async function cancelResponseBody(response: Readonly<{
+  body?: ReadableStream<Uint8Array> | null;
+}>): Promise<void> {
+  await response.body?.cancel();
+}
+
+async function readBoundedResponseBody(
+  response: Readonly<{
+    arrayBuffer(): Promise<ArrayBuffer>;
+    body?: ReadableStream<Uint8Array> | null;
+  }>,
+  maxBytes: number,
+  signal?: AbortSignal
+): Promise<
+  | Readonly<{ exceeded: true; bytesFetched: number }>
+  | Readonly<{ exceeded: false; bytes: Uint8Array }>
+> {
+  if (response.body === undefined || response.body === null) {
+    const bytes = new Uint8Array(await abortable(response.arrayBuffer(), signal));
+    return bytes.byteLength > maxBytes
+      ? { exceeded: true, bytesFetched: bytes.byteLength }
+      : { exceeded: false, bytes };
+  }
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let bytesFetched = 0;
+  try {
+    while (true) {
+      signal?.throwIfAborted();
+      const next = await reader.read();
+      if (next.done) break;
+      bytesFetched += next.value.byteLength;
+      if (bytesFetched > maxBytes) {
+        await reader.cancel();
+        return { exceeded: true, bytesFetched };
+      }
+      chunks.push(next.value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(bytesFetched);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return { exceeded: false, bytes };
+}
+
+type EvidenceIngestionInput = Readonly<{
+  correlationId: string;
+  decisionTaskId: string;
+  operationId: string;
+  source: Readonly<{ sourceId: string; title: string; url: string }>;
+  signal?: AbortSignal;
+  userId: string;
+}>;
+
+type EvidenceIngestionGap = Readonly<{
+  status: "EVIDENCE_GAP";
+  gap: Readonly<{
+    code:
+      | "SOURCE_ACCESS_CHALLENGE"
+      | "SOURCE_DNS_FAILED"
+      | "SOURCE_FETCH_FAILED"
+      | "SOURCE_MIME_REJECTED"
+      | "SOURCE_NOT_APPROVED"
+      | "SOURCE_REDIRECT_REJECTED"
+      | "SOURCE_SCHEME_REJECTED"
+      | "SOURCE_SIZE_EXCEEDED"
+      | "SOURCE_SSRF_BLOCKED";
+    decisionTaskId: string;
+    gapId: string;
+    metrics?: Readonly<{ bytesFetched: number; durationMs: number }>;
+    retryable: boolean;
+    sourceId: string;
+  }>;
+}>;
+
+type EvidenceIngestionRedirect = Readonly<{
+  status: "REDIRECT";
+  location: string;
+  metrics: Readonly<{ bytesFetched: number; durationMs: number }>;
+}>;
+
+type EvidenceIngestionResult<
+  TResult extends DataSourceCollectionResult,
+  TRedirectMode extends "follow" | "manual"
+> =
+  | Readonly<{
+      status: "COLLECTED";
+      collection: Extract<TResult, Readonly<{ ok: true }>>;
+    }>
+  | EvidenceIngestionGap
+  | (TRedirectMode extends "manual" ? EvidenceIngestionRedirect : never);
+
+type EvidenceIngestionService<
+  TResult extends DataSourceCollectionResult,
+  TRedirectMode extends "follow" | "manual"
+> = Readonly<{
+  ingest(input: EvidenceIngestionInput): Promise<
+    EvidenceIngestionResult<TResult, TRedirectMode>
+  >;
+}>;
+
+type EvidenceIngestionServiceOptions<
+  TResult extends DataSourceCollectionResult = DataSourceCollectionResult
+> = Readonly<{
+  approvedSourceOrigins?: ReadonlySet<string>;
   approvedSourceUrls: ReadonlySet<string>;
   collectionPolicy: Readonly<{
     allowedMediaTypes: readonly string[];
     maxBytes: number;
   }>;
-  connector: DataSourceConnector;
+  connector: DataSourceConnector<TResult>;
   egressGuard: EgressGuard;
   nextGapId: () => string;
+  redirectMode?: "follow" | "manual";
   resolveHost(hostname: string): Promise<readonly string[]>;
-}>) {
+}>;
+
+export function createEvidenceIngestionService<
+  TResult extends DataSourceCollectionResult
+>(
+  options: EvidenceIngestionServiceOptions<TResult> & Readonly<{ redirectMode: "manual" }>
+): EvidenceIngestionService<TResult, "manual">;
+export function createEvidenceIngestionService<
+  TResult extends DataSourceCollectionResult
+>(
+  options: EvidenceIngestionServiceOptions<TResult> & Readonly<{ redirectMode?: "follow" }>
+): EvidenceIngestionService<TResult, "follow">;
+export function createEvidenceIngestionService(
+  options: EvidenceIngestionServiceOptions
+): EvidenceIngestionService<DataSourceCollectionResult, "follow" | "manual"> {
   return {
-    async ingest(input: Readonly<{
-      correlationId: string;
-      decisionTaskId: string;
-      operationId: string;
-      source: Readonly<{ sourceId: string; title: string; url: string }>;
-      userId: string;
-    }>) {
-      const sourceUrl = new URL(input.source.url);
-      const approved = options.approvedSourceUrls.has(sourceUrl.href);
-      if (!approved) {
-        return {
-          status: "EVIDENCE_GAP" as const,
-          gap: {
-            code: "SOURCE_NOT_APPROVED" as const,
-            decisionTaskId: input.decisionTaskId,
-            gapId: options.nextGapId(),
-            retryable: false,
-            sourceId: input.source.sourceId
-          }
-        };
-      }
-      if (sourceUrl.protocol !== "https:") {
-        return {
-          status: "EVIDENCE_GAP" as const,
-          gap: {
-            code: "SOURCE_SCHEME_REJECTED" as const,
-            decisionTaskId: input.decisionTaskId,
-            gapId: options.nextGapId(),
-            retryable: false,
-            sourceId: input.source.sourceId
-          }
-        };
-      }
-      if (approved) {
+    async ingest(input) {
+      let sourceUrl = new URL(input.source.url);
+      for (let hop = 0; hop <= 3; hop += 1) {
+        if (sourceUrl.username !== "" || sourceUrl.password !== "" || sourceUrl.hash !== "") {
+          return {
+            status: "EVIDENCE_GAP" as const,
+            gap: {
+              code: hop === 0 ? "SOURCE_NOT_APPROVED" as const : "SOURCE_REDIRECT_REJECTED" as const,
+              decisionTaskId: input.decisionTaskId,
+              gapId: options.nextGapId(),
+              retryable: false,
+              sourceId: input.source.sourceId
+            }
+          };
+        }
+        const approved =
+          options.approvedSourceUrls.has(sourceUrl.href) ||
+          (hop > 0 && options.approvedSourceOrigins?.has(sourceUrl.origin) === true);
+        if (!approved) {
+          return {
+            status: "EVIDENCE_GAP" as const,
+            gap: {
+              code: hop === 0 ? "SOURCE_NOT_APPROVED" as const : "SOURCE_REDIRECT_REJECTED" as const,
+              decisionTaskId: input.decisionTaskId,
+              gapId: options.nextGapId(),
+              retryable: false,
+              sourceId: input.source.sourceId
+            }
+          };
+        }
+        if (sourceUrl.protocol !== "https:") {
+          return {
+            status: "EVIDENCE_GAP" as const,
+            gap: {
+              code: "SOURCE_SCHEME_REJECTED" as const,
+              decisionTaskId: input.decisionTaskId,
+              gapId: options.nextGapId(),
+              retryable: false,
+              sourceId: input.source.sourceId
+            }
+          };
+        }
         const hostname = normalizeHostname(sourceUrl.hostname);
         let resolvedAddresses: readonly string[];
         try {
           resolvedAddresses =
-            isIP(hostname) === 0 ? await options.resolveHost(hostname) : [hostname];
+            isIP(hostname) === 0
+              ? await abortable(options.resolveHost(hostname), input.signal)
+              : [hostname];
         } catch {
           return {
             status: "EVIDENCE_GAP" as const,
@@ -645,22 +915,17 @@ export function createEvidenceIngestionService(options: Readonly<{
             }
           };
         }
+        const resolvedAddress = resolvedAddresses[0];
         if (
           isLocalHostname(hostname) ||
-          resolvedAddresses.length === 0 ||
-          resolvedAddresses.some(isPrivateAddress)
+          resolvedAddress === undefined ||
+          resolvedAddresses.some((address) => !isPublicNetworkAddress(address))
         ) {
           return ssrfEvidenceGap(options, input);
         }
-      }
-
-      if (
-        approved &&
-        sourceUrl.protocol === "https:"
-      ) {
         const guarded = await options.egressGuard.execute({
           userId: input.userId,
-          operationId: input.operationId,
+          operationId: `${input.operationId}:hop-${hop}`,
           operation: "READ_PUBLIC_SOURCE",
           correlationId: input.correlationId,
           destinationUrl: sourceUrl.href,
@@ -668,6 +933,9 @@ export function createEvidenceIngestionService(options: Readonly<{
           perform: () =>
             options.connector.collect({
               ...input.source,
+              resolvedAddress,
+              ...(input.signal === undefined ? {} : { signal: input.signal }),
+              url: sourceUrl.href,
               policy: {
                 allowedMediaTypes: [...options.collectionPolicy.allowedMediaTypes],
                 maxBytes: options.collectionPolicy.maxBytes
@@ -676,6 +944,46 @@ export function createEvidenceIngestionService(options: Readonly<{
         });
         if (guarded.status === "COMPLETED") {
           if (!guarded.value.ok) {
+            if ("redirect" in guarded.value) {
+              if (hop === 3) {
+                return collectionEvidenceGap(options, input, {
+                  code: "SOURCE_REDIRECT_REJECTED",
+                  retryable: false,
+                  metrics: guarded.value.metrics
+                });
+              }
+              try {
+                sourceUrl = new URL(guarded.value.redirect.location, sourceUrl);
+              } catch {
+                return collectionEvidenceGap(options, input, {
+                  code: "SOURCE_REDIRECT_REJECTED",
+                  retryable: false,
+                  metrics: guarded.value.metrics
+                });
+              }
+              if (options.redirectMode === "manual") {
+                const approvedRedirect =
+                  sourceUrl.username === "" &&
+                  sourceUrl.password === "" &&
+                  sourceUrl.hash === "" &&
+                  sourceUrl.protocol === "https:" &&
+                  (options.approvedSourceUrls.has(sourceUrl.href) ||
+                    options.approvedSourceOrigins?.has(sourceUrl.origin) === true);
+                if (!approvedRedirect) {
+                  return collectionEvidenceGap(options, input, {
+                    code: "SOURCE_REDIRECT_REJECTED",
+                    retryable: false,
+                    metrics: guarded.value.metrics
+                  });
+                }
+                return {
+                  status: "REDIRECT" as const,
+                  location: sourceUrl.href,
+                  metrics: guarded.value.metrics
+                };
+              }
+              continue;
+            }
             return {
               status: "EVIDENCE_GAP" as const,
               gap: {
@@ -692,7 +1000,32 @@ export function createEvidenceIngestionService(options: Readonly<{
         }
       }
 
-      throw new Error("未批准来源的失败语义尚未实现");
+      throw new Error("公开来源采集未完成");
+    }
+  };
+}
+
+function collectionEvidenceGap(
+  options: Readonly<{ nextGapId: () => string }>,
+  input: Readonly<{
+    decisionTaskId: string;
+    source: Readonly<{ sourceId: string }>;
+  }>,
+  error: Readonly<{
+    code: "SOURCE_REDIRECT_REJECTED";
+    retryable: boolean;
+    metrics: Readonly<{ bytesFetched: number; durationMs: number }>;
+  }>
+) {
+  return {
+    status: "EVIDENCE_GAP" as const,
+    gap: {
+      code: error.code,
+      decisionTaskId: input.decisionTaskId,
+      gapId: options.nextGapId(),
+      metrics: error.metrics,
+      retryable: error.retryable,
+      sourceId: input.source.sourceId
     }
   };
 }
@@ -727,25 +1060,15 @@ function isLocalHostname(hostname: string): boolean {
   return false;
 }
 
-function isPrivateAddress(address: string): boolean {
-  const normalized = normalizeHostname(address).toLowerCase();
-  if (isIP(normalized) === 4) {
-    const [first = 0, second = 0] = normalized.split(".").map(Number);
-    return (
-      first === 0 ||
-      first === 10 ||
-      first === 127 ||
-      (first === 169 && second === 254) ||
-      (first === 172 && second >= 16 && second <= 31) ||
-      (first === 192 && second === 168)
-    );
-  }
-  if (isIP(normalized) !== 6) return true;
-  if (normalized === "::" || normalized === "::1") return true;
-  if (normalized.startsWith("fc") || normalized.startsWith("fd")) return true;
-  if (/^fe[89ab]/.test(normalized)) return true;
-  if (normalized.startsWith("::ffff:")) {
-    return isPrivateAddress(normalized.slice("::ffff:".length));
-  }
-  return false;
+function abortable<T>(operation: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (signal === undefined) return operation;
+  signal.throwIfAborted();
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    operation.then(resolve, reject).finally(() => {
+      signal.removeEventListener("abort", onAbort);
+    });
+  });
 }
+

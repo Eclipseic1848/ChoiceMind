@@ -5,7 +5,7 @@ import { join } from "node:path";
 
 import { createEgressGuard } from "@choicemind/security";
 import type { PublicWebEvidenceV1 } from "@choicemind/contracts/decision/v1";
-import { describe, expect, it } from "vitest";
+import { describe, expect, expectTypeOf, it, vi } from "vitest";
 
 import {
   createEvidenceIngestionService,
@@ -13,7 +13,8 @@ import {
   createHttpDataSourceConnector,
   createLocalEvidenceRetrievalService,
   createPublicWebEvidenceGenerator,
-  type DataSourceConnector
+  type DataSourceConnector,
+  type DataSourceResponseMetadata
 } from "./index.js";
 
 describe("Evidence ingestion", () => {
@@ -457,7 +458,7 @@ describe("Evidence ingestion", () => {
     }
   });
 
-  it("rejects a redirect before inspecting MIME or reading the body", async () => {
+  it("returns a redirect target before inspecting MIME or reading the body", async () => {
     let bodyReadCount = 0;
     const connector = createHttpDataSourceConnector({
       fetch: async () => ({
@@ -481,6 +482,7 @@ describe("Evidence ingestion", () => {
 
     const result = await connector.collect({
       policy: { allowedMediaTypes: ["text/html"], maxBytes: 1_048_576 },
+      resolvedAddress: "93.184.216.34",
       sourceId: "source-redirect-rejected",
       title: "Redirect rejected fixture",
       url: "https://example.com/choicemind/p0-fixture"
@@ -488,10 +490,397 @@ describe("Evidence ingestion", () => {
 
     expect(result).toEqual({
       ok: false,
-      error: { code: "SOURCE_REDIRECT_REJECTED", retryable: false },
+      redirect: { location: "https://unapproved.example/private" },
       metrics: { bytesFetched: 0, durationMs: 5 }
     });
     expect(bodyReadCount).toBe(0);
+  });
+
+  it("follows an approved HTTPS redirect and records every hop before collection", async () => {
+    const body = new TextEncoder().encode("<main>ChoiceMind redirected fixture</main>");
+    const responses = [
+      {
+        arrayBuffer: async () => new ArrayBuffer(0),
+        headers: new Headers({ location: "https://example.com/final" }),
+        ok: false,
+        status: 302,
+        url: "https://example.com/start"
+      },
+      {
+        arrayBuffer: async () => body.buffer,
+        headers: new Headers({ "content-type": "text/html" }),
+        ok: true,
+        status: 200,
+        url: "https://example.com/final"
+      }
+    ];
+    const egressOperations: string[] = [];
+    const pinnedAddresses: string[] = [];
+    const controller = new AbortController();
+    const connector = createHttpDataSourceConnector({
+      fetch: async (request) => {
+        pinnedAddresses.push(request.resolvedAddress);
+        expect(request.signal.aborted).toBe(false);
+        const response = responses.shift();
+        if (response === undefined) throw new Error("发生了未计划的额外请求");
+        return response;
+      },
+      now: () => new Date("2026-08-26T00:00:01.000Z"),
+      objectStore: {
+        async put() {
+          return {
+            algorithm: "sha256",
+            digest: "d".repeat(64),
+            objectKey: `evidence-raw/sha256/${"d".repeat(64)}`
+          };
+        }
+      },
+      readDurationMs: () => 12
+    });
+    const service = createEvidenceIngestionService({
+      approvedSourceUrls: new Set(["https://example.com/start"]),
+      approvedSourceOrigins: new Set(["https://example.com"]),
+      collectionPolicy: { allowedMediaTypes: ["text/html"], maxBytes: 1_048_576 },
+      connector,
+      egressGuard: createEgressGuard({
+        appendRecord: async (record) => {
+          egressOperations.push(record.operationId);
+        },
+        nextId: () => `egress-${egressOperations.length + 1}`,
+        now: () => new Date("2026-08-26T00:00:00.000Z")
+      }),
+      nextGapId: () => "gap-redirect",
+      resolveHost: async () => ["93.184.216.34"]
+    });
+    type FollowResult = Awaited<ReturnType<typeof service.ingest>>;
+    expectTypeOf<Extract<FollowResult, { status: "REDIRECT" }>>().toEqualTypeOf<never>();
+
+    const result = await service.ingest({
+      correlationId: "correlation-redirect",
+      decisionTaskId: "task-redirect",
+      operationId: "collect-redirect",
+      source: {
+        sourceId: "source-redirect",
+        title: "Redirect fixture",
+        url: "https://example.com/start"
+      },
+      signal: controller.signal,
+      userId: "user-redirect"
+    });
+
+    expect(result).toMatchObject({
+      status: "COLLECTED",
+      collection: { sourceFacts: { url: "https://example.com/final" } }
+    });
+    expect(egressOperations).toEqual([
+      "collect-redirect:hop-0",
+      "collect-redirect:hop-1"
+    ]);
+    expect(pinnedAddresses).toEqual(["93.184.216.34", "93.184.216.34"]);
+  });
+
+  it("returns an approved redirect for a browser to request through the service again", async () => {
+    const collect = vi.fn(async () => ({
+      ok: false as const,
+      redirect: { location: "/final" },
+      metrics: { bytesFetched: 0, durationMs: 3 }
+    }));
+    const resolveHost = vi.fn(async () => ["93.184.216.34"]);
+    const egressOperations: string[] = [];
+    const service = createEvidenceIngestionService({
+      approvedSourceUrls: new Set(["https://example.com/start"]),
+      approvedSourceOrigins: new Set(["https://example.com"]),
+      collectionPolicy: { allowedMediaTypes: ["text/html"], maxBytes: 1_048_576 },
+      connector: { collect },
+      egressGuard: createEgressGuard({
+        appendRecord: async (record) => {
+          egressOperations.push(record.operationId);
+        },
+        nextId: () => "egress-manual-redirect",
+        now: () => new Date("2026-08-26T00:00:00.000Z")
+      }),
+      nextGapId: () => "gap-manual-redirect",
+      redirectMode: "manual",
+      resolveHost
+    });
+    type ManualResult = Awaited<ReturnType<typeof service.ingest>>;
+    type HasManualRedirect = Extract<ManualResult, { status: "REDIRECT" }> extends never
+      ? false
+      : true;
+    expectTypeOf<HasManualRedirect>().toEqualTypeOf<true>();
+
+    await expect(
+      service.ingest({
+        correlationId: "correlation-manual-redirect",
+        decisionTaskId: "task-manual-redirect",
+        operationId: "collect-manual-redirect",
+        source: {
+          sourceId: "source-manual-redirect",
+          title: "Manual redirect fixture",
+          url: "https://example.com/start"
+        },
+        userId: "user-manual-redirect"
+      })
+    ).resolves.toEqual({
+      status: "REDIRECT",
+      location: "https://example.com/final",
+      metrics: { bytesFetched: 0, durationMs: 3 }
+    });
+    expect(collect).toHaveBeenCalledOnce();
+    expect(resolveHost).toHaveBeenCalledOnce();
+    expect(egressOperations).toEqual(["collect-manual-redirect:hop-0"]);
+  });
+
+  it.each([
+    ["an unapproved origin", "https://unapproved.example/private"],
+    ["HTTP", "http://example.com/private"],
+    ["credentials", "https://user@example.com/private"]
+  ])("rejects a manual redirect containing %s", async (_name, location) => {
+    const collect = vi.fn(async () => ({
+      ok: false as const,
+      redirect: { location },
+      metrics: { bytesFetched: 0, durationMs: 3 }
+    }));
+    const service = createEvidenceIngestionService({
+      approvedSourceUrls: new Set(["https://example.com/start"]),
+      approvedSourceOrigins: new Set(["https://example.com"]),
+      collectionPolicy: { allowedMediaTypes: ["text/html"], maxBytes: 1_048_576 },
+      connector: { collect },
+      egressGuard: createEgressGuard({
+        appendRecord: async () => {},
+        nextId: () => "egress-manual-unsafe-redirect",
+        now: () => new Date("2026-08-26T00:00:00.000Z")
+      }),
+      nextGapId: () => "gap-manual-unsafe-redirect",
+      redirectMode: "manual",
+      resolveHost: async () => ["93.184.216.34"]
+    });
+
+    await expect(
+      service.ingest({
+        correlationId: "correlation-manual-unsafe-redirect",
+        decisionTaskId: "task-manual-unsafe-redirect",
+        operationId: "collect-manual-unsafe-redirect",
+        source: {
+          sourceId: "source-manual-unsafe-redirect",
+          title: "Unsafe redirect fixture",
+          url: "https://example.com/start"
+        },
+        userId: "user-manual-unsafe-redirect"
+      })
+    ).resolves.toMatchObject({
+      status: "EVIDENCE_GAP",
+      gap: { code: "SOURCE_REDIRECT_REJECTED", retryable: false }
+    });
+    expect(collect).toHaveBeenCalledOnce();
+  });
+
+  it("rejects an unapproved redirect before the second DNS, egress, or fetch", async () => {
+    let fetchCount = 0;
+    let resolveCount = 0;
+    const egressOperations: string[] = [];
+    const connector = createHttpDataSourceConnector({
+      fetch: async () => {
+        fetchCount += 1;
+        return {
+          arrayBuffer: async () => new ArrayBuffer(0),
+          headers: new Headers({ location: "https://unapproved.example/private" }),
+          ok: false,
+          status: 302,
+          url: "https://example.com/start"
+        };
+      },
+      now: () => new Date("2026-08-26T00:00:01.000Z"),
+      objectStore: {
+        async put() {
+          throw new Error("重定向响应不得写对象存储");
+        }
+      },
+      readDurationMs: () => 4
+    });
+    const service = createEvidenceIngestionService({
+      approvedSourceUrls: new Set(["https://example.com/start"]),
+      collectionPolicy: { allowedMediaTypes: ["text/html"], maxBytes: 1_048_576 },
+      connector,
+      egressGuard: createEgressGuard({
+        appendRecord: async (record) => {
+          egressOperations.push(record.operationId);
+        },
+        nextId: () => "egress-unapproved-redirect",
+        now: () => new Date("2026-08-26T00:00:00.000Z")
+      }),
+      nextGapId: () => "gap-unapproved-redirect",
+      resolveHost: async () => {
+        resolveCount += 1;
+        return ["93.184.216.34"];
+      }
+    });
+
+    await expect(
+      service.ingest({
+        correlationId: "correlation-unapproved-redirect",
+        decisionTaskId: "task-unapproved-redirect",
+        operationId: "collect-unapproved-redirect",
+        source: {
+          sourceId: "source-unapproved-redirect",
+          title: "Unapproved redirect fixture",
+          url: "https://example.com/start"
+        },
+        userId: "user-unapproved-redirect"
+      })
+    ).resolves.toMatchObject({
+      status: "EVIDENCE_GAP",
+      gap: { code: "SOURCE_REDIRECT_REJECTED", retryable: false }
+    });
+    expect(fetchCount).toBe(1);
+    expect(resolveCount).toBe(1);
+    expect(egressOperations).toEqual(["collect-unapproved-redirect:hop-0"]);
+  });
+
+  it("rejects same-origin redirects containing credentials before the second fetch", async () => {
+    let fetchCount = 0;
+    const connector = createHttpDataSourceConnector({
+      fetch: async () => {
+        fetchCount += 1;
+        return {
+          arrayBuffer: async () => new ArrayBuffer(0),
+          headers: new Headers({ location: "https://user@example.com/private" }),
+          ok: false,
+          status: 302,
+          url: "https://example.com/start"
+        };
+      },
+      now: () => new Date("2026-08-26T00:00:01.000Z"),
+      objectStore: { put: async () => { throw new Error("不得写对象存储"); } },
+      readDurationMs: () => 4
+    });
+    const service = createEvidenceIngestionService({
+      approvedSourceUrls: new Set(["https://example.com/start"]),
+      approvedSourceOrigins: new Set(["https://example.com"]),
+      collectionPolicy: { allowedMediaTypes: ["text/html"], maxBytes: 1_048_576 },
+      connector,
+      egressGuard: createEgressGuard({
+        appendRecord: async () => {},
+        nextId: () => "egress-credential-redirect",
+        now: () => new Date("2026-08-26T00:00:00.000Z")
+      }),
+      nextGapId: () => "gap-credential-redirect",
+      resolveHost: async () => ["93.184.216.34"]
+    });
+
+    await expect(
+      service.ingest({
+        correlationId: "correlation-credential-redirect",
+        decisionTaskId: "task-credential-redirect",
+        operationId: "collect-credential-redirect",
+        source: {
+          sourceId: "source-credential-redirect",
+          title: "Credential redirect fixture",
+          url: "https://example.com/start"
+        },
+        userId: "user-credential-redirect"
+      })
+    ).resolves.toMatchObject({
+      status: "EVIDENCE_GAP",
+      gap: { code: "SOURCE_REDIRECT_REJECTED", retryable: false }
+    });
+    expect(fetchCount).toBe(1);
+  });
+
+  it("rejects a fourth redirect after auditing the first four requests", async () => {
+    let fetchCount = 0;
+    const egressOperations: string[] = [];
+    const connector = createHttpDataSourceConnector({
+      fetch: async (input) => {
+        fetchCount += 1;
+        return {
+          arrayBuffer: async () => new ArrayBuffer(0),
+          headers: new Headers({ location: `/hop-${fetchCount}` }),
+          ok: false,
+          status: 302,
+          url: input.url
+        };
+      },
+      now: () => new Date("2026-08-26T00:00:01.000Z"),
+      objectStore: { put: async () => { throw new Error("重定向不得写对象存储"); } },
+      readDurationMs: () => 2
+    });
+    const service = createEvidenceIngestionService({
+      approvedSourceUrls: new Set(["https://example.com/start"]),
+      approvedSourceOrigins: new Set(["https://example.com"]),
+      collectionPolicy: { allowedMediaTypes: ["text/html"], maxBytes: 1_048_576 },
+      connector,
+      egressGuard: createEgressGuard({
+        appendRecord: async (record) => {
+          egressOperations.push(record.operationId);
+        },
+        nextId: () => `egress-max-redirect-${egressOperations.length + 1}`,
+        now: () => new Date("2026-08-26T00:00:00.000Z")
+      }),
+      nextGapId: () => "gap-max-redirect",
+      resolveHost: async () => ["93.184.216.34"]
+    });
+
+    await expect(
+      service.ingest({
+        correlationId: "correlation-max-redirect",
+        decisionTaskId: "task-max-redirect",
+        operationId: "collect-max-redirect",
+        source: {
+          sourceId: "source-max-redirect",
+          title: "Max redirect fixture",
+          url: "https://example.com/start"
+        },
+        userId: "user-max-redirect"
+      })
+    ).resolves.toMatchObject({
+      status: "EVIDENCE_GAP",
+      gap: { code: "SOURCE_REDIRECT_REJECTED", retryable: false }
+    });
+    expect(fetchCount).toBe(4);
+    expect(egressOperations).toEqual([
+      "collect-max-redirect:hop-0",
+      "collect-max-redirect:hop-1",
+      "collect-max-redirect:hop-2",
+      "collect-max-redirect:hop-3"
+    ]);
+  });
+
+  it("turns a fetch timeout into a retryable structured error", async () => {
+    let observedSignal: AbortSignal | undefined;
+    const connector = createHttpDataSourceConnector({
+      fetch: async (input) => {
+        observedSignal = input.signal;
+        return await new Promise((_, reject) => {
+          input.signal.addEventListener("abort", () => reject(input.signal.reason), {
+            once: true
+          });
+        });
+      },
+      now: () => new Date("2026-08-26T00:00:01.000Z"),
+      objectStore: {
+        async put() {
+          throw new Error("超时请求不得写对象存储");
+        }
+      },
+      readDurationMs: () => 15,
+      timeoutMs: 5
+    });
+
+    await expect(
+      connector.collect({
+        policy: { allowedMediaTypes: ["text/html"], maxBytes: 1_048_576 },
+        resolvedAddress: "93.184.216.34",
+        sourceId: "source-timeout",
+        title: "Timeout fixture",
+        url: "https://example.com/timeout"
+      })
+    ).resolves.toEqual({
+      ok: false,
+      error: { code: "SOURCE_FETCH_FAILED", retryable: true },
+      metrics: { bytesFetched: 0, durationMs: 15 }
+    });
+    expect(observedSignal?.aborted).toBe(true);
   });
 
   it("returns a retryable structured error for an HTTP 503 before reading the body", async () => {
@@ -518,6 +907,7 @@ describe("Evidence ingestion", () => {
 
     const result = await connector.collect({
       policy: { allowedMediaTypes: ["text/html"], maxBytes: 1_048_576 },
+      resolvedAddress: "93.184.216.34",
       sourceId: "source-fetch-failed",
       title: "Fetch failed fixture",
       url: "https://example.com/choicemind/p0-fixture"
@@ -529,6 +919,84 @@ describe("Evidence ingestion", () => {
       metrics: { bytesFetched: 0, durationMs: 6 }
     });
     expect(bodyReadCount).toBe(0);
+  });
+
+  it("treats HTTP 429 as retryable without reading the body", async () => {
+    let bodyReadCount = 0;
+    const connector = createHttpDataSourceConnector({
+      fetch: async () => ({
+        arrayBuffer: async () => {
+          bodyReadCount += 1;
+          return new ArrayBuffer(0);
+        },
+        headers: new Headers(),
+        ok: false,
+        status: 429,
+        url: "https://example.com/rate-limited"
+      }),
+      now: () => new Date("2026-08-26T00:00:01.000Z"),
+      objectStore: {
+        async put() {
+          throw new Error("限流响应不得写对象存储");
+        }
+      },
+      readDurationMs: () => 6
+    });
+
+    await expect(
+      connector.collect({
+        policy: { allowedMediaTypes: ["text/html"], maxBytes: 1_048_576 },
+        resolvedAddress: "93.184.216.34",
+        sourceId: "source-rate-limited",
+        title: "Rate limited fixture",
+        url: "https://example.com/rate-limited"
+      })
+    ).resolves.toEqual({
+      ok: false,
+      error: { code: "SOURCE_FETCH_FAILED", retryable: true },
+      metrics: { bytesFetched: 0, durationMs: 6 }
+    });
+    expect(bodyReadCount).toBe(0);
+  });
+
+  it("reports an HTTP access challenge as a final structured failure", async () => {
+    let cancelCount = 0;
+    const connector = createHttpDataSourceConnector({
+      fetch: async () => ({
+        arrayBuffer: async () => new ArrayBuffer(0),
+        body: new ReadableStream({
+          cancel() {
+            cancelCount += 1;
+          }
+        }),
+        headers: new Headers(),
+        ok: false,
+        status: 403,
+        url: "https://example.com/protected"
+      }),
+      now: () => new Date("2026-08-26T00:00:01.000Z"),
+      objectStore: {
+        async put() {
+          throw new Error("访问挑战响应不得写对象存储");
+        }
+      },
+      readDurationMs: () => 6
+    });
+
+    await expect(
+      connector.collect({
+        policy: { allowedMediaTypes: ["text/html"], maxBytes: 1_048_576 },
+        resolvedAddress: "93.184.216.34",
+        sourceId: "source-protected",
+        title: "Protected fixture",
+        url: "https://example.com/protected"
+      })
+    ).resolves.toEqual({
+      ok: false,
+      error: { code: "SOURCE_ACCESS_CHALLENGE", retryable: false },
+      metrics: { bytesFetched: 0, durationMs: 6 }
+    });
+    expect(cancelCount).toBe(1);
   });
 
   it("turns a network exception into a retryable structured error", async () => {
@@ -547,6 +1015,7 @@ describe("Evidence ingestion", () => {
 
     const result = await connector.collect({
       policy: { allowedMediaTypes: ["text/html"], maxBytes: 1_048_576 },
+      resolvedAddress: "93.184.216.34",
       sourceId: "source-network-failed",
       title: "Network failed fixture",
       url: "https://example.com/choicemind/p0-fixture"
@@ -557,6 +1026,50 @@ describe("Evidence ingestion", () => {
       error: { code: "SOURCE_FETCH_FAILED", retryable: true },
       metrics: { bytesFetched: 0, durationMs: 8 }
     });
+  });
+
+  it("rejects non-identity content encoding before reading or storing the body", async () => {
+    let bodyReadCount = 0;
+    let objectWriteCount = 0;
+    const connector = createHttpDataSourceConnector({
+      fetch: async () => ({
+        arrayBuffer: async () => {
+          bodyReadCount += 1;
+          return new Uint8Array([0x1f, 0x8b]).buffer;
+        },
+        headers: new Headers({
+          "content-encoding": "gzip",
+          "content-type": "text/html"
+        }),
+        ok: true,
+        status: 200,
+        url: "https://example.com/compressed"
+      }),
+      now: () => new Date("2026-08-26T00:00:01.000Z"),
+      objectStore: {
+        async put() {
+          objectWriteCount += 1;
+          throw new Error("压缩正文不得写对象存储");
+        }
+      },
+      readDurationMs: () => 7
+    });
+
+    await expect(
+      connector.collect({
+        policy: { allowedMediaTypes: ["text/html"], maxBytes: 1_048_576 },
+        resolvedAddress: "93.184.216.34",
+        sourceId: "source-compressed",
+        title: "Compressed fixture",
+        url: "https://example.com/compressed"
+      })
+    ).resolves.toEqual({
+      ok: false,
+      error: { code: "SOURCE_FETCH_FAILED", retryable: false },
+      metrics: { bytesFetched: 0, durationMs: 7 }
+    });
+    expect(bodyReadCount).toBe(0);
+    expect(objectWriteCount).toBe(0);
   });
 
   it("rejects response MIME before reading the body or writing object storage", async () => {
@@ -585,6 +1098,7 @@ describe("Evidence ingestion", () => {
 
     const result = await connector.collect({
       policy: { allowedMediaTypes: ["text/html"], maxBytes: 1_048_576 },
+      resolvedAddress: "93.184.216.34",
       sourceId: "source-mime-rejected",
       title: "MIME rejected fixture",
       url: "https://example.com/choicemind/p0-fixture"
@@ -626,6 +1140,7 @@ describe("Evidence ingestion", () => {
 
     const result = await connector.collect({
       policy: { allowedMediaTypes: ["text/html"], maxBytes: 1_048_576 },
+      resolvedAddress: "93.184.216.34",
       sourceId: "source-size-rejected",
       title: "Oversized fixture",
       url: "https://example.com/choicemind/p0-fixture"
@@ -655,7 +1170,8 @@ describe("Evidence ingestion", () => {
       }),
       now: () => new Date("2026-08-26T00:00:01.000Z"),
       objectStore: {
-        async put(bytes) {
+        async put(bytes, retention) {
+          expect(retention).toEqual({ expiresAt: "2026-09-02T00:00:01.000Z" });
           storedBytes = bytes;
           return {
             algorithm: "sha256",
@@ -669,6 +1185,7 @@ describe("Evidence ingestion", () => {
 
     const result = await connector.collect({
       policy: { allowedMediaTypes: ["text/html"], maxBytes: 1_048_576 },
+      resolvedAddress: "93.184.216.34",
       sourceId: "source-collected",
       title: "Collected fixture",
       url: "https://example.com/choicemind/p0-fixture"
@@ -694,6 +1211,88 @@ describe("Evidence ingestion", () => {
     expect(JSON.stringify(result)).not.toContain("ChoiceMind fixture");
   });
 
+  it("includes only browser-safe response metadata when explicitly requested", async () => {
+    const body = new TextEncoder().encode("console.log('ChoiceMind')");
+    const connector = createHttpDataSourceConnector({
+      fetch: async () => ({
+        arrayBuffer: async () => body.buffer,
+        headers: new Headers({
+          "access-control-allow-origin": "https://brand.example",
+          "content-security-policy": "default-src 'self'",
+          "content-type": "text/javascript; charset=utf-8",
+          "cross-origin-resource-policy": "same-origin",
+          "referrer-policy": "no-referrer",
+          "set-cookie": "session=secret",
+          "x-content-type-options": "nosniff",
+          "x-internal-secret": "hidden"
+        }),
+        ok: true,
+        status: 200,
+        url: "https://brand.example/app.js"
+      }),
+      collectorVersion: "http-connector@1",
+      includeResponseMetadata: true,
+      now: () => new Date("2026-08-26T00:00:01.000Z"),
+      objectStore: {
+        async put() {
+          return {
+            algorithm: "sha256",
+            digest: "e".repeat(64),
+            objectKey: `evidence-raw/sha256/${"e".repeat(64)}`
+          };
+        }
+      },
+      readDurationMs: () => 4
+    });
+    const metadataService = createEvidenceIngestionService({
+      approvedSourceUrls: new Set(["https://brand.example/app.js"]),
+      approvedSourceOrigins: new Set(["https://brand.example"]),
+      collectionPolicy: { allowedMediaTypes: ["text/javascript"], maxBytes: 1_048_576 },
+      connector,
+      egressGuard: createEgressGuard({
+        appendRecord: async () => {},
+        nextId: () => "egress-metadata-type",
+        now: () => new Date("2026-08-26T00:00:00.000Z")
+      }),
+      nextGapId: () => "gap-metadata-type",
+      redirectMode: "manual",
+      resolveHost: async () => ["93.184.216.34"]
+    });
+    type MetadataServiceResult = Awaited<ReturnType<typeof metadataService.ingest>>;
+    type MetadataCollection = Extract<
+      MetadataServiceResult,
+      { status: "COLLECTED" }
+    >["collection"];
+    expectTypeOf<MetadataCollection["response"]>().toEqualTypeOf<DataSourceResponseMetadata>();
+
+    const result = await connector.collect({
+      policy: { allowedMediaTypes: ["text/javascript"], maxBytes: 1_048_576 },
+      resolvedAddress: "93.184.216.34",
+      sourceId: "source-browser-script",
+      title: "Browser script fixture",
+      url: "https://brand.example/app.js"
+    });
+
+    expect(result).toMatchObject({
+      ok: true,
+      sourceFacts: { collectorVersion: "http-connector@1" },
+      response: {
+        status: 200,
+        headers: {
+          "access-control-allow-origin": "https://brand.example",
+          "content-security-policy": "default-src 'self'",
+          "content-type": "text/javascript; charset=utf-8",
+          "cross-origin-resource-policy": "same-origin",
+          "referrer-policy": "no-referrer",
+          "x-content-type-options": "nosniff"
+        }
+      }
+    });
+    expect(JSON.stringify(result)).not.toContain("set-cookie");
+    expect(JSON.stringify(result)).not.toContain("x-internal-secret");
+    if (result.ok) expect(result.response.status).toBe(200);
+  });
+
   it("rejects an oversized body before writing object storage when Content-Length is absent", async () => {
     let objectWriteCount = 0;
     const connector = createHttpDataSourceConnector({
@@ -716,6 +1315,7 @@ describe("Evidence ingestion", () => {
 
     const result = await connector.collect({
       policy: { allowedMediaTypes: ["text/html"], maxBytes: 2 },
+      resolvedAddress: "93.184.216.34",
       sourceId: "source-body-size-rejected",
       title: "Body size rejected fixture",
       url: "https://example.com/choicemind/p0-fixture"
@@ -726,6 +1326,54 @@ describe("Evidence ingestion", () => {
       error: { code: "SOURCE_SIZE_EXCEEDED", retryable: false },
       metrics: { bytesFetched: 3, durationMs: 13 }
     });
+    expect(objectWriteCount).toBe(0);
+  });
+
+  it("stops a streamed body as soon as it crosses the byte limit", async () => {
+    let objectWriteCount = 0;
+    let arrayBufferReadCount = 0;
+    const connector = createHttpDataSourceConnector({
+      fetch: async () => ({
+        arrayBuffer: async () => {
+          arrayBufferReadCount += 1;
+          throw new Error("真实 Response 流存在时不得回退到整包读取");
+        },
+        body: new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new Uint8Array([1, 2, 3]));
+            controller.enqueue(new Uint8Array([4, 5, 6]));
+            controller.close();
+          }
+        }),
+        headers: new Headers({ "content-type": "text/html" }),
+        ok: true,
+        status: 200,
+        url: "https://example.com/streamed"
+      }),
+      now: () => new Date("2026-08-26T00:00:01.000Z"),
+      objectStore: {
+        async put() {
+          objectWriteCount += 1;
+          throw new Error("流式正文超限时不得写对象存储");
+        }
+      },
+      readDurationMs: () => 9
+    });
+
+    await expect(
+      connector.collect({
+        policy: { allowedMediaTypes: ["text/html"], maxBytes: 4 },
+        resolvedAddress: "93.184.216.34",
+        sourceId: "source-streamed",
+        title: "Streamed fixture",
+        url: "https://example.com/streamed"
+      })
+    ).resolves.toEqual({
+      ok: false,
+      error: { code: "SOURCE_SIZE_EXCEEDED", retryable: false },
+      metrics: { bytesFetched: 6, durationMs: 9 }
+    });
+    expect(arrayBufferReadCount).toBe(0);
     expect(objectWriteCount).toBe(0);
   });
 
