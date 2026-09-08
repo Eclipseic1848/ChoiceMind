@@ -44,6 +44,12 @@ const EXECUTION_RUNTIMES = {
 		// 二进制 wheel 最多 64 MiB，帧头与摘要不足 1 MiB；普通日志额度不变。
 		outputLimit: 65 * 1024 * 1024,
 	},
+	PYTHON_SECRETS: {
+		...RUNTIMES.PYTHON,
+		image:
+			"sha256:866ebea5648adbc74fd4dfe345bdd057fe78329a2c986e4bbb7e28110c091768",
+		policy: "local-python-secrets-sandbox.v1",
+	},
 } as const;
 const SLOT = "choicemind-adapter-candidate-slot";
 const LIMIT = 65_536;
