@@ -103,6 +103,9 @@ importers:
       '@choicemind/task-persistence':
         specifier: workspace:*
         version: link:../../packages/task-persistence
+      playwright:
+        specifier: 1.62.1
+        version: 1.62.1
 
   apps/web:
     dependencies:
