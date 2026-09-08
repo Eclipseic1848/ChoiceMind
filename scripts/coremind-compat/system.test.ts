@@ -376,6 +376,7 @@ test.runIf(process.platform === "win32")(
     const output = await executeSystemCommand({
       command: "pnpm",
       args: ["--dir", workspace, "--version"],
+      environment: { COREPACK_ENABLE_NETWORK: "0" },
       signal: AbortSignal.timeout(15_000)
     });
 
