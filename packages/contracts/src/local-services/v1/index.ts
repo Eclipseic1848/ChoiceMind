@@ -53,6 +53,7 @@ export type DocumentParserRequestV1 = Readonly<{
 	requestId: string;
 	port: "DOCUMENT_PARSER";
 	input: Readonly<{
+		extractLinks?: boolean | undefined;
 		document: Readonly<{
 			mediaType: "application/pdf" | "image/png" | "image/jpeg" | "text/html";
 			dataBase64: string;
@@ -108,7 +109,8 @@ export type SuccessfulLocalServiceResultV1 =
 	| (LocalServiceResultHeaderV1<"DOCUMENT_PARSER"> &
 			Readonly<{
 				ok: true;
-				output: Readonly<{ parser: string; text: string; pageCount: number }>;
+				output: Readonly<{ parser: string; text: string; pageCount: number;
+					links?: readonly Readonly<{ href: string; text: string; next: boolean }>[] | undefined }>;
 			}>)
 	| (LocalServiceResultHeaderV1<"ASR"> &
 			Readonly<{
@@ -205,6 +207,7 @@ const localServiceRequestSchema = z.discriminatedUnion("port", [
 		...requestHeader,
 		port: z.literal("DOCUMENT_PARSER"),
 		input: z.strictObject({
+			extractLinks: z.boolean().optional(),
 			document: z.strictObject({
 				mediaType: z.enum([
 					"application/pdf",
@@ -283,6 +286,11 @@ const successfulResultSchema = z.discriminatedUnion("port", [
 			parser: meaningfulTextSchema,
 			text: meaningfulTextSchema,
 			pageCount: z.number().int().positive(),
+			links: z.array(z.strictObject({
+				href: meaningfulTextSchema.max(2048),
+				text: z.string().max(200),
+				next: z.boolean(),
+			})).max(200).optional(),
 		}),
 	}),
 	z.strictObject({

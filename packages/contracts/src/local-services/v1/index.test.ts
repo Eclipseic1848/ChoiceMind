@@ -6,6 +6,24 @@ import {
 } from "./index.js";
 
 describe("本地服务 v1 合同", () => {
+	it("链接发现为可选扩展，限制链接数量和字段大小", () => {
+		const request = { contractType: "local-service-request", contractVersion: "1.0",
+			requestId: "links", port: "DOCUMENT_PARSER",
+			input: { extractLinks: true, document: { mediaType: "text/html", dataBase64: "YQ==" } } };
+		expect(decodeLocalServiceRequestV1(request).ok).toBe(true);
+		const result = { contractType: "local-service-result", contractVersion: "1.0",
+			requestId: "links", port: "DOCUMENT_PARSER", ok: true,
+			output: { parser: "html", text: "产品", pageCount: 1,
+				links: [{ href: "/product", text: "产品", next: false }] } };
+		expect(decodeLocalServiceResultV1(result).ok).toBe(true);
+		for (const links of [
+			Array.from({ length: 201 }, () => result.output.links[0]),
+			[{ href: "x".repeat(2049), text: "产品", next: false }],
+			[{ href: "/product", text: "中".repeat(201), next: false }],
+		]) {
+			expect(decodeLocalServiceResultV1({ ...result, output: { ...result.output, links } }).ok).toBe(false);
+		}
+	});
 	it.each([
 		{
 			port: "MODEL_PROVIDER",

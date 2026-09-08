@@ -16,6 +16,7 @@ class DocumentInput(BaseModel):
 
 class ParserInput(BaseModel):
     document: DocumentInput
+    extract_links: bool = Field(default=False, alias="extractLinks")
 
 
 class DocumentParserRequest(BaseModel):
@@ -31,22 +32,43 @@ class TextExtractor(HTMLParser):
         super().__init__()
         self.parts: list[str] = []
         self.ignored_depth = 0
+        self.template_depth = 0
+        self.links: list[dict[str, object]] = []
+        self.current_link: dict[str, object] | None = None
 
     def handle_starttag(
         self, tag: str, attrs: list[tuple[str, str | None]]
     ) -> None:
-        del attrs
         if tag in {"script", "style"}:
             self.ignored_depth += 1
+        if tag == "template":
+            self.template_depth += 1
+        if tag == "a" and self.ignored_depth == 0 and self.template_depth == 0:
+            self.current_link = None
+            attributes = dict(attrs)
+            href = attributes.get("href") or ""
+            if href.strip() and len(href) <= 2048 and len(self.links) < 200:
+                self.current_link = {
+                    "href": href,
+                    "text": "",
+                    "next": "next" in (attributes.get("rel") or "").lower().split(),
+                }
+                self.links.append(self.current_link)
 
     def handle_endtag(self, tag: str) -> None:
         if tag in {"script", "style"} and self.ignored_depth > 0:
             self.ignored_depth -= 1
+        if tag == "template" and self.template_depth > 0:
+            self.template_depth -= 1
+        if tag == "a":
+            self.current_link = None
 
     def handle_data(self, data: str) -> None:
         text = " ".join(data.split())
         if self.ignored_depth == 0 and text:
             self.parts.append(text)
+            if self.current_link is not None and self.template_depth == 0:
+                self.current_link["text"] = f"{self.current_link['text']} {text}".strip()[:200]
 
 
 @app.get("/health/live")
@@ -78,6 +100,7 @@ def parse_document(request: DocumentParserRequest) -> dict[str, object]:
             "parser": "choicemind-html-parser-1.0",
             "text": " ".join(parser.parts),
             "pageCount": 1,
+            **({"links": parser.links} if request.input.extract_links else {}),
         },
     }
 
