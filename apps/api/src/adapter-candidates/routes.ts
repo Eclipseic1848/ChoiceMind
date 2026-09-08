@@ -90,6 +90,7 @@ export function registerAdapterCandidateRoutes(
 		url: "/api/v1/admin/adapter-candidates/:candidateId",
 		bodyLimit: 4096,
 		handler: async (request, reply) => {
+			reply.header("cache-control", "no-store");
 			const principal = await resolver?.resolve(
 				request.headers.authorization,
 				request.headers.cookie,
@@ -112,12 +113,18 @@ export function registerAdapterCandidateRoutes(
 					.code(503)
 					.send({ error: { code: "ADAPTER_CANDIDATE_UNAVAILABLE" } });
 			if (request.method === "GET") {
-				const result = await store.read(params.data.candidateId);
-				return result === undefined
-					? reply
-							.code(404)
-							.send({ error: { code: "ADAPTER_CANDIDATE_NOT_FOUND" } })
-					: reply.send(result);
+				try {
+					const result = await store.read(params.data.candidateId);
+					return result === undefined
+						? reply
+								.code(404)
+								.send({ error: { code: "ADAPTER_CANDIDATE_NOT_FOUND" } })
+						: reply.send(result);
+				} catch {
+					return reply
+						.code(503)
+						.send({ error: { code: "ADAPTER_CANDIDATE_UNAVAILABLE" } });
+				}
 			}
 			const parsed = actionSchema.safeParse(request.body);
 			if (!parsed.success)

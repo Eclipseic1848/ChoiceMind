@@ -150,3 +150,21 @@ it("报告冲突明确拒绝，内部错误不泄漏", async () => {
 	expect(failed.statusCode).toBe(503);
 	expect(failed.body).not.toContain("secret-internal");
 });
+
+it("详情存储异常脱敏且所有详情响应禁止缓存", async () => {
+	const { app, store } = setup();
+	const headers = { authorization: "Bearer admin" };
+	store.read.mockRejectedValueOnce(new Error("synthetic-private-db-path"));
+	const failed = await app.inject({ url, headers });
+	expect(failed.body).not.toContain("synthetic-private-db-path");
+	expect(failed.statusCode).toBe(503);
+	expect(failed.headers["cache-control"]).toBe("no-store");
+	for (const authorization of [
+		"Bearer admin",
+		"Bearer user",
+		"Bearer unknown",
+	]) {
+		const response = await app.inject({ url, headers: { authorization } });
+		expect(response.headers["cache-control"]).toBe("no-store");
+	}
+});
