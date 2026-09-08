@@ -4,6 +4,7 @@ import {
 	createAdapterCandidate,
 } from "@choicemind/source-research/adapter-candidate";
 import type { openPostgresCandidateStore } from "@choicemind/source-research/candidate-store";
+import { scanCandidateVulnerabilities } from "./candidate-vulnerability-scan.js";
 import {
 	CandidateWheelInstallFailure,
 	installCandidateWheels,
@@ -102,8 +103,12 @@ export async function reviewCandidateWheelDependencies(
 		receipt = error;
 	}
 	signal?.throwIfAborted();
+	const vulnerabilityScan = installed
+		? await scanCandidateVulnerabilities(locked, signal)
+		: { status: "NOT_RUN" as const, findingCount: 0 };
+	signal?.throwIfAborted();
 	const report = {
-		schemaVersion: "candidate-wheel-dependency-review.v1",
+		schemaVersion: "candidate-wheel-dependency-review.v2",
 		source,
 		artifactSha256: hash(artifact),
 		bundleSha256: hash(bundle),
@@ -111,7 +116,7 @@ export async function reviewCandidateWheelDependencies(
 		reviewedAt: new Date().toISOString(),
 		controller: "isolated-locked-wheel-install.v1",
 		lockedWheelInstallation: installed ? "PASSED" : "FAILED",
-		vulnerabilityScan: "NOT_RUN",
+		vulnerabilityScan,
 		execution: receipt.execution,
 		executionReportSha256: receipt.reportSha256,
 	};
@@ -131,7 +136,13 @@ export async function reviewCandidateWheelDependencies(
 			checks: {
 				...initial.review.checks,
 				dependencies: installed
-					? notRun
+					? vulnerabilityScan.status === "NOT_RUN"
+						? notRun
+						: {
+								status: vulnerabilityScan.status,
+								checkCount: 2,
+								findingCount: vulnerabilityScan.findingCount,
+							}
 					: { status: "FAILED", checkCount: 1, findingCount: 1 },
 			},
 		},

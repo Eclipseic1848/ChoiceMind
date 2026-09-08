@@ -6,13 +6,28 @@ import { openPostgresCandidateStore } from "@choicemind/source-research/candidat
 import { describe, expect, it, vi } from "vitest";
 import { reviewCandidateWheelDependencies } from "./candidate-wheel-review.js";
 
+// 容器/数据库使用真实实现，OSV 用固定响应；真实外部查询另设显式门禁。
+const scan = vi.hoisted(() => vi.fn());
+vi.mock("./candidate-vulnerability-scan.js", () => ({
+	scanCandidateVulnerabilities: scan,
+}));
+
 describe.runIf(
 	process.env.CHOICEMIND_RUN_CANDIDATE_SANDBOX === "1" &&
 		process.env.CHOICEMIND_TEST_DATABASE_URL !== undefined,
 )("可信依赖安装回执", () => {
-	it.each(["complete", "missing"])(
-		"%s：报告来自实际执行，残缺检查不能启用",
-		async (mode) => {
+	it.each([
+		["complete", "PASSED"],
+		["complete", "FAILED"],
+		["complete", "NOT_RUN"],
+		["missing", "NOT_RUN"],
+	])(
+		"%s / %s：报告来自实际执行，残缺检查不能启用",
+		async (mode, status) => {
+			scan.mockResolvedValue({
+				status,
+				findingCount: status === "FAILED" ? 1 : 0,
+			});
 			const databaseUrl = process.env.CHOICEMIND_TEST_DATABASE_URL ?? "";
 			let store = await openPostgresCandidateStore(databaseUrl);
 			try {
@@ -60,9 +75,11 @@ describe.runIf(
 					mode === "complete" ? "PASSED" : "FAILED",
 				);
 				expect(report.execution.exitCode).toBe(mode === "complete" ? 0 : 2);
-				expect(report.vulnerabilityScan).toBe("NOT_RUN");
+				expect(report.vulnerabilityScan.status).toBe(
+					mode === "complete" ? status : "NOT_RUN",
+				);
 				expect(stored.candidate.review.checks.dependencies.status).toBe(
-					mode === "complete" ? "NOT_RUN" : "FAILED",
+					mode === "complete" ? status : "FAILED",
 				);
 				expect(stored.candidate.review.checks.basicCollection.status).toBe(
 					"NOT_RUN",

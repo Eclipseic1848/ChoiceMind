@@ -2,6 +2,13 @@ import { createHash } from "node:crypto";
 import { expect, it, vi } from "vitest";
 import { reviewCandidateWheelDependencies } from "./candidate-wheel-review.js";
 
+vi.mock("./candidate-vulnerability-scan.js", () => ({
+	scanCandidateVulnerabilities: vi.fn(async () => ({
+		status: "PASSED",
+		findingCount: 0,
+	})),
+}));
+
 vi.mock("./candidate-wheel-install.js", async (importOriginal) => ({
 	...(await importOriginal<typeof import("./candidate-wheel-install.js")>()),
 	installCandidateWheels: vi.fn(async () => ({
