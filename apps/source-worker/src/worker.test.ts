@@ -168,6 +168,7 @@ describe("Source Worker", () => {
         resultKey: "fixture:item-1",
         evidenceId: "evidence-1",
         summary: "测试证据",
+        material: { synthetic: true, summary: "测试证据" },
         costUnits: 1
       };
     });

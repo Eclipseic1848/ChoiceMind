@@ -32,6 +32,135 @@ afterEach(async () => {
 });
 
 describe("Postgres Source Research", () => {
+  it("公开来源必须携带可验证的研究目标，并在领取后保持不变", async () => {
+    const module = await openPostgresSourceResearch({ databaseUrl });
+    openModules.push(module);
+    const command = {
+      type: "CREATE_BATCH" as const,
+      batchId: randomUUID(),
+      ownerUserId: "user-a",
+      decisionTaskId: "task-public",
+      idempotencyKey: randomUUID(),
+      query: "核验显示器的 USB-C 能力",
+      sources: [
+        {
+          sourceId: "brand-official",
+          sourceAccountId: "public",
+          accessMode: "PUBLIC" as const
+        }
+      ]
+    };
+
+    await expect(module.execute(command)).rejects.toThrow(
+      "SOURCE_RESEARCH_TARGET_REQUIRED"
+    );
+
+    const researchTarget = {
+      subject: { kind: "CANDIDATE", value: "candidate-a" },
+      claimTargets: [{ claimId: "claim-a", statement: "候选产品支持 USB-C" }]
+    };
+    await module.execute({ ...command, target: researchTarget });
+    await expect(module.claimNext("worker-public", 30_000)).resolves.toMatchObject({
+      status: "CLAIMED",
+      accessMode: "PUBLIC",
+      researchTarget
+    });
+  });
+
+  it("一个作业原子提交多条 Evidence，重复完成不重复计费", async () => {
+    const module = await openPostgresSourceResearch({ databaseUrl });
+    openModules.push(module);
+    const batch = await module.execute({
+      type: "CREATE_BATCH",
+      batchId: randomUUID(),
+      ownerUserId: "user-a",
+      decisionTaskId: "task-batch-evidence",
+      idempotencyKey: randomUUID(),
+      query: "核验两项产品规格",
+      target: {
+        subject: { kind: "CANDIDATE", value: "candidate-a" },
+        claimTargets: [
+          { claimId: "claim-a", statement: "支持 USB-C" },
+          { claimId: "claim-b", statement: "支持升降支架" }
+        ]
+      },
+      sources: [
+        {
+          sourceId: "brand-official",
+          sourceAccountId: "public",
+          accessMode: "PUBLIC"
+        }
+      ]
+    });
+    const claim = await module.claimNext("worker-public", 30_000);
+    if (claim.status !== "CLAIMED") throw new Error("公开来源作业未领取");
+    const outcome = {
+      type: "EVIDENCE_BATCH" as const,
+      items: [
+        {
+          resultKey: "brand:item-a",
+          evidenceId: "evidence-a",
+          summary: "USB-C 规格",
+          material: { excerpt: "支持 USB-C" }
+        },
+        {
+          resultKey: "brand:item-b",
+          evidenceId: "evidence-b",
+          summary: "支架规格",
+          material: { excerpt: "支持升降" }
+        }
+      ],
+      costUnits: 3,
+      checkpoint: { searched: 8, deepRead: 2, hasMore: true }
+    };
+
+    await expect(module.complete(claim, {
+      ...outcome,
+      items: outcome.items.map((item, index) => index === 1 ? { ...item, material: { invalid: 1n } } : item)
+    })).rejects.toThrow();
+    await expect(module.read({
+      type: "GET_BATCH", batchId: batch.batchId, ownerUserId: "user-a"
+    })).resolves.toMatchObject({ state: "RUNNING", costUnits: 0, results: [] });
+    const verification = new Client({ connectionString: databaseUrl });
+    await verification.connect();
+    try {
+      const jobs = await verification.query(
+        "SELECT state, cost_units, checkpoint FROM source_research_jobs WHERE batch_id = $1",
+        [batch.batchId]
+      );
+      expect(jobs.rows).toEqual([{ state: "RUNNING", cost_units: 0, checkpoint: null }]);
+    } finally {
+      await verification.end();
+    }
+
+    await expect(module.complete(claim, outcome)).resolves.toEqual({
+      status: "COMMITTED"
+    });
+    await expect(module.complete(claim, outcome)).resolves.toEqual({
+      status: "ALREADY_COMMITTED"
+    });
+    for (const conflicting of [
+      { ...outcome, items: outcome.items.slice(0, 1) },
+      { ...outcome, items: outcome.items.map((item) => ({ ...item, material: { excerpt: "改变后的正文" } })) },
+      { ...outcome, costUnits: 4 },
+      { ...outcome, checkpoint: { ...outcome.checkpoint, hasMore: false } }
+    ]) {
+      await expect(module.complete(claim, conflicting)).rejects.toThrow(
+        "SOURCE_RESEARCH_OUTCOME_CONFLICT"
+      );
+    }
+    await expect(
+      module.read({ type: "GET_BATCH", batchId: batch.batchId, ownerUserId: "user-a" })
+    ).resolves.toMatchObject({
+      state: "COMPLETED",
+      costUnits: 3,
+      results: [
+        { resultKey: "brand:item-a", evidenceId: "evidence-a" },
+        { resultKey: "brand:item-b", evidenceId: "evidence-b" }
+      ]
+    });
+  });
+
   it("恢复过期租约并且同一作业只允许一个 Worker 领取", async () => {
     let now = new Date("2026-08-27T10:00:00.000Z");
     const module = await openPostgresSourceResearch({ databaseUrl, now: () => now });
@@ -140,11 +269,20 @@ describe("Postgres Source Research", () => {
     ).resolves.toBeUndefined();
     const claim = await module.claimNext("worker-a", 30_000);
     if (claim.status !== "CLAIMED") throw new Error("测试作业未领取");
+    const material = {
+      excerpt: "测试证据原始材料",
+      locator: { section: "fixture", field: "body" },
+      rawArtifact: {
+        objectKey: "source-artifacts/sha256/fixture",
+        digest: "fixture"
+      }
+    };
     const outcome = {
       type: "EVIDENCE" as const,
       resultKey: "fixture:item-1",
       evidenceId: "evidence-1",
       summary: "测试证据",
+      material,
       costUnits: 3
     };
     await expect(module.complete(claim, outcome)).resolves.toEqual({
@@ -160,6 +298,26 @@ describe("Postgres Source Research", () => {
       state: "COMPLETED",
       costUnits: 3,
       results: [{ evidenceId: "evidence-1", resultKey: "fixture:item-1" }]
+    });
+    expect(
+      JSON.stringify(
+        await module.read({
+          type: "GET_BATCH",
+          batchId: batch.batchId,
+          ownerUserId: "user-a"
+        })
+      )
+    ).not.toContain("rawArtifact");
+    await expect(
+      module.readEvidenceCandidates({ batchId: batch.batchId, ownerUserId: "user-b" })
+    ).resolves.toBeUndefined();
+    await expect(
+      module.readEvidenceCandidates({ batchId: batch.batchId, ownerUserId: "user-a" })
+    ).resolves.toEqual({
+      batchId: batch.batchId,
+      ownerUserId: "user-a",
+      decisionTaskId: "task-a",
+      results: [{ resultKey: "fixture:item-1", material }]
     });
   });
 
@@ -220,6 +378,7 @@ describe("Postgres Source Research", () => {
       resultKey: "fixture:mixed",
       evidenceId: "evidence-mixed",
       summary: "一个结果",
+      material: { synthetic: true, summary: "一个结果" },
       costUnits: 2
     });
     const second = await module.claimNext("worker-b", 30_000);

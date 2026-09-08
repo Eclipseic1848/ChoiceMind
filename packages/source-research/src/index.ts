@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import { createHash } from "node:crypto";
 
 import { Pool, type PoolClient } from "pg";
@@ -37,7 +38,23 @@ export type SourceResearchOutcome =
       resultKey: string;
       evidenceId: string;
       summary: string;
+      material: unknown;
       costUnits: number;
+    }>
+  | Readonly<{
+      type: "EVIDENCE_BATCH";
+      items: readonly Readonly<{
+        resultKey: string;
+        evidenceId: string;
+        summary: string;
+        material: unknown;
+      }>[];
+      costUnits: number;
+      checkpoint: Readonly<{
+        searched: number;
+        deepRead: number;
+        hasMore: boolean;
+      }>;
     }>
   | Readonly<{ type: "NO_RESULT"; summary: string; costUnits: number }>
   | Readonly<{
@@ -131,6 +148,15 @@ export interface SourceResearch {
     decisionTaskId: string;
     ownerUserId: string;
   }>): Promise<SourceResearchBatch | undefined>;
+  readEvidenceCandidates(input: Readonly<{
+    batchId: string;
+    ownerUserId: string;
+  }>): Promise<Readonly<{
+    batchId: string;
+    ownerUserId: string;
+    decisionTaskId: string;
+    results: readonly Readonly<{ resultKey: string; material: unknown }>[];
+  }> | undefined>;
   claimNext(workerId: string, leaseDurationMs: number): Promise<SourceResearchClaim | Readonly<{ status: "EMPTY" }>>;
   renewLease(
     claim: SourceResearchClaim,
@@ -178,6 +204,11 @@ type ResultRow = Readonly<{
   result_key: string;
   evidence_id: string;
   summary: string;
+}>;
+
+type EvidenceCandidateRow = Readonly<{
+  result_key: string;
+  material: unknown;
 }>;
 
 export async function openPostgresSourceResearch(options: Readonly<{
@@ -352,6 +383,30 @@ export async function openPostgresSourceResearch(options: Readonly<{
         ? undefined
         : readBatch(pool, result.rows[0].batch_id, query.ownerUserId);
     },
+    async readEvidenceCandidates(input) {
+      const batch = await pool.query<{ decision_task_id: string }>(
+        `SELECT decision_task_id FROM source_research_batches
+         WHERE batch_id = $1 AND owner_user_id = $2`,
+        [input.batchId, input.ownerUserId]
+      );
+      if (batch.rows[0] === undefined) return undefined;
+      const result = await pool.query<EvidenceCandidateRow>(
+        `SELECT result_key, material
+         FROM source_research_results
+         WHERE batch_id = $1 AND owner_user_id = $2
+         ORDER BY created_at, result_key`,
+        [input.batchId, input.ownerUserId]
+      );
+      return {
+        batchId: input.batchId,
+        ownerUserId: input.ownerUserId,
+        decisionTaskId: batch.rows[0].decision_task_id,
+        results: result.rows.map((row) => ({
+          resultKey: row.result_key,
+          material: row.material
+        }))
+      };
+    },
     async claimNext(workerId, leaseDurationMs) {
       if (!Number.isSafeInteger(leaseDurationMs) || leaseDurationMs <= 0) {
         throw new Error("SOURCE_RESEARCH_LEASE_INVALID");
@@ -447,16 +502,38 @@ export async function openPostgresSourceResearch(options: Readonly<{
       return { status: result.rowCount === 1 ? "SAVED" : "LEASE_LOST" };
     },
     async complete(claim, outcome) {
+      if (outcome.type === "EVIDENCE_BATCH" && !isEvidenceBatchOutcome(outcome)) {
+        throw new Error("SOURCE_RESEARCH_OUTCOME_INVALID");
+      }
       const client = await pool.connect();
       try {
         await client.query("BEGIN");
-        if (outcome.type === "EVIDENCE") {
-          const existing = await client.query(
-            `SELECT 1 FROM source_research_results
-             WHERE job_id = $1 AND result_key = $2`,
-            [claim.jobId, outcome.resultKey]
+        const evidenceItems = outcome.type === "EVIDENCE"
+          ? [outcome]
+          : outcome.type === "EVIDENCE_BATCH"
+            ? outcome.items
+            : [];
+        if (outcome.type === "EVIDENCE" || outcome.type === "EVIDENCE_BATCH") {
+          const existing = await client.query<{
+            result_key: string; evidence_id: string; summary: string; material: unknown;
+            job_cost_units: number; checkpoint: unknown;
+          }>(
+            `SELECT results.result_key, results.evidence_id, results.summary, results.material,
+                    jobs.cost_units AS job_cost_units, jobs.checkpoint
+             FROM source_research_results AS results
+             JOIN source_research_jobs AS jobs ON jobs.job_id = results.job_id
+             WHERE results.job_id = $1`,
+            [claim.jobId]
           );
-          if (existing.rows[0] !== undefined) {
+          if (existing.rows.length > 0) {
+            const same = existing.rows.length === evidenceItems.length && evidenceItems.every((item) => {
+              const row = existing.rows.find((candidate) => candidate.result_key === item.resultKey);
+              return row !== undefined && row.evidence_id === item.evidenceId &&
+                row.summary === item.summary && row.job_cost_units === outcome.costUnits &&
+                isDeepStrictEqual(row.material, JSON.parse(JSON.stringify(item.material))) &&
+                (outcome.type !== "EVIDENCE_BATCH" || isDeepStrictEqual(row.checkpoint, outcome.checkpoint));
+            });
+            if (!same) throw new Error("SOURCE_RESEARCH_OUTCOME_CONFLICT");
             await client.query("COMMIT");
             return { status: "ALREADY_COMMITTED" } as const;
           }
@@ -473,30 +550,35 @@ export async function openPostgresSourceResearch(options: Readonly<{
           return { status: "LEASE_LOST" } as const;
         }
         const timestamp = now();
-        if (outcome.type === "EVIDENCE") {
-          await client.query(
-            `INSERT INTO source_research_results (
-               job_id, batch_id, owner_user_id, result_key, evidence_id,
-               summary, cost_units, created_at
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-            [
-              claim.jobId,
-              claim.batchId,
-              claim.ownerUserId,
-              outcome.resultKey,
-              outcome.evidenceId,
-              outcome.summary,
-              outcome.costUnits,
-              timestamp
-            ]
-          );
+        if (outcome.type === "EVIDENCE" || outcome.type === "EVIDENCE_BATCH") {
+          for (const item of evidenceItems) {
+            await client.query(
+              `INSERT INTO source_research_results (
+                 job_id, batch_id, owner_user_id, result_key, evidence_id,
+                 summary, material, cost_units, created_at
+               ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9)`,
+              [
+                claim.jobId,
+                claim.batchId,
+                claim.ownerUserId,
+                item.resultKey,
+                item.evidenceId,
+                item.summary,
+                JSON.stringify(item.material),
+                outcome.type === "EVIDENCE" ? outcome.costUnits : 0,
+                timestamp
+              ]
+            );
+          }
           await finishJob(
             client,
             claim.jobId,
             "COMPLETED",
             timestamp,
             null,
-            outcome.costUnits
+            outcome.costUnits,
+            null,
+            outcome.type === "EVIDENCE_BATCH" ? outcome.checkpoint : null
           );
         } else if (outcome.type === "NO_RESULT") {
           await finishJob(
@@ -573,12 +655,14 @@ async function finishJob(
   timestamp: Date,
   outcome: unknown,
   costUnits: number,
-  nextAttemptAt: Date | null = null
+  nextAttemptAt: Date | null = null,
+  checkpoint: unknown | null = null
 ): Promise<void> {
   await client.query(
     `UPDATE source_research_jobs
      SET state = $2, outcome = $3::jsonb, cost_units = $5, worker_id = NULL,
-         lease_expires_at = NULL, next_attempt_at = $6, updated_at = $4
+         lease_expires_at = NULL, next_attempt_at = $6,
+         checkpoint = COALESCE($7::jsonb, checkpoint), updated_at = $4
      WHERE job_id = $1`,
     [
       jobId,
@@ -586,7 +670,8 @@ async function finishJob(
       outcome === null ? null : JSON.stringify(outcome),
       timestamp,
       costUnits,
-      nextAttemptAt
+      nextAttemptAt,
+      checkpoint === null ? null : JSON.stringify(checkpoint)
     ]
   );
 }
@@ -746,10 +831,24 @@ async function migrateSourceResearch(pool: Pool): Promise<void> {
         result_key text NOT NULL,
         evidence_id text NOT NULL,
         summary text NOT NULL,
+        material jsonb NOT NULL,
         cost_units integer NOT NULL CHECK (cost_units >= 0),
         created_at timestamptz NOT NULL,
         PRIMARY KEY (job_id, result_key)
       )
+    `);
+    await client.query(`
+      ALTER TABLE source_research_results
+      ADD COLUMN IF NOT EXISTS material jsonb
+    `);
+    await client.query(`
+      UPDATE source_research_results
+      SET material = 'null'::jsonb
+      WHERE material IS NULL
+    `);
+    await client.query(`
+      ALTER TABLE source_research_results
+      ALTER COLUMN material SET NOT NULL
     `);
     await client.query(`
       CREATE TABLE IF NOT EXISTS source_research_outbox (
@@ -812,6 +911,42 @@ function isSourceResearchTarget(value: unknown): value is SourceResearchTarget {
     new Set(
       target.claimTargets.map((claim) => (claim as { claimId: string }).claimId)
     ).size === target.claimTargets.length
+  );
+}
+
+function isEvidenceBatchOutcome(
+  outcome: Extract<SourceResearchOutcome, { type: "EVIDENCE_BATCH" }>
+): boolean {
+  if (
+    !Array.isArray(outcome.items) ||
+    typeof outcome.checkpoint !== "object" ||
+    outcome.checkpoint === null
+  ) {
+    return false;
+  }
+  return (
+    outcome.items.length > 0 &&
+    outcome.items.length <= 5 &&
+    outcome.items.every(
+      (item) =>
+        isBoundedTrimmedString(item.resultKey, 500) &&
+        isBoundedTrimmedString(item.evidenceId, 500) &&
+        isBoundedTrimmedString(item.summary, 4_000) &&
+        item.material !== undefined
+    ) &&
+    new Set(outcome.items.map((item) => item.resultKey)).size === outcome.items.length &&
+    new Set(outcome.items.map((item) => item.evidenceId)).size === outcome.items.length &&
+    Number.isSafeInteger(outcome.costUnits) &&
+    outcome.costUnits >= 0 &&
+    Number.isSafeInteger(outcome.checkpoint.searched) &&
+    outcome.checkpoint.searched >= 0 &&
+    outcome.checkpoint.searched <= 20 &&
+    Number.isSafeInteger(outcome.checkpoint.deepRead) &&
+    outcome.checkpoint.deepRead > 0 &&
+    outcome.checkpoint.deepRead <= 5 &&
+    outcome.checkpoint.deepRead <= outcome.checkpoint.searched &&
+    outcome.items.length <= outcome.checkpoint.deepRead &&
+    typeof outcome.checkpoint.hasMore === "boolean"
   );
 }
 
