@@ -24,6 +24,11 @@ describe.runIf(
 		["secret", "PASSED"],
 		["binary", "PASSED"],
 		["comment", "PASSED"],
+		["invoke-success", "PASSED"],
+		["invoke-shadow", "PASSED"],
+		["invoke-noise", "PASSED"],
+		["invoke-output", "PASSED"],
+		["invoke-fake", "PASSED"],
 	])(
 		"%s / %s：报告来自实际执行，残缺检查不能启用",
 		async (mode, status) => {
@@ -92,6 +97,38 @@ describe.runIf(
 							: "PASSED",
 				);
 				expect(saveArtifact).toHaveBeenCalledTimes(1);
+				const entrypointRan =
+					status === "PASSED" &&
+					!["missing", "secret", "binary", "comment"].includes(mode);
+				const entrypointStatus = !entrypointRan
+					? "NOT_RUN"
+					: ["invoke-success", "invoke-shadow", "invoke-fake"].includes(mode)
+						? "PASSED"
+						: "FAILED";
+				expect(report.entrypoint.status).toBe(entrypointStatus);
+				expect(stored.candidate.review.checks.entrypoints.status).toBe(
+					entrypointStatus,
+				);
+				if (entrypointRan) {
+					expect(report.entrypoint.execution?.policyVersion).toBe(
+						"local-python-invoke-sandbox.v1",
+					);
+					expect(report.entrypoint.executionReportSha256).toBe(
+						hash(
+							Buffer.from(JSON.stringify(report.entrypoint.execution), "utf8"),
+						),
+					);
+				} else expect(report.entrypoint.execution).toBeUndefined();
+				// 合法 stdout 只能满足协议，不得把候选自报 PASSED 晋升成业务检查。
+				for (const key of [
+					"network",
+					"basicCollection",
+					"loginExpiry",
+					"rateLimit",
+					"emptyResult",
+					"failureHandling",
+				] as const)
+					expect(stored.candidate.review.checks[key].status).toBe("NOT_RUN");
 				for (const [bytes] of saveArtifact.mock.calls) {
 					expect(Buffer.from(bytes).toString("utf8")).not.toContain(
 						"Ab3dE5gH7jK9mN2pQ4sT6vW8xY0zB1cD3fG5",

@@ -10,6 +10,10 @@ import {
 	CandidateWheelInstallFailure,
 	installCandidateWheels,
 } from "./candidate-wheel-install.js";
+import {
+	CandidatePythonCallFailure,
+	createPythonCandidateInvoker,
+} from "./python-candidate-adapter.js";
 
 // 仅执行固定的可信 wheel 安装检查；不接受候选自报的检查状态或测试函数。
 export async function reviewCandidateWheelDependencies(
@@ -117,8 +121,44 @@ export async function reviewCandidateWheelDependencies(
 		? await scanCandidateVulnerabilities(locked, signal)
 		: { status: "NOT_RUN" as const, findingCount: 0 };
 	signal?.throwIfAborted();
+	let entrypoint: {
+		status: "PASSED" | "FAILED" | "NOT_RUN";
+		execution?: CandidatePythonCallFailure["execution"];
+		executionReportSha256?: string;
+	} = { status: "NOT_RUN" };
+	// 只有前置检查完整通过才执行候选；固定空请求只证明调用协议，不证明业务行为。
+	if (
+		installed &&
+		secretScan.status === "NO_FINDINGS" &&
+		vulnerabilityScan.status === "PASSED"
+	) {
+		try {
+			const call = await createPythonCandidateInvoker({
+				bundle,
+				bundleSha256: hash(bundle),
+				artifactSha256: source.artifactSha256,
+				locked,
+			})(
+				{ query: "", researchTarget: null, checkpoint: null },
+				signal ?? new AbortController().signal,
+			);
+			entrypoint = {
+				status: "PASSED",
+				execution: call.execution,
+				executionReportSha256: call.reportSha256,
+			};
+		} catch (error) {
+			if (!(error instanceof CandidatePythonCallFailure)) throw error;
+			entrypoint = {
+				status: "FAILED",
+				execution: error.execution,
+				executionReportSha256: error.reportSha256,
+			};
+		}
+	}
+	signal?.throwIfAborted();
 	const report = {
-		schemaVersion: "candidate-wheel-dependency-review.v3",
+		schemaVersion: "candidate-wheel-dependency-review.v4",
 		source,
 		artifactSha256: hash(artifact),
 		bundleSha256: hash(bundle),
@@ -128,6 +168,7 @@ export async function reviewCandidateWheelDependencies(
 		lockedWheelInstallation: installed ? "PASSED" : "FAILED",
 		vulnerabilityScan,
 		secretScan,
+		entrypoint,
 		execution: receipt.execution,
 		executionReportSha256: receipt.reportSha256,
 	};
@@ -144,6 +185,14 @@ export async function reviewCandidateWheelDependencies(
 			reviewedAt: report.reviewedAt,
 			checks: {
 				...initial.review.checks,
+				entrypoints:
+					entrypoint.status === "NOT_RUN"
+						? notRun
+						: {
+								status: entrypoint.status,
+								checkCount: 1,
+								findingCount: entrypoint.status === "FAILED" ? 1 : 0,
+							},
 				secrets:
 					secretScan.status === "NOT_RUN"
 						? notRun
