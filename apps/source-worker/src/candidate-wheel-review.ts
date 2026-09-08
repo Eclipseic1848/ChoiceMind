@@ -4,7 +4,11 @@ import {
 	createAdapterCandidate,
 	parseAdapterCandidateSource,
 } from "@choicemind/source-research/adapter-candidate";
-import type { openPostgresCandidateStore } from "@choicemind/source-research/candidate-store";
+import { createCandidateResearchWorker } from "@choicemind/source-research/candidate-runtime";
+import type {
+	openPostgresCandidateResearchRequests,
+	openPostgresCandidateStore,
+} from "@choicemind/source-research/candidate-store";
 import { acquireCandidateArtifact } from "./candidate-acquisition.js";
 import { scanCandidateArchiveSecrets } from "./candidate-archive-secret-scan.js";
 import { resolvePublicPypiClosure } from "./candidate-pypi-closure.js";
@@ -21,6 +25,38 @@ import {
 	CandidatePythonCallFailure,
 	createPythonCandidateInvoker,
 } from "./python-candidate-adapter.js";
+
+export function createCandidateReviewWorker(
+	requests: Awaited<
+		ReturnType<typeof openPostgresCandidateResearchRequests>
+	>["review"],
+	store: Parameters<typeof reviewCandidateWheelDependencies>[1],
+) {
+	return createCandidateResearchWorker({
+		requests: {
+			...requests,
+			claimNext: () => requests.claimNext(30_000, ["PYPI"]),
+		},
+		async execute({ scope, signal, assertActive }) {
+			const source = scope.proposal;
+			if (source?.kind !== "PYPI")
+				throw new Error("CANDIDATE_REVIEW_SOURCE_UNSUPPORTED");
+			await assertActive();
+			await reviewCandidateWheelDependencies(
+				{
+					requirement: {
+						packageName: source.packageName,
+						specifier: `==${source.version}`,
+						extras: [],
+					},
+					expectedSource: source,
+					signal,
+				},
+				store,
+			);
+		},
+	});
+}
 
 // 仅执行固定的可信 wheel 安装检查；不接受候选自报的检查状态或测试函数。
 export async function reviewCandidateWheelDependencies(
