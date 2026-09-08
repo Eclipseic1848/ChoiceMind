@@ -1,5 +1,6 @@
 import { createCredentialVault } from "@choicemind/security";
 import { openPostgresSourceAccess } from "@choicemind/source-access";
+import { openPostgresCandidateStore } from "@choicemind/source-research/candidate-store";
 import {
   openPostgresSourceResearch,
   openSourceResearchNotificationPublisher
@@ -52,6 +53,7 @@ const vault = createCredentialVault({
 });
 const sourceAccess = await openPostgresSourceAccess({ databaseUrl, vault, systemActor });
 const sourceResearch = await openPostgresSourceResearch({ databaseUrl });
+const candidateStore = await openPostgresCandidateStore(databaseUrl);
 let notificationPublisher: Awaited<ReturnType<typeof openSourceResearchNotificationPublisher>> | undefined;
 try {
   const redisUrl = process.env.CHOICEMIND_REDIS_URL;
@@ -66,6 +68,7 @@ const worker = createSourceWorker({
   systemActor,
   sourceAccess,
   sourceResearch,
+  requestCandidateResearch: (sourceId) => candidateStore.requestResearch(sourceId),
   adapters: new Map([
     [
       "fixture",
@@ -104,6 +107,7 @@ try {
   await Promise.all([
     sourceAccess.close(),
     sourceResearch.close(),
+    candidateStore.close(),
     notificationPublisher?.close(),
     persistence.close()
   ]);

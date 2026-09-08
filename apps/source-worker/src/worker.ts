@@ -88,6 +88,7 @@ export function createSourceWorker(options: Readonly<{
   sourceAccess: SourceAccessPort;
   sourceResearch: SourceResearchPort;
   adapters: ReadonlyMap<string, SourceAdapter>;
+  requestCandidateResearch?(sourceId: string): Promise<void>;
   leaseDurationMs?: number;
   heartbeatIntervalMs?: number;
 }>) {
@@ -104,6 +105,15 @@ export function createSourceWorker(options: Readonly<{
 
       const adapter = options.adapters.get(claim.sourceId);
       if (adapter === undefined) {
+        try {
+          await options.requestCandidateResearch?.(claim.sourceId);
+        } catch {
+          await options.sourceResearch.complete(claim, {
+            type: "FAILED_RETRYABLE",
+            summary: "来源工具研究请求暂时无法记录"
+          });
+          return { claimed: 1, completed: 1 };
+        }
         await options.sourceResearch.complete(claim, {
           type: "FAILED_FINAL",
           summary: `没有可用的来源 Adapter：${claim.sourceId}`

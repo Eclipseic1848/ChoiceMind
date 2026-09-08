@@ -28,7 +28,10 @@ export async function openPostgresCandidateStore(databaseUrl: string) {
 			result jsonb NOT NULL, PRIMARY KEY(candidate_id, request_id));
 		CREATE TABLE IF NOT EXISTS source_research_candidate_artifacts (
 			sha256 text PRIMARY KEY CHECK (sha256 ~ '^[a-f0-9]{64}$'),
-			artifact bytea NOT NULL CHECK (octet_length(artifact) BETWEEN 1 AND 67108864));`);
+			artifact bytea NOT NULL CHECK (octet_length(artifact) BETWEEN 1 AND 67108864));
+		CREATE TABLE IF NOT EXISTS source_research_candidate_requests (
+			source_id text PRIMARY KEY,
+			requested_at timestamptz NOT NULL DEFAULT now());`);
 	} catch (error) {
 		await pool.end();
 		throw error;
@@ -60,6 +63,18 @@ export async function openPostgresCandidateStore(databaseUrl: string) {
 	}
 
 	return {
+		// 平台能力缺口，不保存发起用户、聊天、来源账号或凭据；重复缺口只保留一项待处理请求。
+		async requestResearch(sourceId: string) {
+			if (
+				typeof sourceId !== "string" ||
+				!/^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/.test(sourceId)
+			)
+				throw new Error("ADAPTER_CANDIDATE_SOURCE_INVALID");
+			await pool.query(
+				"INSERT INTO source_research_candidate_requests(source_id) VALUES($1) ON CONFLICT(source_id) DO NOTHING",
+				[sourceId],
+			);
+		},
 		async list(input: { limit?: number; cursor?: string } = {}) {
 			const limit = input.limit ?? 20;
 			if (
