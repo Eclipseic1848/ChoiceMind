@@ -25,7 +25,10 @@ export async function openPostgresCandidateStore(databaseUrl: string) {
 			UNIQUE(candidate_id, review_binding));
 		CREATE TABLE IF NOT EXISTS source_research_candidate_actions (
 			candidate_id text NOT NULL, request_id text NOT NULL, command_sha256 text NOT NULL,
-			result jsonb NOT NULL, PRIMARY KEY(candidate_id, request_id));`);
+			result jsonb NOT NULL, PRIMARY KEY(candidate_id, request_id));
+		CREATE TABLE IF NOT EXISTS source_research_candidate_artifacts (
+			sha256 text PRIMARY KEY CHECK (sha256 ~ '^[a-f0-9]{64}$'),
+			artifact bytea NOT NULL CHECK (octet_length(artifact) BETWEEN 1 AND 67108864));`);
 	} catch (error) {
 		await pool.end();
 		throw error;
@@ -57,6 +60,56 @@ export async function openPostgresCandidateStore(databaseUrl: string) {
 	}
 
 	return {
+		// 仅存公开候选制品，不接受用户文件或秘密；存入不代表审查通过。
+		async saveArtifact(input: Uint8Array): Promise<string> {
+			if (
+				!(input instanceof Uint8Array) ||
+				input.byteLength === 0 ||
+				input.byteLength > 64 * 1024 * 1024
+			)
+				throw new Error("ADAPTER_CANDIDATE_ARTIFACT_INVALID");
+			const artifact = Buffer.from(input);
+			const sha256 = createHash("sha256").update(artifact).digest("hex");
+			const result = await pool.query<{ sha256: string }>(
+				`INSERT INTO source_research_candidate_artifacts(sha256,artifact) VALUES($1,$2)
+				ON CONFLICT(sha256) DO UPDATE SET sha256=EXCLUDED.sha256
+				WHERE source_research_candidate_artifacts.artifact=EXCLUDED.artifact RETURNING sha256`,
+				[sha256, artifact],
+			);
+			if (result.rows[0]?.sha256 !== sha256)
+				throw new Error("ADAPTER_CANDIDATE_ARTIFACT_CONFLICT");
+			return sha256;
+		},
+		async readApprovedArtifact(
+			candidateId: string,
+			reviewBinding: string,
+		): Promise<Buffer | undefined> {
+			const result = await pool.query<
+				StoredCandidate & { artifact: Buffer | null }
+			>(
+				`SELECT current.candidate,current.lifecycle,artifacts.artifact
+				FROM (SELECT candidate,lifecycle FROM source_research_candidate_reviews
+				WHERE candidate_id=$1 ORDER BY revision DESC LIMIT 1) AS current
+				LEFT JOIN source_research_candidate_artifacts AS artifacts
+				ON artifacts.sha256=current.candidate->'source'->>'artifactSha256'`,
+				[candidateId],
+			);
+			const current = result.rows[0];
+			if (current === undefined || current.artifact === null) return undefined;
+			const sha256 = createHash("sha256")
+				.update(current.artifact)
+				.digest("hex");
+			if (
+				readApprovedAdapterCandidate(
+					current.candidate,
+					current.lifecycle,
+					reviewBinding,
+					sha256,
+				) === undefined
+			)
+				return undefined;
+			return current.artifact;
+		},
 		async record(input: unknown): Promise<StoredCandidate> {
 			const candidate = createAdapterCandidate(input);
 			const lifecycle = createAdapterCandidateLifecycle(candidate);

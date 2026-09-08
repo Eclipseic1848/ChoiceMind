@@ -1,5 +1,24 @@
 import { expect, it, vi } from "vitest";
-import { loadApprovedCandidateAdapter } from "./approved-candidate-adapter.js";
+import {
+	loadApprovedCandidateAdapter,
+	loadPersistedCandidateAdapter,
+} from "./approved-candidate-adapter.js";
+
+it("持久制品缺失时不能调用工厂", async () => {
+	const load = vi.fn();
+	await expect(
+		loadPersistedCandidateAdapter({
+			candidateId: "candidate",
+			reviewBindingSha256: "binding",
+			approvals: {
+				readApproved: vi.fn(),
+				readApprovedArtifact: vi.fn(async () => undefined),
+			},
+			load,
+		}),
+	).rejects.toThrow("ADAPTER_CANDIDATE_NOT_APPROVED");
+	expect(load).not.toHaveBeenCalled();
+});
 
 it("工厂等待期间被撤销不能返回可用 Driver", async () => {
 	const readApproved = vi

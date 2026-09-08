@@ -2,6 +2,30 @@ import { createHash } from "node:crypto";
 import type { openPostgresCandidateStore } from "@choicemind/source-research/candidate-store";
 import type { SourceAdapter } from "./worker.js";
 
+export async function loadPersistedCandidateAdapter(input: {
+	candidateId: string;
+	reviewBindingSha256: string;
+	approvals: Pick<
+		Awaited<ReturnType<typeof openPostgresCandidateStore>>,
+		"readApproved" | "readApprovedArtifact"
+	>;
+	load: (artifact: Uint8Array) => Promise<SourceAdapter>;
+}): Promise<SourceAdapter> {
+	const { candidateId, reviewBindingSha256, approvals, load } = input;
+	const artifact = await approvals.readApprovedArtifact(
+		candidateId,
+		reviewBindingSha256,
+	);
+	if (artifact === undefined) throw new Error("ADAPTER_CANDIDATE_NOT_APPROVED");
+	return loadApprovedCandidateAdapter({
+		candidateId,
+		reviewBindingSha256,
+		approvals,
+		load,
+		artifact,
+	});
+}
+
 // 工厂由受信任注册器提供，必须只加载传入制品；这里不接受路径或任意模块名。
 export async function loadApprovedCandidateAdapter(input: {
 	candidateId: string;

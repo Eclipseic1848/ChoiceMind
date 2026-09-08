@@ -1,10 +1,52 @@
 import { randomUUID } from "node:crypto";
+import { Client } from "pg";
 import { describe, expect, it } from "vitest";
 import { openPostgresCandidateStore } from "../../src/candidate-store.js";
 
 describe.runIf(process.env.CHOICEMIND_TEST_DATABASE_URL !== undefined)(
 	"候选报告与审批持久化",
 	() => {
+		it("批准不替代制品存在与完整性检查，损坏制品不能被静默覆盖", async () => {
+			const databaseUrl = process.env.CHOICEMIND_TEST_DATABASE_URL ?? "";
+			const store = await openPostgresCandidateStore(databaseUrl);
+			const client = new Client({ connectionString: databaseUrl });
+			try {
+				await client.connect();
+				const artifact = Buffer.from(`synthetic-${randomUUID()}`);
+				const sha256 = await store.saveArtifact(artifact);
+				const input = candidateInput();
+				input.source.artifactSha256 = sha256;
+				const stored = await store.record(input);
+				const id = stored.candidate.candidateId;
+				const binding = stored.lifecycle.reviewBindingSha256;
+				await store.transition(id, binding, randomUUID(), {
+					type: "ENABLE",
+					actorId: "admin-test",
+					actorRole: "ADMIN",
+					occurredAt: "2026-09-08T12:01:00.000Z",
+				});
+				expect(await store.readApprovedArtifact(id, binding)).toEqual(artifact);
+				expect(
+					await store.readApprovedArtifact(id, "0".repeat(64)),
+				).toBeUndefined();
+				await client.query(
+					"UPDATE source_research_candidate_artifacts SET artifact=$2 WHERE sha256=$1",
+					[sha256, Buffer.from("damaged")],
+				);
+				expect(await store.readApprovedArtifact(id, binding)).toBeUndefined();
+				await expect(store.saveArtifact(artifact)).rejects.toThrow(
+					"ADAPTER_CANDIDATE_ARTIFACT_CONFLICT",
+				);
+				await client.query(
+					"DELETE FROM source_research_candidate_artifacts WHERE sha256=$1",
+					[sha256],
+				);
+				expect(await store.readApprovedArtifact(id, binding)).toBeUndefined();
+			} finally {
+				await client.end();
+				await store.close();
+			}
+		});
 		it("并发审批幂等、重启保留；新报告使旧审批失效且旧报告不能倒灌", async () => {
 			const url = process.env.CHOICEMIND_TEST_DATABASE_URL ?? "";
 			let store = await openPostgresCandidateStore(url);
