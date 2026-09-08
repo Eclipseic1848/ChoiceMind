@@ -115,7 +115,7 @@ it("真实登录 Cookie 授权候选审批，普通用户拒绝，注销后权�
 			{ scope: "ALL" },
 			adminCookie,
 		);
-			expect(logout.status).toBe(204);
+		expect(logout.status).toBe(204);
 		const revoked = await request(path, "POST", action, adminCookie);
 		expect(revoked.status).toBe(401);
 		await revoked.json();
