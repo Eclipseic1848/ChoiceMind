@@ -183,6 +183,17 @@ describe("executeLocalServiceRequest", () => {
 		expect(result).toMatchObject({ ok: false, error: { code: "TIMEOUT" } });
 	});
 
+	it.each(["AbortError", "TimeoutError"])("正文读取期间的 %s 保持超时映射", async (name) => {
+		const response = Response.json({});
+		vi.spyOn(response, "json").mockRejectedValue(new DOMException("请求已中止", name));
+		const result = await executeLocalServiceRequest(
+			target("choicemind-html-parser"),
+			documentRequest("text/html", "PG1haW4+Q2hvaWNlTWluZDwvbWFpbj4="),
+			{ fetch: async () => response },
+		);
+		expect(result).toMatchObject({ ok: false, error: { code: "TIMEOUT" } });
+	});
+
 	it("把不符合协议的响应映射为 INVALID_RESPONSE", async () => {
 		const result = await executeLocalServiceRequest(
 			target("qwen-model"),

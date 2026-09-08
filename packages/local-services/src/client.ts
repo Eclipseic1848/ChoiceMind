@@ -68,7 +68,10 @@ export async function executeLocalServiceRequest(
 	let payload: unknown;
 	try {
 		payload = await response.json();
-	} catch {
+	} catch (error) {
+		if (isTimeoutError(error)) {
+			return failure(target, request.requestId, "TIMEOUT", "本地服务调用超时");
+		}
 		return failure(
 			target,
 			request.requestId,
