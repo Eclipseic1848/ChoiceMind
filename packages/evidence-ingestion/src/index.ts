@@ -747,7 +747,7 @@ async function readBoundedResponseBody(
   try {
     while (true) {
       signal?.throwIfAborted();
-      const next = await reader.read();
+      const next = await abortable(reader.read(), signal);
       if (next.done) break;
       bytesFetched += next.value.byteLength;
       if (bytesFetched > maxBytes) {
@@ -756,6 +756,9 @@ async function readBoundedResponseBody(
       }
       chunks.push(next.value);
     }
+  } catch (error) {
+    await reader.cancel();
+    throw error;
   } finally {
     reader.releaseLock();
   }

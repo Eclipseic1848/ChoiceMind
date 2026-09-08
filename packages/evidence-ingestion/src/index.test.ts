@@ -1377,6 +1377,49 @@ describe("Evidence ingestion", () => {
     expect(objectWriteCount).toBe(0);
   });
 
+  it("取消停滞的正文读取会释放流且不落盘", async () => {
+    const abort = new AbortController();
+    let enteredRead!: () => void;
+    const reading = new Promise<void>((resolve) => { enteredRead = resolve; });
+    let streamController!: ReadableStreamDefaultController<Uint8Array>;
+    const cancel = vi.fn();
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) { streamController = controller; },
+      pull() { enteredRead(); },
+      cancel
+    }, { highWaterMark: 0 });
+    const put = vi.fn();
+    const connector = createHttpDataSourceConnector({
+      fetch: async () => ({ body, arrayBuffer: async () => new ArrayBuffer(0),
+        headers: new Headers({ "content-type": "text/html" }), ok: true, status: 200,
+        url: "https://example.com/stalled" }),
+      now: () => new Date("2026-08-26T00:00:01.000Z"),
+      objectStore: { put }, readDurationMs: () => 1
+    });
+    const result = connector.collect({ signal: abort.signal,
+      policy: { allowedMediaTypes: ["text/html"], maxBytes: 100 },
+      resolvedAddress: "93.184.216.34", sourceId: "stalled", title: "合成停滞响应",
+      url: "https://example.com/stalled" });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await reading;
+      abort.abort();
+      const deadline = new Promise<"STALLED">((resolve) => {
+        timer = setTimeout(() => resolve("STALLED"), 200);
+      });
+      await expect(Promise.race([result, deadline])).resolves.toMatchObject({
+        ok: false, error: { code: "SOURCE_FETCH_FAILED", retryable: true }
+      });
+      expect(cancel).toHaveBeenCalledOnce();
+      expect(put).not.toHaveBeenCalled();
+      expect(body.locked).toBe(false);
+    } finally {
+      clearTimeout(timer);
+      if (cancel.mock.calls.length === 0) streamController.close();
+      await result.catch(() => undefined);
+    }
+  });
+
   it("records approved HTTPS egress before returning connector facts and artifact reference", async () => {
     const sequence: string[] = [];
     const connector: DataSourceConnector = {
