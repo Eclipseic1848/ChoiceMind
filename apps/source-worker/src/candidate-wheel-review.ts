@@ -4,8 +4,14 @@ import {
 	createAdapterCandidate,
 } from "@choicemind/source-research/adapter-candidate";
 import type { openPostgresCandidateStore } from "@choicemind/source-research/candidate-store";
+import { acquireCandidateArtifact } from "./candidate-acquisition.js";
 import { scanCandidateArchiveSecrets } from "./candidate-archive-secret-scan.js";
+import { resolvePublicPypiClosure } from "./candidate-pypi-closure.js";
 import { scanCandidateVulnerabilities } from "./candidate-vulnerability-scan.js";
+import {
+	parseWheelRequirement,
+	type WheelRequirement,
+} from "./candidate-wheel-dependencies.js";
 import {
 	CandidateWheelInstallFailure,
 	installCandidateWheels,
@@ -17,18 +23,25 @@ import {
 
 // 仅执行固定的可信 wheel 安装检查；不接受候选自报的检查状态或测试函数。
 export async function reviewCandidateWheelDependencies(
-	input: {
-		source: AdapterCandidateSource;
-		artifact: Uint8Array;
-		bundle: Uint8Array;
-		locked: Parameters<typeof installCandidateWheels>[0]["locked"];
-		signal?: AbortSignal;
-	},
+	request:
+		| {
+				source: AdapterCandidateSource;
+				artifact: Uint8Array;
+				bundle: Uint8Array;
+				locked: Parameters<typeof installCandidateWheels>[0]["locked"];
+				signal?: AbortSignal;
+		  }
+		| { requirement: WheelRequirement; signal?: AbortSignal },
 	store: Pick<
 		Awaited<ReturnType<typeof openPostgresCandidateStore>>,
 		"saveArtifact" | "record"
 	>,
 ) {
+	const prepared =
+		"requirement" in request
+			? await preparePypiReview(request)
+			: { input: request, provenance: undefined };
+	const { input, provenance } = prepared;
 	const signal = input.signal;
 	const notRun = { status: "NOT_RUN", checkCount: 0, findingCount: 0 } as const;
 	const initial = createAdapterCandidate({
@@ -158,7 +171,10 @@ export async function reviewCandidateWheelDependencies(
 	}
 	signal?.throwIfAborted();
 	const report = {
-		schemaVersion: "candidate-wheel-dependency-review.v4",
+		schemaVersion: provenance
+			? "candidate-wheel-dependency-review.v5"
+			: "candidate-wheel-dependency-review.v4",
+		...(provenance ? { provenance } : {}),
 		source,
 		artifactSha256: hash(artifact),
 		bundleSha256: hash(bundle),
@@ -217,6 +233,58 @@ export async function reviewCandidateWheelDependencies(
 		},
 	});
 	return { stored, report };
+}
+
+// 证据只来自本次实际解析；不接受调用者提交的来源回执或 PASSED 状态。
+async function preparePypiReview(request: {
+	requirement: WheelRequirement;
+	signal?: AbortSignal;
+}) {
+	const requirement = parseWheelRequirement(request.requirement);
+	const timeout = AbortSignal.timeout(600_000);
+	const signal = request.signal
+		? AbortSignal.any([request.signal, timeout])
+		: timeout;
+	const resolution = await resolvePublicPypiClosure([requirement], signal);
+	const target = resolution.locked.find(
+		(item) => item.name === requirement.packageName,
+	);
+	if (!target) throw new Error("CANDIDATE_WHEEL_REVIEW_TARGET_NOT_LOCKED");
+	// 重新获取所选根制品并核验固定摘要，避免在宿主解包候选 catalogue。
+	const acquired = await acquireCandidateArtifact(
+		{
+			kind: "PYPI",
+			packageName: target.name,
+			version: target.version,
+			artifactSha256: target.sha256,
+		},
+		signal,
+	);
+	if (acquired.receipt.filename !== target.filename)
+		throw new Error("CANDIDATE_WHEEL_FILENAME_MISMATCH");
+	return {
+		input: {
+			source: acquired.receipt.source,
+			artifact: acquired.artifact,
+			bundle: resolution.bundle,
+			locked: resolution.locked,
+			signal,
+		},
+		provenance: {
+			requirement,
+			locked: resolution.locked,
+			indexes: resolution.indexes,
+			missingProjects: resolution.missingProjects,
+			acquisitions: resolution.acquisitions,
+			targetAcquisition: acquired.receipt,
+			dependencyReports: resolution.dependencyReports,
+			catalogueSha256: resolution.catalogueSha256,
+			catalogueReportSha256: resolution.catalogueReportSha256,
+			requirementsSha256: resolution.requirementsSha256,
+			execution: resolution.execution,
+			reportSha256: resolution.reportSha256,
+		},
+	};
 }
 
 function hash(bytes: Uint8Array) {
