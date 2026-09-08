@@ -55,7 +55,7 @@ jobs:
         run: pnpm verify
       - name: Diagnose Windows process query latency
         if: failure()
-        timeout-minutes: 1
+        timeout-minutes: 2
         shell: pwsh
         run: |
           @'
@@ -73,6 +73,16 @@ jobs:
               } catch (error) {
                 console.log(JSON.stringify({ environment, phase, ms: Date.now() - start, outcome: 'failed', code: error.code, signal: error.signal }));
               }
+            }
+          }
+          for (const key of ['windir','SystemDrive','ProgramData','ProgramFiles','ProgramFiles(x86)','CommonProgramFiles','PSModulePath','COMPUTERNAME','USERNAME','USERDOMAIN','USERDNSDOMAIN','OS']) {
+            if (process.env[key] === undefined) continue;
+            const start = Date.now();
+            try {
+              execFileSync('powershell.exe', ['-NoLogo','-NoProfile','-NonInteractive','-Command','Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId | Measure-Object | Select-Object -ExpandProperty Count'], { env: { ...minimal, [key]: process.env[key] }, timeout: 5000, windowsHide: true, stdio: 'pipe' });
+              console.log(JSON.stringify({ addedKey: key, ms: Date.now() - start, outcome: 'success' }));
+            } catch (error) {
+              console.log(JSON.stringify({ addedKey: key, ms: Date.now() - start, outcome: 'failed', code: error.code, signal: error.signal }));
             }
           }
           '@ | node
