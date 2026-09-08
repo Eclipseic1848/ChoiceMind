@@ -166,7 +166,7 @@ export async function executeCandidateSandbox(input: {
 				if (slot?.Config.Labels?.[OWNER_LABEL] === owner) containerId = slot.Id;
 			}
 			if (containerId !== undefined) {
-				await docker(["rm", "--force", containerId]);
+				await removeContainer(containerId);
 			}
 		} catch {
 			// biome-ignore lint/correctness/noUnsafeFinally: 回收未确认必须覆盖成功结果，不能把残留容器报告为成功。
@@ -214,7 +214,7 @@ export async function recoverCandidateSandbox(): Promise<
 	)
 		throw new Error("CANDIDATE_SLOT_OWNERSHIP_UNCONFIRMED");
 	if (Date.now() < deadline) return "ACTIVE";
-	await docker(["rm", "--force", slot.Id]);
+	await removeContainer(slot.Id);
 	return "RECOVERED";
 }
 
@@ -232,11 +232,41 @@ async function inspectSlot() {
 	if (id === "") return undefined;
 	if (!/^[a-f0-9]{64}$/.test(id))
 		throw new Error("CANDIDATE_SLOT_OWNERSHIP_UNCONFIRMED");
-	const slot = JSON.parse(
-		(await docker(["inspect", id])).stdout.toString("utf8"),
-	)[0];
+	let inspection: Awaited<ReturnType<typeof docker>>;
+	try {
+		inspection = await docker(["inspect", id]);
+	} catch (error) {
+		if (await containerExists(id)) throw error;
+		return undefined;
+	}
+	const slot = JSON.parse(inspection.stdout.toString("utf8"))[0];
 	if (slot?.Id !== id) throw new Error("CANDIDATE_SLOT_OWNERSHIP_UNCONFIRMED");
 	return slot;
+}
+
+async function containerExists(id: string) {
+	const result = await docker([
+		"ps",
+		"--all",
+		"--no-trunc",
+		"--filter",
+		`id=${id}`,
+		"--format",
+		"{{.ID}}",
+	]);
+	const found = result.stdout.toString("utf8").trim();
+	if (found !== "" && found !== id)
+		throw new Error("CANDIDATE_SLOT_OWNERSHIP_UNCONFIRMED");
+	return found === id;
+}
+
+async function removeContainer(id: string) {
+	try {
+		await docker(["rm", "--force", id]);
+	} catch (error) {
+		// 监督者与执行者可并发回收；只认原 ID 已消失，不按槽位名称重删。
+		if (await containerExists(id)) throw error;
+	}
 }
 
 function digest(bytes: Uint8Array): string {

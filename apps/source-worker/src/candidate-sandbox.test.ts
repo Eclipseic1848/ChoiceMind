@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { readFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 
@@ -86,7 +87,14 @@ describe.runIf(process.env.CHOICEMIND_RUN_CANDIDATE_SANDBOX === "1")(
 				const id = created.stdout.trim();
 				if (!/^[a-f0-9]{64}$/.test(id)) throw new Error("测试容器创建未确认");
 				ownedId = id;
-				expect(await recoverCandidateSandbox()).toBe("RECOVERED");
+				const results = await Promise.all([
+					recoverCandidateSandbox(),
+					recoverCandidateSandbox(),
+				]);
+				expect(results).toContain("RECOVERED");
+				expect(
+					results.every((state) => state === "RECOVERED" || state === "EMPTY"),
+				).toBe(true);
 				ownedId = undefined;
 				expect(await recoverCandidateSandbox()).toBe("EMPTY");
 			} finally {
@@ -94,7 +102,7 @@ describe.runIf(process.env.CHOICEMIND_RUN_CANDIDATE_SANDBOX === "1")(
 			}
 		}, 30_000);
 
-		it("控制器被强制终止后不抢占有效租约，过期回收再运行", async () => {
+		it("控制器被强制终止后独立监督进程按时回收，有效租约不抢占", async () => {
 			expect(await recoverCandidateSandbox()).toBe("EMPTY");
 			const source = `// ${randomUUID()}\nsetInterval(()=>{},1000)`;
 			const candidate = input(source);
@@ -111,6 +119,18 @@ describe.runIf(process.env.CHOICEMIND_RUN_CANDIDATE_SANDBOX === "1")(
 				{ windowsHide: true, stdio: "ignore" },
 			);
 			const exited = once(child, "exit");
+			const supervisor = spawn(
+				process.execPath,
+				[
+					"--import",
+					"tsx",
+					fileURLToPath(
+						new URL("./candidate-sandbox-supervisor.ts", import.meta.url),
+					),
+				],
+				{ windowsHide: true, stdio: "ignore" },
+			);
+			const supervisorExited = once(supervisor, "exit");
 			const runDocker = (args: string[]) =>
 				promisify(execFile)("docker", ["--context", "desktop-linux", ...args], {
 					windowsHide: true,
@@ -155,16 +175,35 @@ describe.runIf(process.env.CHOICEMIND_RUN_CANDIDATE_SANDBOX === "1")(
 				);
 				let recovered = false;
 				while (Date.now() < waitUntil && !recovered) {
-					recovered = (await recoverCandidateSandbox()) === "RECOVERED";
+					// 这里只观察 Docker，不由测试或已死亡的控制器执行回收。
+					recovered =
+						(
+							await runDocker([
+								"ps",
+								"-a",
+								"--no-trunc",
+								"--filter",
+								`id=${ownedId}`,
+								"--format",
+								"{{.ID}}",
+							])
+						).stdout.trim() === "";
 					if (!recovered) await delay(200);
 				}
 				expect(recovered).toBe(true);
+				expect(supervisor.exitCode).toBeNull();
 				ownedId = undefined;
 				expect(await recoverCandidateSandbox()).toBe("EMPTY");
 				expect(
 					(await executeCandidateSandbox(input("1"))).report.exitCode,
 				).toBe(0);
+				await delay(1100);
+				expect(supervisor.exitCode).toBeNull();
+				supervisor.kill("SIGKILL");
+				await supervisorExited;
 			} finally {
+				if (supervisor.exitCode === null && supervisor.signalCode === null)
+					supervisor.kill("SIGKILL");
 				if (child.exitCode === null && child.signalCode === null)
 					child.kill("SIGKILL");
 				// 仅清理带本次随机合成制品摘要且已核验的容器 ID。
