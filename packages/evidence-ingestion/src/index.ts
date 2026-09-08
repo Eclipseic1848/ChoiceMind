@@ -1012,6 +1012,7 @@ export function createPublicWebEvidenceGenerator(options: Readonly<{
     async generate(input: Readonly<{
       collection: Extract<DataSourceCollectionResult, Readonly<{ ok: true }>>;
       decisionTaskId: string;
+      extractLinks?: boolean;
       signal?: AbortSignal;
       validUntil: string;
     }>) {
@@ -1029,6 +1030,7 @@ export function createPublicWebEvidenceGenerator(options: Readonly<{
         requestId: options.nextParserRequestId(),
         port: "DOCUMENT_PARSER",
         input: {
+          ...(input.extractLinks === true ? { extractLinks: true } : {}),
           document: {
             mediaType: "text/html",
             dataBase64: Buffer.from(rawBytes).toString("base64")
@@ -1040,12 +1042,16 @@ export function createPublicWebEvidenceGenerator(options: Readonly<{
         const retryable = parsed.ok && !parsed.value.ok ? parsed.value.error.retryable : false;
         return parserEvidenceGap(options, input.decisionTaskId, retryable);
       }
+      if (input.extractLinks === true && parsed.value.output.links === undefined) {
+        return parserEvidenceGap(options, input.decisionTaskId, false, "SOURCE_LINK_DISCOVERY_UNSUPPORTED");
+      }
 
       const excerpt = parsed.value.output.text;
       const excerptDigest = createHash("sha256").update(excerpt, "utf8").digest("hex");
       return {
         status: "EVIDENCE_CREATED" as const,
         documentSignals,
+        ...(input.extractLinks === true ? { links: parsed.value.output.links } : {}),
         evidence: {
           contractType: "evidence" as const,
           contractVersion: "1.0" as const,
@@ -1090,12 +1096,13 @@ function inspectHtmlDocumentSignals(bytes: Uint8Array) {
 function parserEvidenceGap(
   options: Readonly<{ nextGapId: () => string }>,
   decisionTaskId: string,
-  retryable: boolean
+  retryable: boolean,
+  code: "SOURCE_PARSE_FAILED" | "SOURCE_LINK_DISCOVERY_UNSUPPORTED" = "SOURCE_PARSE_FAILED"
 ) {
   return {
     status: "EVIDENCE_GAP" as const,
     gap: {
-      code: "SOURCE_PARSE_FAILED" as const,
+      code,
       decisionTaskId,
       gapId: options.nextGapId(),
       retryable
