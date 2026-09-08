@@ -15,6 +15,7 @@ type SourceAdapterOutcome =
   | Readonly<{ type: "AUTH_REQUIRED"; challenge: "QR_CODE" | "SMS" | "CAPTCHA" }>;
 
 export type SourceAdapter = Readonly<{
+  authorize?(): Promise<void>;
   officialLoginUrl: string;
   run(input: Readonly<{
     claim: SourceResearchClaim;
@@ -98,6 +99,15 @@ export function createSourceWorker(options: Readonly<{
         return { claimed: 1, completed: 1 };
       }
 
+      try {
+        await adapter.authorize?.();
+      } catch {
+        await options.sourceResearch.complete(claim, {
+          type: "FAILED_RETRYABLE",
+          summary: "候选来源未获当前批准或审批状态暂不可用"
+        });
+        return { claimed: 1, completed: 1 };
+      }
       const status = await options.sourceAccess.read({
         type: "GET_SOURCE_STATUS",
         ownerUserId: claim.ownerUserId,
@@ -145,6 +155,7 @@ export function createSourceWorker(options: Readonly<{
           });
       }, heartbeatIntervalMs);
       try {
+        await adapter.authorize?.();
         await options.sourceAccess.withCredential(
           {
             ownerUserId: claim.ownerUserId,

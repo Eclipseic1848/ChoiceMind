@@ -47,6 +47,7 @@ export async function loadApprovedCandidateAdapter(input: {
 	if (adapter.accessMode === "PUBLIC")
 		return {
 			accessMode: "PUBLIC",
+			authorize: check,
 			async run(job) {
 				await check();
 				return adapter.run(job);
@@ -54,6 +55,7 @@ export async function loadApprovedCandidateAdapter(input: {
 		};
 	return {
 		accessMode: "CREDENTIAL",
+		authorize: check,
 		officialLoginUrl: adapter.officialLoginUrl,
 		async run(job) {
 			await check();
