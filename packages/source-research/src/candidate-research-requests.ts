@@ -1,5 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { Pool } from "pg";
+import {
+	type AdapterCandidateSource,
+	parseAdapterCandidateSource,
+} from "./adapter-candidate.js";
 import type { SourceResearchClaim } from "./index.js";
 
 export type CandidateResearchExecution = Readonly<{
@@ -9,6 +13,7 @@ export type CandidateResearchExecution = Readonly<{
 	agentRunId: string;
 	sourceId: string;
 	token: string;
+	proposal?: AdapterCandidateSource;
 }>;
 
 // 请求、领取和每次付费前复核使用同一原任务归属条件。
@@ -60,12 +65,45 @@ export async function openPostgresCandidateResearchRequests(
 			ADD COLUMN IF NOT EXISTS candidate_requested_at timestamptz,
 			ADD COLUMN IF NOT EXISTS candidate_state text,
 			ADD COLUMN IF NOT EXISTS candidate_token text,
-			ADD COLUMN IF NOT EXISTS candidate_lease_expires_at timestamptz;`);
+			ADD COLUMN IF NOT EXISTS candidate_lease_expires_at timestamptz,
+			ADD COLUMN IF NOT EXISTS candidate_proposal jsonb,
+			ADD COLUMN IF NOT EXISTS candidate_review_state text,
+			ADD COLUMN IF NOT EXISTS candidate_review_token text,
+			ADD COLUMN IF NOT EXISTS candidate_review_lease_expires_at timestamptz;`);
 	} catch (error) {
 		await pool.end();
 		throw error;
 	}
-	return {
+	const commands = {
+		async submitProposal(
+			claim: CandidateResearchExecution,
+			source: unknown,
+		): Promise<boolean> {
+			const proposal = parseAdapterCandidateSource(source);
+			const result = await pool.query(
+				`WITH eligible AS (SELECT job.job_id ${originJoin}
+				 WHERE job.job_id::text=$1 AND job.candidate_token=$2
+				 AND job.owner_user_id=$3 AND job.decision_task_id=$4
+				 AND job.candidate_agent_run_id=$5 AND job.source_id=$6
+				 AND job.candidate_agent_run_id=operation.agent_run_id
+				 AND job.candidate_state='RUNNING' AND job.candidate_lease_expires_at>now()
+				 AND ${activeOrigin} FOR UPDATE OF job, operation)
+				 UPDATE source_research_jobs AS target SET candidate_proposal=$7::jsonb
+				 FROM eligible WHERE target.job_id=eligible.job_id
+				 AND (target.candidate_proposal IS NULL OR target.candidate_proposal=$7::jsonb)
+				 RETURNING target.job_id`,
+				[
+					claim.jobId,
+					claim.token,
+					claim.ownerUserId,
+					claim.decisionTaskId,
+					claim.agentRunId,
+					claim.sourceId,
+					JSON.stringify(proposal),
+				],
+			);
+			return result.rowCount === 1;
+		},
 		async request(
 			claim: Pick<SourceResearchClaim, "jobId" | "workerId" | "attemptCount">,
 		) {
@@ -99,84 +137,121 @@ export async function openPostgresCandidateResearchRequests(
 			);
 			return { recorded: result.rowCount === 1 };
 		},
-		async claimNext(
-			leaseMs = 30_000,
-		): Promise<CandidateResearchExecution | undefined> {
-			validateLease(leaseMs);
-			// 进程死亡后无法确认是否外发；过期只记 UNKNOWN，永不自动重领。
-			await pool.query(`UPDATE source_research_jobs SET candidate_state='UNKNOWN'
-				WHERE candidate_state='RUNNING' AND candidate_lease_expires_at<=now()`);
-			const result = await pool.query<CandidateResearchExecution>(
-				`WITH eligible AS (SELECT job.job_id ${originJoin}
-				 WHERE job.candidate_requested_at IS NOT NULL AND job.candidate_state IS NULL
-				 AND job.candidate_token IS NULL AND job.candidate_agent_run_id=operation.agent_run_id
+	};
+	// 只在两组固定列名间选择；研究与审查共享原任务门禁但持有独立租约。
+	function consumer(stage: "research" | "review") {
+		const prefix = stage === "research" ? "candidate" : "candidate_review";
+		return {
+			async claimNext(
+				leaseMs = 30_000,
+				allowedKinds?: readonly AdapterCandidateSource["kind"][],
+			): Promise<CandidateResearchExecution | undefined> {
+				validateLease(leaseMs);
+				if (
+					allowedKinds !== undefined &&
+					(stage !== "review" ||
+						!Array.isArray(allowedKinds) ||
+						allowedKinds.length < 1 ||
+						allowedKinds.length > 3 ||
+						new Set(allowedKinds).size !== allowedKinds.length ||
+						allowedKinds.some(
+							(kind) => !["GITHUB", "NPM", "PYPI"].includes(kind),
+						))
+				)
+					throw new Error("ADAPTER_CANDIDATE_REVIEW_KINDS_INVALID");
+				// 进程死亡后无法确认是否外发；过期只记 UNKNOWN，永不自动重领。
+				await pool.query(`UPDATE source_research_jobs SET ${prefix}_state='UNKNOWN'
+				WHERE ${prefix}_state='RUNNING' AND ${prefix}_lease_expires_at<=now()`);
+				const result = await pool.query<CandidateResearchExecution>(
+					`WITH eligible AS (SELECT job.job_id ${originJoin}
+				 WHERE job.candidate_requested_at IS NOT NULL AND job.${prefix}_state IS NULL
+				 AND job.${prefix}_token IS NULL AND job.candidate_agent_run_id=operation.agent_run_id
+				 ${stage === "review" ? "AND job.candidate_state='COMPLETED' AND job.candidate_proposal IS NOT NULL" : ""}
+				 ${allowedKinds === undefined ? "" : "AND job.candidate_proposal->>'kind'=ANY($3::text[])"}
 				 AND ${activeOrigin}
 				 ORDER BY job.candidate_requested_at, job.job_id
 				 LIMIT 1 FOR UPDATE OF job, operation SKIP LOCKED)
-				 UPDATE source_research_jobs AS target SET candidate_state='RUNNING',
-				 candidate_token=$1, candidate_lease_expires_at=now()+$2*interval '1 millisecond'
+				 UPDATE source_research_jobs AS target SET ${prefix}_state='RUNNING',
+				 ${prefix}_token=$1, ${prefix}_lease_expires_at=now()+$2*interval '1 millisecond'
 				 FROM eligible WHERE target.job_id=eligible.job_id
 				 RETURNING target.job_id AS "jobId", target.owner_user_id AS "ownerUserId",
 				 target.decision_task_id AS "decisionTaskId", target.candidate_agent_run_id AS "agentRunId",
-				 target.source_id AS "sourceId", target.candidate_token AS token`,
-				[randomUUID(), leaseMs],
-			);
-			return result.rows[0];
-		},
-		async check(
-			claim: CandidateResearchExecution,
-			leaseMs = 30_000,
-		): Promise<boolean> {
-			validateLease(leaseMs);
-			const result = await pool.query(
-				`WITH eligible AS (SELECT job.job_id ${originJoin}
-				 WHERE job.job_id::text=$1 AND job.candidate_token=$2
+				 target.source_id AS "sourceId", target.${prefix}_token AS token
+				 ${stage === "review" ? ", target.candidate_proposal AS proposal" : ""}`,
+					[
+						randomUUID(),
+						leaseMs,
+						...(allowedKinds === undefined ? [] : [[...allowedKinds]]),
+					],
+				);
+				const claim = result.rows[0];
+				if (claim && stage === "review")
+					return {
+						...claim,
+						proposal: parseAdapterCandidateSource(claim.proposal),
+					};
+				return claim;
+			},
+			async check(
+				claim: CandidateResearchExecution,
+				leaseMs = 30_000,
+			): Promise<boolean> {
+				validateLease(leaseMs);
+				const result = await pool.query(
+					`WITH eligible AS (SELECT job.job_id ${originJoin}
+				 WHERE job.job_id::text=$1 AND job.${prefix}_token=$2
 				 AND job.owner_user_id=$3 AND job.decision_task_id=$4
 				 AND job.candidate_agent_run_id=$5 AND job.source_id=$6
 				 AND job.candidate_agent_run_id=operation.agent_run_id
-				 AND job.candidate_state='RUNNING' AND job.candidate_lease_expires_at>now()
+				 AND job.${prefix}_state='RUNNING' AND job.${prefix}_lease_expires_at>now()
 				 AND ${activeOrigin} FOR UPDATE OF job, operation)
 				 UPDATE source_research_jobs AS target
-				 SET candidate_lease_expires_at=now()+$7*interval '1 millisecond'
+				 SET ${prefix}_lease_expires_at=now()+$7*interval '1 millisecond'
 				 FROM eligible WHERE target.job_id=eligible.job_id RETURNING target.job_id`,
-				[
-					claim.jobId,
-					claim.token,
-					claim.ownerUserId,
-					claim.decisionTaskId,
-					claim.agentRunId,
-					claim.sourceId,
-					leaseMs,
-				],
-			);
-			return result.rowCount === 1;
-		},
-		async finish(
-			claim: CandidateResearchExecution,
-			state: "COMPLETED" | "FAILED_FINAL" | "CANCELLED" | "UNKNOWN",
-		): Promise<boolean> {
-			if (
-				!["COMPLETED", "FAILED_FINAL", "CANCELLED", "UNKNOWN"].includes(state)
-			)
-				throw new Error("ADAPTER_CANDIDATE_OUTCOME_INVALID");
-			// 原任务取消后仍可封存已发请求的结果；失去租约不得覆盖 UNKNOWN。
-			const result = await pool.query(
-				`UPDATE source_research_jobs SET candidate_state=$7, candidate_lease_expires_at=NULL
-				 WHERE job_id::text=$1 AND candidate_token=$2 AND owner_user_id=$3
+					[
+						claim.jobId,
+						claim.token,
+						claim.ownerUserId,
+						claim.decisionTaskId,
+						claim.agentRunId,
+						claim.sourceId,
+						leaseMs,
+					],
+				);
+				return result.rowCount === 1;
+			},
+			async finish(
+				claim: CandidateResearchExecution,
+				state: "COMPLETED" | "FAILED_FINAL" | "CANCELLED" | "UNKNOWN",
+			): Promise<boolean> {
+				if (
+					!["COMPLETED", "FAILED_FINAL", "CANCELLED", "UNKNOWN"].includes(state)
+				)
+					throw new Error("ADAPTER_CANDIDATE_OUTCOME_INVALID");
+				// 原任务取消后仍可封存已发请求的结果；失去租约不得覆盖 UNKNOWN。
+				const result = await pool.query(
+					`UPDATE source_research_jobs SET ${prefix}_state=$7, ${prefix}_lease_expires_at=NULL
+				 WHERE job_id::text=$1 AND ${prefix}_token=$2 AND owner_user_id=$3
 				 AND decision_task_id=$4 AND candidate_agent_run_id=$5 AND source_id=$6
-				 AND candidate_state='RUNNING' AND candidate_lease_expires_at>now() RETURNING job_id`,
-				[
-					claim.jobId,
-					claim.token,
-					claim.ownerUserId,
-					claim.decisionTaskId,
-					claim.agentRunId,
-					claim.sourceId,
-					state,
-				],
-			);
-			return result.rowCount === 1;
-		},
+				 AND ${prefix}_state='RUNNING' AND ${prefix}_lease_expires_at>now() RETURNING job_id`,
+					[
+						claim.jobId,
+						claim.token,
+						claim.ownerUserId,
+						claim.decisionTaskId,
+						claim.agentRunId,
+						claim.sourceId,
+						state,
+					],
+				);
+				return result.rowCount === 1;
+			},
+		};
+	}
+	return {
+		...commands,
+		...consumer("research"),
+		review: consumer("review"),
 		close: () => pool.end(),
 	};
 }

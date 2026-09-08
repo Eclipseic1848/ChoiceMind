@@ -4,6 +4,10 @@
   "private": true,
   "type": "module",
   "exports": {
+    "./candidate-runtime": {
+      "types": "./src/candidate-runtime.ts",
+      "default": "./dist/candidate-runtime.js"
+    },
     "./adapter-candidate": {
       "types": "./src/adapter-candidate.ts",
       "default": "./dist/adapter-candidate.js"

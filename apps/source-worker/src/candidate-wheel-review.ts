@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import {
 	type AdapterCandidateSource,
 	createAdapterCandidate,
+	parseAdapterCandidateSource,
 } from "@choicemind/source-research/adapter-candidate";
 import type { openPostgresCandidateStore } from "@choicemind/source-research/candidate-store";
 import { acquireCandidateArtifact } from "./candidate-acquisition.js";
@@ -31,7 +32,11 @@ export async function reviewCandidateWheelDependencies(
 				locked: Parameters<typeof installCandidateWheels>[0]["locked"];
 				signal?: AbortSignal;
 		  }
-		| { requirement: WheelRequirement; signal?: AbortSignal },
+		| {
+				requirement: WheelRequirement;
+				expectedSource?: AdapterCandidateSource;
+				signal?: AbortSignal;
+		  },
 	store: Pick<
 		Awaited<ReturnType<typeof openPostgresCandidateStore>>,
 		"saveArtifact" | "record"
@@ -238,9 +243,20 @@ export async function reviewCandidateWheelDependencies(
 // 证据只来自本次实际解析；不接受调用者提交的来源回执或 PASSED 状态。
 async function preparePypiReview(request: {
 	requirement: WheelRequirement;
+	expectedSource?: AdapterCandidateSource;
 	signal?: AbortSignal;
 }) {
 	const requirement = parseWheelRequirement(request.requirement);
+	const expected =
+		request.expectedSource === undefined
+			? undefined
+			: parseAdapterCandidateSource(request.expectedSource);
+	if (
+		expected &&
+		(expected.kind !== "PYPI" ||
+			expected.packageName !== requirement.packageName)
+	)
+		throw new Error("CANDIDATE_PROPOSAL_SOURCE_MISMATCH");
 	const timeout = AbortSignal.timeout(600_000);
 	const signal = request.signal
 		? AbortSignal.any([request.signal, timeout])
@@ -250,6 +266,13 @@ async function preparePypiReview(request: {
 		(item) => item.name === requirement.packageName,
 	);
 	if (!target) throw new Error("CANDIDATE_WHEEL_REVIEW_TARGET_NOT_LOCKED");
+	if (
+		expected &&
+		(expected.kind !== "PYPI" ||
+			expected.version !== target.version ||
+			expected.artifactSha256 !== target.sha256)
+	)
+		throw new Error("CANDIDATE_PROPOSAL_SOURCE_MISMATCH");
 	// 重新获取所选根制品并核验固定摘要，避免在宿主解包候选 catalogue。
 	const acquired = await acquireCandidateArtifact(
 		{

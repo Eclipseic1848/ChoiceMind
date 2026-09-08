@@ -34,6 +34,73 @@ afterEach(() => {
 });
 
 describe("候选研究消费者", () => {
+	it.each([true, false])(
+		"提案按宿主持有的token提交，成功记录=%s才完成模型阶段",
+		async (recorded) => {
+			const store = {
+				...requests(),
+				submitProposal: vi.fn().mockResolvedValue(recorded),
+			};
+			const proposal = {
+				kind: "PYPI" as const,
+				packageName: "synthetic",
+				version: "1.0",
+				artifactSha256: "a".repeat(64),
+			};
+			const worker = createCandidateResearchWorker({
+				requests: store,
+				async execute({ scope }) {
+					expect(scope).not.toHaveProperty("token");
+					return proposal;
+				},
+			});
+			expect(await worker.runOnce()).toEqual({
+				claimed: 1,
+				completed: recorded ? 1 : 0,
+			});
+			expect(store.submitProposal).toHaveBeenCalledWith(claim, proposal);
+			expect(store.finish).toHaveBeenCalledWith(
+				claim,
+				recorded ? "COMPLETED" : "UNKNOWN",
+			);
+		},
+	);
+	it("取消后调度退出，但drain等待在途用量结算后才允许关闭资源", async () => {
+		const controller = new AbortController();
+		const store = requests();
+		let release: (() => void) | undefined;
+		let started: (() => void) | undefined;
+		const ready = new Promise<void>((resolve) => {
+			started = resolve;
+		});
+		const settled = vi.fn();
+		const worker = createCandidateResearchWorker({
+			requests: store,
+			async execute({ signal }) {
+				started?.();
+				await aborted(signal);
+				await new Promise<void>((resolve) => {
+					release = resolve;
+				});
+				settled();
+			},
+		});
+		const running = worker.runOnce(controller.signal);
+		await ready;
+		controller.abort();
+		expect(await running).toEqual({ claimed: 1, completed: 0 });
+		let drained = false;
+		const draining = worker.drain().then(() => {
+			drained = true;
+		});
+		await Promise.resolve();
+		expect(drained).toBe(false);
+		expect(settled).not.toHaveBeenCalled();
+		release?.();
+		await draining;
+		expect(settled).toHaveBeenCalledOnce();
+		expect(await worker.runOnce()).toEqual({ claimed: 0, completed: 0 });
+	});
 	it("执行器不响应取消仍有界退出，迟到完成不能覆盖UNKNOWN或启动第二次付费", async () => {
 		vi.useFakeTimers();
 		const store = requests();

@@ -3,6 +3,10 @@ import { expect, it, vi } from "vitest";
 import { reviewCandidateWheelDependencies } from "./candidate-wheel-review.js";
 
 const invoke = vi.hoisted(() => vi.fn());
+const closure = vi.hoisted(() => vi.fn());
+vi.mock("./candidate-pypi-closure.js", () => ({
+	resolvePublicPypiClosure: closure,
+}));
 vi.mock("./python-candidate-adapter.js", async (importOriginal) => ({
 	...(await importOriginal<typeof import("./python-candidate-adapter.js")>()),
 	createPythonCandidateInvoker: () => invoke,
@@ -33,6 +37,47 @@ vi.mock("./candidate-wheel-install.js", async (importOriginal) => ({
 		reportSha256: "0".repeat(64),
 	})),
 }));
+
+it.each(["package", "version", "sha256"])(
+	"拒绝审查与提案不一致的%s，不执行候选或落库",
+	async (mismatch) => {
+		closure.mockReset();
+		closure.mockResolvedValue({
+			locked: [
+				{
+					name: "candidate",
+					version: "1.0",
+					sha256: "a".repeat(64),
+					filename: "candidate.whl",
+				},
+			],
+		});
+		invoke.mockClear();
+		const store = { saveArtifact: vi.fn(), record: vi.fn() };
+		await expect(
+			reviewCandidateWheelDependencies(
+				{
+					requirement: {
+						packageName: "candidate",
+						specifier: "==1.0",
+						extras: [],
+					},
+					expectedSource: {
+						kind: "PYPI",
+						packageName: mismatch === "package" ? "other" : "candidate",
+						version: mismatch === "version" ? "2.0" : "1.0",
+						artifactSha256: (mismatch === "sha256" ? "b" : "a").repeat(64),
+					},
+				},
+				store,
+			),
+		).rejects.toThrow("CANDIDATE_PROPOSAL_SOURCE_MISMATCH");
+		expect(closure).toHaveBeenCalledTimes(mismatch === "package" ? 0 : 1);
+		expect(invoke).not.toHaveBeenCalled();
+		expect(store.saveArtifact).not.toHaveBeenCalled();
+		expect(store.record).not.toHaveBeenCalled();
+	},
+);
 
 it.each([
 	"scan-cancel",
