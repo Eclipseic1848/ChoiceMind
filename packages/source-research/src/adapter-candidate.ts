@@ -98,7 +98,10 @@ export function createAdapterCandidate(input: unknown): AdapterCandidate {
 	) {
 		invalidCandidate();
 	}
-	return buildCandidate(parseSource(input.source), parseReview(input.review));
+	return buildCandidate(
+		parseAdapterCandidateSource(input.source),
+		parseReview(input.review),
+	);
 }
 
 export function createAdapterCandidateLifecycle(
@@ -159,7 +162,7 @@ function parseCandidate(input: unknown): AdapterCandidate {
 		invalidCandidate();
 	}
 	const candidate = buildCandidate(
-		parseSource(input.source),
+		parseAdapterCandidateSource(input.source),
 		parseReview(input.review),
 	);
 	if (input.candidateId !== candidate.candidateId) invalidCandidate();
@@ -181,7 +184,9 @@ function buildCandidate(
 	});
 }
 
-function parseSource(input: unknown): AdapterCandidateSource {
+export function parseAdapterCandidateSource(
+	input: unknown,
+): AdapterCandidateSource {
 	if (!isPlainObject(input) || typeof input.kind !== "string") {
 		invalidCandidate();
 	}
