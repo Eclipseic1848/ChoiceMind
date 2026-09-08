@@ -219,6 +219,17 @@ describe("Runtime 恢复合同 v1", () => {
     };
 
     expect(decodeRuntimePausedOutcomeV1(outcome)).toEqual({ ok: true, value: outcome });
+    expect(decodeRuntimePausedOutcomeV1({ ...outcome, pauseReason: "PRIVATE_FILE_PERMISSION" })).toEqual({
+      ok: true, value: { ...outcome, pauseReason: "PRIVATE_FILE_PERMISSION" }
+    });
+    expect(decodeRuntimePausedOutcomeV1({ ...outcome, pauseReason: "SOURCE_RESEARCH" })).toMatchObject({ ok: false });
+    expect(decodeRuntimePausedOutcomeV1({ ...outcome, pauseReason: "UNKNOWN" })).toMatchObject({ ok: false });
+    for (const pauseReason of ["SOURCE_RESEARCH", "PRIVATE_FILE_PROCESSING"]) {
+      const waiting = { ...outcome, pauseReason, state: "PAUSED_USER",
+        snapshot: { ...snapshot, taskState: "PAUSED_USER" },
+        runEvents: outcome.runEvents.map(event => ({ ...event, taskState: "PAUSED_USER" })) };
+      expect(decodeRuntimePausedOutcomeV1(waiting)).toEqual({ ok: true, value: waiting });
+    }
     expect(
       decodeDecisionTaskSnapshotV1({
         contractType: "decision-task-snapshot",

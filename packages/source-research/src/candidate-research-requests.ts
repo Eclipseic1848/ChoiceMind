@@ -1,16 +1,66 @@
+import { randomUUID } from "node:crypto";
 import { Pool } from "pg";
 import type { SourceResearchClaim } from "./index.js";
+
+export type CandidateResearchExecution = Readonly<{
+	jobId: string;
+	ownerUserId: string;
+	decisionTaskId: string;
+	agentRunId: string;
+	sourceId: string;
+	token: string;
+}>;
+
+// 请求、领取和每次付费前复核使用同一原任务归属条件。
+const originJoin = `FROM source_research_jobs AS job
+	JOIN source_research_batches AS batch ON batch.batch_id=job.batch_id
+	JOIN decision_task_submissions AS submission
+	  ON submission.decision_task_id=job.decision_task_id
+	 AND submission.owner_user_id=job.owner_user_id
+	JOIN agent_run_operations AS operation
+	  ON operation.execution_request_id=submission.execution_request_id
+	 AND operation.decision_task_id=job.decision_task_id
+	 AND operation.agent_run_id=batch.origin_agent_run_id`;
+const activeOrigin = `job.source_id ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$'
+	AND (operation.state IN ('ACCEPTED','RUNNING') OR (
+	  operation.state='PAUSED_USER'
+	  AND operation.result_payload->>'contractType'='runtime-paused-outcome'
+	  AND operation.result_payload->>'contractVersion'='1.0'
+	  AND operation.result_payload->>'state'='PAUSED_USER'
+	  AND operation.result_payload->>'pauseReason'='SOURCE_RESEARCH'
+	  AND operation.result_payload->'snapshot'->>'decisionTaskId'=operation.decision_task_id
+	  AND operation.result_payload->'snapshot'->>'agentRunId'=operation.agent_run_id))
+	AND NOT EXISTS (SELECT 1 FROM runtime_control_states AS control
+	  WHERE control.agent_run_id=operation.agent_run_id AND control.state='CANCELLED')
+	AND operation.agent_run_id=(
+	  SELECT latest.agent_run_id FROM agent_run_operations AS latest
+	  JOIN decision_task_submissions AS owner USING(execution_request_id)
+	  WHERE latest.decision_task_id=job.decision_task_id AND owner.owner_user_id=job.owner_user_id
+	  ORDER BY latest.created_at DESC, latest.agent_run_id DESC LIMIT 1)`;
+
+function validateLease(leaseMs: number) {
+	if (!Number.isSafeInteger(leaseMs) || leaseMs < 1 || leaseMs > 300_000)
+		throw new Error("ADAPTER_CANDIDATE_LEASE_INVALID");
+}
 
 // 仅供已认证的采集 Worker 调用；费用归属从原作业和任务解析，不接受外部传入的用户或 Key。
 export async function openPostgresCandidateResearchRequests(
 	databaseUrl: string,
 ) {
-	const pool = new Pool({ connectionString: databaseUrl });
+	const pool = new Pool({
+		connectionString: databaseUrl,
+		connectionTimeoutMillis: 5_000,
+		query_timeout: 5_000,
+		statement_timeout: 5_000,
+	});
 	try {
 		// 复用原作业的隔离与删除生命周期；不建立第二份用户任务数据。
 		await pool.query(`ALTER TABLE source_research_jobs
 			ADD COLUMN IF NOT EXISTS candidate_agent_run_id text,
-			ADD COLUMN IF NOT EXISTS candidate_requested_at timestamptz;`);
+			ADD COLUMN IF NOT EXISTS candidate_requested_at timestamptz,
+			ADD COLUMN IF NOT EXISTS candidate_state text,
+			ADD COLUMN IF NOT EXISTS candidate_token text,
+			ADD COLUMN IF NOT EXISTS candidate_lease_expires_at timestamptz;`);
 	} catch (error) {
 		await pool.end();
 		throw error;
@@ -31,31 +81,15 @@ export async function openPostgresCandidateResearchRequests(
 				claim.attemptCount < 1
 			)
 				throw new Error("ADAPTER_CANDIDATE_REQUEST_INVALID");
-			// 活跃白名单：暂停、失败、部分完成、结束和取消均不得新增候选研究。
+			// 仅接受活跃原任务或可信的等待来源研究暂停。
 			// 锁住原作业和任务，防止已提交的终态/租约变更被旧请求越过。
 			const result = await pool.query(
 				`WITH eligible AS (
 				SELECT job.job_id, operation.agent_run_id, job.source_id
-				FROM source_research_jobs AS job
-				JOIN source_research_batches AS batch ON batch.batch_id=job.batch_id
-				JOIN decision_task_submissions AS submission
-				  ON submission.decision_task_id=job.decision_task_id
-				 AND submission.owner_user_id=job.owner_user_id
-				JOIN agent_run_operations AS operation
-				  ON operation.execution_request_id=submission.execution_request_id
-				 AND operation.decision_task_id=job.decision_task_id
-				 AND operation.agent_run_id=batch.origin_agent_run_id
+				${originJoin}
 				WHERE job.job_id=$1 AND job.worker_id=$2 AND job.attempt_count=$3
 				  AND job.state='RUNNING' AND job.lease_expires_at > now()
-				  AND job.source_id ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$'
-				  AND operation.state IN ('ACCEPTED','RUNNING')
-				  AND NOT EXISTS (SELECT 1 FROM runtime_control_states AS control
-				    WHERE control.agent_run_id=operation.agent_run_id AND control.state='CANCELLED')
-				  AND operation.agent_run_id=(
-				    SELECT latest.agent_run_id FROM agent_run_operations AS latest
-				    JOIN decision_task_submissions AS owner USING(execution_request_id)
-				    WHERE latest.decision_task_id=job.decision_task_id AND owner.owner_user_id=job.owner_user_id
-				    ORDER BY latest.created_at DESC, latest.agent_run_id DESC LIMIT 1)
+				  AND ${activeOrigin}
 				FOR UPDATE OF job, operation
 			) UPDATE source_research_jobs AS target
 			SET candidate_agent_run_id=eligible.agent_run_id, candidate_requested_at=now()
@@ -64,6 +98,84 @@ export async function openPostgresCandidateResearchRequests(
 				[claim.jobId, claim.workerId, claim.attemptCount],
 			);
 			return { recorded: result.rowCount === 1 };
+		},
+		async claimNext(
+			leaseMs = 30_000,
+		): Promise<CandidateResearchExecution | undefined> {
+			validateLease(leaseMs);
+			// 进程死亡后无法确认是否外发；过期只记 UNKNOWN，永不自动重领。
+			await pool.query(`UPDATE source_research_jobs SET candidate_state='UNKNOWN'
+				WHERE candidate_state='RUNNING' AND candidate_lease_expires_at<=now()`);
+			const result = await pool.query<CandidateResearchExecution>(
+				`WITH eligible AS (SELECT job.job_id ${originJoin}
+				 WHERE job.candidate_requested_at IS NOT NULL AND job.candidate_state IS NULL
+				 AND job.candidate_token IS NULL AND job.candidate_agent_run_id=operation.agent_run_id
+				 AND ${activeOrigin}
+				 ORDER BY job.candidate_requested_at, job.job_id
+				 LIMIT 1 FOR UPDATE OF job, operation SKIP LOCKED)
+				 UPDATE source_research_jobs AS target SET candidate_state='RUNNING',
+				 candidate_token=$1, candidate_lease_expires_at=now()+$2*interval '1 millisecond'
+				 FROM eligible WHERE target.job_id=eligible.job_id
+				 RETURNING target.job_id AS "jobId", target.owner_user_id AS "ownerUserId",
+				 target.decision_task_id AS "decisionTaskId", target.candidate_agent_run_id AS "agentRunId",
+				 target.source_id AS "sourceId", target.candidate_token AS token`,
+				[randomUUID(), leaseMs],
+			);
+			return result.rows[0];
+		},
+		async check(
+			claim: CandidateResearchExecution,
+			leaseMs = 30_000,
+		): Promise<boolean> {
+			validateLease(leaseMs);
+			const result = await pool.query(
+				`WITH eligible AS (SELECT job.job_id ${originJoin}
+				 WHERE job.job_id::text=$1 AND job.candidate_token=$2
+				 AND job.owner_user_id=$3 AND job.decision_task_id=$4
+				 AND job.candidate_agent_run_id=$5 AND job.source_id=$6
+				 AND job.candidate_agent_run_id=operation.agent_run_id
+				 AND job.candidate_state='RUNNING' AND job.candidate_lease_expires_at>now()
+				 AND ${activeOrigin} FOR UPDATE OF job, operation)
+				 UPDATE source_research_jobs AS target
+				 SET candidate_lease_expires_at=now()+$7*interval '1 millisecond'
+				 FROM eligible WHERE target.job_id=eligible.job_id RETURNING target.job_id`,
+				[
+					claim.jobId,
+					claim.token,
+					claim.ownerUserId,
+					claim.decisionTaskId,
+					claim.agentRunId,
+					claim.sourceId,
+					leaseMs,
+				],
+			);
+			return result.rowCount === 1;
+		},
+		async finish(
+			claim: CandidateResearchExecution,
+			state: "COMPLETED" | "FAILED_FINAL" | "CANCELLED" | "UNKNOWN",
+		): Promise<boolean> {
+			if (
+				!["COMPLETED", "FAILED_FINAL", "CANCELLED", "UNKNOWN"].includes(state)
+			)
+				throw new Error("ADAPTER_CANDIDATE_OUTCOME_INVALID");
+			// 原任务取消后仍可封存已发请求的结果；失去租约不得覆盖 UNKNOWN。
+			const result = await pool.query(
+				`UPDATE source_research_jobs SET candidate_state=$7, candidate_lease_expires_at=NULL
+				 WHERE job_id::text=$1 AND candidate_token=$2 AND owner_user_id=$3
+				 AND decision_task_id=$4 AND candidate_agent_run_id=$5 AND source_id=$6
+				 AND candidate_state='RUNNING' AND candidate_lease_expires_at>now() RETURNING job_id`,
+				[
+					claim.jobId,
+					claim.token,
+					claim.ownerUserId,
+					claim.decisionTaskId,
+					claim.agentRunId,
+					claim.sourceId,
+					state,
+				],
+			);
+			return result.rowCount === 1;
 		},
 		close: () => pool.end(),
 	};

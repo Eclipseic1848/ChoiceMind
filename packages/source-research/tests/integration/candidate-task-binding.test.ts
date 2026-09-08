@@ -23,10 +23,14 @@ describe.runIf(process.env.CHOICEMIND_TEST_DATABASE_URL)(
 			const secretAccess = vi.fn(() => {
 				throw new Error("SECRET_ACCESS_FORBIDDEN");
 			});
+			const owners: string[] = [];
 			async function origin(state = "RUNNING", foreignOwner = false) {
 				const taskId = randomUUID();
 				const runId = randomUUID();
 				const owner = randomUUID();
+				owners.push(owner);
+				const sourceOwner = foreignOwner ? randomUUID() : owner;
+				if (foreignOwner) owners.push(sourceOwner);
 				await pool.query(
 					`INSERT INTO decision_task_submissions
 				(execution_request_id,command_fingerprint,decision_task_id,command_payload,created_at,owner_user_id)
@@ -42,7 +46,7 @@ describe.runIf(process.env.CHOICEMIND_TEST_DATABASE_URL)(
 				const batch = await sourceResearch.execute({
 					type: "CREATE_BATCH",
 					batchId: randomUUID(),
-					ownerUserId: foreignOwner ? randomUUID() : owner,
+					ownerUserId: sourceOwner,
 					decisionTaskId: taskId,
 					originAgentRunId: runId,
 					idempotencyKey: randomUUID(),
@@ -195,6 +199,8 @@ describe.runIf(process.env.CHOICEMIND_TEST_DATABASE_URL)(
 				);
 				expect(remaining.rows).toEqual([]);
 			} finally {
+				for (const owner of owners)
+					await sourceResearch.purgePrivateDataForOwner(owner);
 				await Promise.all([
 					requests.close(),
 					sourceResearch.close(),

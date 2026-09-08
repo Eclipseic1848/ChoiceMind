@@ -459,6 +459,7 @@ export const runtimePausedOutcomeSchema = z.strictObject({
     "PAUSED_LIMIT"
   ]),
   summary: meaningfulTextSchema,
+  pauseReason: z.enum(["SOURCE_LOGIN", "SOURCE_RESEARCH", "PRIVATE_FILE_PERMISSION", "PRIVATE_FILE_PROCESSING"]).optional(),
   snapshot: runtimeSnapshotSchema,
   effectReceipts: z.array(effectReceiptSchema),
   runEvents: z.array(runEventSchema).min(1)
