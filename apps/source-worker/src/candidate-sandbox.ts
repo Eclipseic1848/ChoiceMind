@@ -27,6 +27,17 @@ const RUNTIMES = {
 } as const;
 const EXECUTION_RUNTIMES = {
 	...RUNTIMES,
+	GITLEAKS: {
+		image:
+			"ghcr.io/gitleaks/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f",
+		policy: "local-gitleaks-stdin.v1",
+		outputLimit: 65_536,
+		// 日志不离开容器；只导出扫描字节数，避免把静默跳过误认为扫描完成。
+		command: [
+			"-c",
+			"gitleaks stdin --no-banner --no-color --ignore-gitleaks-allow --exit-code 42 --redact=100 >/dev/null 2>/work/scan.log; result=$?; sed -n 's/.*scanned ~\\([0-9][0-9]*\\) bytes.*/\\1/p' /work/scan.log; exit \"$result\"",
+		],
+	},
 	PYTHON_BUILD: {
 		...RUNTIMES.PYTHON,
 		policy: "local-python-build-sandbox.v1",
@@ -56,7 +67,8 @@ export async function executeCandidateSandbox(input: {
 	if (
 		!(input.artifact instanceof Uint8Array) ||
 		input.artifact.byteLength === 0 ||
-		input.artifact.byteLength > LIMIT ||
+		input.artifact.byteLength >
+			(runtimeName === "GITLEAKS" ? 64 * 1024 * 1024 : LIMIT) ||
 		!/^[a-f0-9]{64}$/.test(input.artifactSha256) ||
 		!Number.isSafeInteger(timeoutMs) ||
 		timeoutMs < 100 ||
@@ -64,6 +76,7 @@ export async function executeCandidateSandbox(input: {
 		!Object.hasOwn(EXECUTION_RUNTIMES, runtimeName) ||
 		(input.stdin !== undefined &&
 			(runtimeName === "NODE" ||
+				runtimeName === "GITLEAKS" ||
 				!(input.stdin instanceof Uint8Array) ||
 				input.stdin.byteLength > 64 * 1024 * 1024))
 	) {
@@ -75,7 +88,7 @@ export async function executeCandidateSandbox(input: {
 		input.stdin === undefined ? Buffer.alloc(0) : Buffer.from(input.stdin);
 	const runtime = EXECUTION_RUNTIMES[runtimeName];
 	let stdin = artifact;
-	if (runtimeName !== "NODE") {
+	if (runtimeName !== "NODE" && runtimeName !== "GITLEAKS") {
 		const length = Buffer.alloc(4);
 		length.writeUInt32BE(artifact.byteLength);
 		stdin = Buffer.concat([length, artifact, data]);
@@ -132,6 +145,7 @@ export async function executeCandidateSandbox(input: {
 			"/work",
 			"--log-driver",
 			"none",
+			...(runtimeName === "GITLEAKS" ? ["--entrypoint", "/bin/sh"] : []),
 			runtime.image,
 			...runtime.command,
 		]);
@@ -203,7 +217,9 @@ export async function executeCandidateSandbox(input: {
 			policyVersion: runtime.policy,
 			artifactSha256: digest(artifact),
 			image: runtime.image,
-			...(runtimeName !== "NODE" ? { inputSha256: digest(data) } : {}),
+			...(runtimeName !== "NODE" && runtimeName !== "GITLEAKS"
+				? { inputSha256: digest(data) }
+				: {}),
 			outcome: execution.outcome,
 			exitCode,
 			stdoutSha256: digest(execution.stdout),
