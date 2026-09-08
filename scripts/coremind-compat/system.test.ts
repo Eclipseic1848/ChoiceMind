@@ -69,6 +69,22 @@ afterEach(async () => {
   );
 });
 
+test("真实命令不继承宿主秘密或 PowerShell 模块路径且能完成清理", async () => {
+  vi.stubEnv("CHOICEMIND_TEST_HOST_SECRET", "synthetic-secret");
+  try {
+    const output = await executeSystemCommand({
+      command: "node",
+      args: [
+        "-e",
+        'process.stdout.write(JSON.stringify([process.env.CHOICEMIND_TEST_HOST_SECRET ?? null, process.env.PSModulePath ?? null]));'
+      ]
+    });
+    expect(JSON.parse(output.toString("utf8"))).toEqual([null, null]);
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});
+
 test("真实命令取消后父子进程均已退出", async () => {
   const root = await createTemporaryDirectory();
   const pidPath = path.join(root, "processes.json");
