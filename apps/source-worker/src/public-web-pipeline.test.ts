@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import {
-  createEvidenceIngestionService, createFileRawEvidenceObjectStore,
+  createEvidenceIngestionService, createEvidenceModule, createFileRawEvidenceObjectStore,
   createHttpDataSourceConnector, createPublicWebEvidenceGenerator,
   createStaticPublicWebPageCollector, type ResearchEvidenceMaterial
 } from "@choicemind/evidence-ingestion";
@@ -75,6 +75,26 @@ it.skipIf(process.env.CHOICEMIND_TEST_DATABASE_URL === undefined)(
       const material = candidates?.results[0]?.material as ResearchEvidenceMaterial;
       expect(material).toMatchObject({ source: { url }, claimLinks: [{ claimId: "memory", direction: "SUPPORTS" }],
         rawArtifact: { expiresAt: "2026-09-08T00:00:00.000Z" } });
+      const evidence = createEvidenceModule({ sourceResearch: research,
+        nextEvidenceId: randomUUID, nextLinkId: randomUUID, nextGapId: randomUUID });
+      const request = { batchId: batch.batchId, ownerUserId,
+        decisionTaskId: candidates?.decisionTaskId as string, claimIds: ["memory"] };
+      const normalized = await evidence.normalizeResearchBatchById(request);
+      expect(normalized.gaps).toEqual([]);
+      expect(normalized.evidence).toHaveLength(1);
+      await expect(evidence.normalizeResearchBatchById(request)).resolves.toEqual(normalized);
+      await expect(evidence.normalizeResearchBatchById({ ...request, ownerUserId: "other" }))
+        .rejects.toThrow("EVIDENCE_BATCH_NOT_FOUND");
+      const projectionInput = { ownerUserId, decisionTaskId: request.decisionTaskId,
+        evidence: normalized.evidence, claimEvidenceLinks: normalized.claimEvidenceLinks };
+      const projection = evidence.projectForCoreMind({ ...projectionInput,
+        decisionValidFrom: now().toISOString() });
+      expect(projection.items).toHaveLength(1);
+      expect(projection.items[0]).toMatchObject({ source: { url },
+        claimLinks: [{ claimId: "memory", direction: "SUPPORTS" }] });
+      expect(JSON.stringify(projection)).not.toContain(material.rawArtifact.objectKey);
+      expect(evidence.projectForCoreMind({ ...projectionInput,
+        decisionValidFrom: new Date(Date.parse(material.validUntil) + 1).toISOString() }).items).toEqual([]);
       await expect(objectStore.read(material.rawArtifact)).resolves.toEqual(bytes);
       await expect(objectStore.purgeExpired(new Date("2026-09-07T23:59:59.000Z"))).resolves.toEqual({ deleted: 0 });
       await expect(objectStore.purgeExpired(new Date("2026-09-08T00:00:00.000Z"))).resolves.toEqual({ deleted: 1 });
