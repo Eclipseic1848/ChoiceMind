@@ -54,6 +54,8 @@ jobs:
       - name: Build clean checkout before runtime imports
         run: pnpm build
       - name: Verify
+        env:
+          CHOICEMIND_RUN_CHROMIUM_ACCEPTANCE: '1'
         run: pnpm verify
       - name: Report evidence boundary
         if: always()
@@ -94,9 +96,13 @@ jobs:
         run: |
           npm install --global pnpm@11.21.0
           pnpm install --frozen-lockfile
-      - name: Build API dependency closure
-        run: pnpm --filter @choicemind/api... build
+      - name: Build API and Source Worker dependency closures
+        run: pnpm --filter @choicemind/api... --filter @choicemind/source-worker... build
       - name: Verify real Cookie authorization with synthetic accounts
         env:
           CHOICEMIND_TEST_DATABASE_URL: postgresql://candidate_test:synthetic_test_only@127.0.0.1:${{ job.services.postgres.ports[5432] }}/candidate_test
         run: pnpm --filter @choicemind/api exec vitest run tests/integration/candidate-identity.test.ts
+      - name: Verify public research persistence and artifact expiry
+        env:
+          CHOICEMIND_TEST_DATABASE_URL: postgresql://candidate_test:synthetic_test_only@127.0.0.1:${{ job.services.postgres.ports[5432] }}/candidate_test
+        run: pnpm --filter @choicemind/source-worker exec vitest run src/public-web-pipeline.test.ts
