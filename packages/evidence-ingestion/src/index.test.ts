@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { link, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -17,6 +17,146 @@ import {
 } from "./index.js";
 
 describe("Evidence ingestion", () => {
+  it("purges retained public-web bytes after their registered seven-day expiry", async () => {
+    const rootDirectory = await mkdtemp(join(tmpdir(), "choicemind-evidence-retention-"));
+    try {
+      const store = createFileRawEvidenceObjectStore({ rootDirectory });
+      const bytes = new TextEncoder().encode("ChoiceMind transient public fixture");
+      const reference = await store.put(bytes, {
+        expiresAt: "2026-09-06T12:00:00.000Z"
+      });
+
+      await expect(
+        store.purgeExpired(new Date("2026-09-06T11:59:59.000Z"))
+      ).resolves.toEqual({ deleted: 0 });
+      await expect(store.read(reference)).resolves.toEqual(bytes);
+
+      await expect(
+        store.purgeExpired(new Date("2026-09-06T12:00:00.000Z"))
+      ).resolves.toEqual({ deleted: 1 });
+      await expect(store.read(reference)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(rootDirectory, { force: true, recursive: true });
+    }
+  });
+
+  it("keeps deduplicated bytes until the latest registered collection expires", async () => {
+    const rootDirectory = await mkdtemp(join(tmpdir(), "choicemind-evidence-retention-"));
+    try {
+      const store = createFileRawEvidenceObjectStore({ rootDirectory });
+      const bytes = new TextEncoder().encode("ChoiceMind shared public fixture");
+      const first = await store.put(bytes, {
+        expiresAt: "2026-09-06T12:00:00.000Z"
+      });
+      const second = await store.put(bytes, {
+        expiresAt: "2026-09-07T12:00:00.000Z"
+      });
+
+      expect(second).toEqual(first);
+      await expect(
+        store.purgeExpired(new Date("2026-09-06T12:00:00.000Z"))
+      ).resolves.toEqual({ deleted: 0 });
+      await expect(store.read(first)).resolves.toEqual(bytes);
+      await expect(
+        store.purgeExpired(new Date("2026-09-07T12:00:00.000Z"))
+      ).resolves.toEqual({ deleted: 1 });
+    } finally {
+      await rm(rootDirectory, { force: true, recursive: true });
+    }
+  });
+
+  it("并发登记同一原始对象不会缩短最新留存期限", async () => {
+    const rootDirectory = await mkdtemp(join(tmpdir(), "choicemind-evidence-concurrent-"));
+    try {
+      const store = createFileRawEvidenceObjectStore({ rootDirectory });
+      const bytes = new TextEncoder().encode("并发保存的合成公开网页");
+      const latest = Date.parse("2026-09-07T12:00:00.000Z");
+      const results = await Promise.allSettled(Array.from({ length: 20 }, (_, index) =>
+        store.put(bytes, { expiresAt: new Date(latest - index * 1_000).toISOString() })
+      ));
+      expect(results.every((result) => result.status === "fulfilled")).toBe(true);
+      const first = results[0];
+      if (first?.status !== "fulfilled") throw new Error("并发保存失败");
+      await expect(store.purgeExpired(new Date(latest - 1))).resolves.toEqual({ deleted: 0 });
+      await expect(store.read(first.value)).resolves.toEqual(bytes);
+      await expect(store.purgeExpired(new Date(latest))).resolves.toEqual({ deleted: 1 });
+    } finally {
+      await rm(rootDirectory, { force: true, recursive: true });
+    }
+  });
+
+  it("replaces retention metadata atomically without mutating the previous file", async () => {
+    const rootDirectory = await mkdtemp(join(tmpdir(), "choicemind-evidence-retention-"));
+    try {
+      const store = createFileRawEvidenceObjectStore({ rootDirectory });
+      const bytes = new TextEncoder().encode("ChoiceMind atomic retention fixture");
+      const digest = createHash("sha256").update(bytes).digest("hex");
+      const retentionPath = join(
+        rootDirectory,
+        "evidence-raw",
+        "sha256",
+        `${digest}.retention.json`
+      );
+      const previousFile = join(rootDirectory, "previous-retention.json");
+
+      await store.put(bytes, { expiresAt: "2026-09-06T12:00:00.000Z" });
+      await link(retentionPath, previousFile);
+      await store.put(bytes, { expiresAt: "2026-09-07T12:00:00.000Z" });
+
+      await expect(readFile(previousFile, "utf8")).resolves.toBe(
+        '{"expiresAt":"2026-09-06T12:00:00.000Z"}\n'
+      );
+      await expect(
+        store.purgeExpired(new Date("2026-09-06T12:00:00.000Z"))
+      ).resolves.toEqual({ deleted: 0 });
+    } finally {
+      await rm(rootDirectory, { force: true, recursive: true });
+    }
+  });
+
+  it("purges valid expired objects before reporting damaged retention metadata", async () => {
+    const rootDirectory = await mkdtemp(join(tmpdir(), "choicemind-evidence-retention-"));
+    try {
+      const directory = join(rootDirectory, "evidence-raw", "sha256");
+      const damagedDigest = "0".repeat(64);
+      await mkdir(directory, { recursive: true });
+      await writeFile(join(directory, damagedDigest), "damaged retention fixture", "utf8");
+      await writeFile(join(directory, `${damagedDigest}.retention.json`), "{", "utf8");
+
+      const store = createFileRawEvidenceObjectStore({ rootDirectory });
+      const expired = await store.put(
+        new TextEncoder().encode("ChoiceMind expired public fixture"),
+        { expiresAt: "2026-09-06T12:00:00.000Z" }
+      );
+
+      await expect(
+        store.purgeExpired(new Date("2026-09-06T12:00:00.000Z"))
+      ).rejects.toThrow("原始 Evidence 生命周期元数据无效");
+      await expect(store.read(expired)).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(readFile(join(directory, damagedDigest), "utf8")).resolves.toBe(
+        "damaged retention fixture"
+      );
+    } finally {
+      await rm(rootDirectory, { force: true, recursive: true });
+    }
+  });
+
+  it("purges an orphan raw object after seven days even when no retention file survived", async () => {
+    const rootDirectory = await mkdtemp(join(tmpdir(), "choicemind-evidence-orphan-"));
+    try {
+      const store = createFileRawEvidenceObjectStore({ rootDirectory });
+      const bytes = new TextEncoder().encode("ChoiceMind orphan public fixture");
+      const reference = await store.put(bytes);
+
+      await expect(store.purgeExpired(new Date("2100-01-01T00:00:00.000Z"))).resolves.toEqual({
+        deleted: 1
+      });
+      await expect(store.read(reference)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(rootDirectory, { force: true, recursive: true });
+    }
+  });
+
   it("indexes with local Embedding and reranks pgvector candidates with local Reranker", async () => {
     const indexed: Array<{ evidenceId: string; model: string; vector: readonly number[] }> = [];
     const embeddingRequests: unknown[] = [];

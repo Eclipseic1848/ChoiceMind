@@ -1,5 +1,5 @@
-import { createHash } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { isIP } from "node:net";
 import { join } from "node:path";
 
@@ -59,24 +59,42 @@ export interface DataSourceConnector {
 }
 
 export interface RawEvidenceObjectStore {
-  put(bytes: Uint8Array): Promise<DataSourceArtifactRef>;
+  put(
+    bytes: Uint8Array,
+    retention?: Readonly<{ expiresAt: string }>
+  ): Promise<DataSourceArtifactRef>;
 }
 
 export interface ReadableRawEvidenceObjectStore extends RawEvidenceObjectStore {
   read(reference: DataSourceArtifactRef, signal?: AbortSignal): Promise<Uint8Array>;
 }
 
+export interface ManagedRawEvidenceObjectStore extends ReadableRawEvidenceObjectStore {
+  purgeExpired(now: Date): Promise<Readonly<{ deleted: number }>>;
+}
+
 export function createFileRawEvidenceObjectStore(options: Readonly<{
   rootDirectory: string;
-}>): ReadableRawEvidenceObjectStore {
+}>): ManagedRawEvidenceObjectStore {
+  // ponytail: 单实例串行修改；多个进程共享目录前改用持久化租约。
+  let pending: Promise<void> = Promise.resolve();
+  function mutate<T>(operation: () => Promise<T>): Promise<T> {
+    const result = pending.then(operation);
+    pending = result.then(() => undefined, () => undefined);
+    return result;
+  }
   return {
-    async put(bytes) {
+    put: (bytes, retention) => mutate(async () => {
       const digest = createHash("sha256").update(bytes).digest("hex");
       const reference = toRawArtifactReference(digest);
       const filePath = rawArtifactPath(options.rootDirectory, digest);
-      await mkdir(join(options.rootDirectory, "evidence-raw", "sha256"), {
+      const directory = rawArtifactDirectory(options.rootDirectory);
+      await mkdir(directory, {
         recursive: true
       });
+      if (retention !== undefined) {
+        await registerRawArtifactRetention(directory, digest, retention.expiresAt);
+      }
       try {
         await writeFile(filePath, bytes, { flag: "wx" });
       } catch (error) {
@@ -86,7 +104,7 @@ export function createFileRawEvidenceObjectStore(options: Readonly<{
         await readVerifiedRawArtifact(filePath, digest);
       }
       return reference;
-    },
+    }),
     async read(reference, signal) {
       if (
         reference.algorithm !== "sha256" ||
@@ -100,7 +118,53 @@ export function createFileRawEvidenceObjectStore(options: Readonly<{
         reference.digest,
         signal
       );
-    }
+    },
+    purgeExpired: (now) => mutate(async () => {
+      if (!Number.isFinite(now.getTime())) throw new Error("原始 Evidence 清理时间无效");
+      const directory = rawArtifactDirectory(options.rootDirectory);
+      let names: string[];
+      try {
+        names = await readdir(directory);
+      } catch (error) {
+        if (hasErrorCode(error, "ENOENT")) return { deleted: 0 };
+        throw error;
+      }
+      let deleted = 0;
+      const retainedDigests = new Set<string>();
+      const retentionErrors: unknown[] = [];
+      for (const name of names.filter((candidate) => candidate.endsWith(".retention.json"))) {
+        const digest = name.slice(0, -".retention.json".length);
+        if (!/^[0-9a-f]{64}$/.test(digest)) continue;
+        retainedDigests.add(digest);
+        const retentionPath = join(directory, name);
+        let retention: Readonly<{ expiresAt: string }>;
+        try {
+          retention = parseRawArtifactRetention(await readFile(retentionPath, "utf8"));
+        } catch (error) {
+          retentionErrors.push(error);
+          continue;
+        }
+        if (Date.parse(retention.expiresAt) > now.getTime()) continue;
+        try {
+          await unlink(rawArtifactPath(options.rootDirectory, digest));
+          deleted += 1;
+        } catch (error) {
+          if (!hasErrorCode(error, "ENOENT")) throw error;
+        }
+        await unlink(retentionPath);
+      }
+      const orphanCutoff = now.getTime() - 7 * 24 * 60 * 60 * 1_000;
+      for (const digest of names.filter((candidate) => /^[0-9a-f]{64}$/.test(candidate))) {
+        if (retainedDigests.has(digest)) continue;
+        const filePath = rawArtifactPath(options.rootDirectory, digest);
+        const metadata = await stat(filePath);
+        if (metadata.mtimeMs > orphanCutoff) continue;
+        await unlink(filePath);
+        deleted += 1;
+      }
+      if (retentionErrors.length > 0) throw retentionErrors[0];
+      return { deleted };
+    })
   };
 }
 
@@ -113,7 +177,68 @@ function toRawArtifactReference(digest: string): DataSourceArtifactRef {
 }
 
 function rawArtifactPath(rootDirectory: string, digest: string): string {
-  return join(rootDirectory, "evidence-raw", "sha256", digest);
+  return join(rawArtifactDirectory(rootDirectory), digest);
+}
+
+function rawArtifactDirectory(rootDirectory: string): string {
+  return join(rootDirectory, "evidence-raw", "sha256");
+}
+
+async function registerRawArtifactRetention(
+  directory: string,
+  digest: string,
+  expiresAt: string
+): Promise<void> {
+  const expiry = Date.parse(expiresAt);
+  if (!Number.isFinite(expiry)) throw new Error("原始 Evidence 到期时间无效");
+  const retentionPath = join(directory, `${digest}.retention.json`);
+  let latestExpiry = expiry;
+  try {
+    const current = parseRawArtifactRetention(await readFile(retentionPath, "utf8"));
+    latestExpiry = Math.max(latestExpiry, Date.parse(current.expiresAt));
+  } catch (error) {
+    if (!hasErrorCode(error, "ENOENT")) throw error;
+  }
+  const temporaryPath = join(directory, `.${digest}.${randomUUID()}.retention.tmp`);
+  try {
+    await writeFile(
+      temporaryPath,
+      `${JSON.stringify({ expiresAt: new Date(latestExpiry).toISOString() })}\n`,
+      { encoding: "utf8", flag: "wx" }
+    );
+    await rename(temporaryPath, retentionPath);
+  } catch (error) {
+    try {
+      await unlink(temporaryPath);
+    } catch (cleanupError) {
+      if (!hasErrorCode(cleanupError, "ENOENT")) {
+        throw new AggregateError(
+          [error, cleanupError],
+          "原始 Evidence 生命周期元数据写入失败"
+        );
+      }
+    }
+    throw error;
+  }
+}
+
+function parseRawArtifactRetention(value: string): Readonly<{ expiresAt: string }> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    throw new Error("原始 Evidence 生命周期元数据无效");
+  }
+  if (
+    typeof parsed !== "object" ||
+    parsed === null ||
+    !("expiresAt" in parsed) ||
+    typeof parsed.expiresAt !== "string" ||
+    !Number.isFinite(Date.parse(parsed.expiresAt))
+  ) {
+    throw new Error("原始 Evidence 生命周期元数据无效");
+  }
+  return { expiresAt: parsed.expiresAt };
 }
 
 async function readVerifiedRawArtifact(
