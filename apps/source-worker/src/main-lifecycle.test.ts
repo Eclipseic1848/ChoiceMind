@@ -6,6 +6,7 @@ const state = vi.hoisted(() => ({
 	failDrain: false,
 	stopNormally: false,
 	failClose: false,
+	publicSources: false,
 	key: undefined as Buffer | undefined,
 	signals: [] as AbortSignal[],
 }));
@@ -31,7 +32,7 @@ vi.mock("@choicemind/source-access", () => ({
 }));
 vi.mock("@choicemind/source-research", () => ({
 	openPostgresSourceResearch: async () => resource("research"),
-	createPublicWebSourceCatalog: () => new Map(),
+	createPublicWebSourceCatalog: () => new Map(state.publicSources ? [["brand", {}]] : []),
 }));
 vi.mock("@choicemind/source-research/candidate-store", () => ({
 	openPostgresCandidateResearchRequests: async () => ({
@@ -80,10 +81,11 @@ afterEach(() => {
 	state.failDrain = false;
 	state.stopNormally = false;
 	state.failClose = false;
+	state.publicSources = false;
 	state.key = undefined;
 });
 
-it.each(["startup", "running", "drain", "close", "signal"])(
+it.each(["startup", "configuration", "running", "drain", "close", "signal"])(
 	"%s 退出仍回收已取得资源并擦除密钥",
 	async (phase) => {
 		vi.stubEnv("CHOICEMIND_DATABASE_URL", "postgres://synthetic-unused");
@@ -95,6 +97,7 @@ it.each(["startup", "running", "drain", "close", "signal"])(
 		vi.stubEnv("CHOICEMIND_EVIDENCE_OBJECT_ROOT", "");
 		vi.stubEnv("CHOICEMIND_PUBLIC_WEB_SOURCES_JSON", "[]");
 		state.failOpen = phase === "startup";
+		state.publicSources = phase === "configuration";
 		state.failDrain = phase === "drain";
 		state.failClose = phase === "close";
 		state.stopNormally = phase === "signal";
@@ -115,13 +118,13 @@ it.each(["startup", "running", "drain", "close", "signal"])(
 			]);
 		} else
 			expect(error.message).toBe(
-				phase === "startup" ? "TEST_STORE_OPEN_FAILED" : "TEST_WORKER_FAILED",
+				phase === "startup" ? "TEST_STORE_OPEN_FAILED" : phase === "configuration" ? "CHOICEMIND_EVIDENCE_OBJECT_ROOT 未配置" : "TEST_WORKER_FAILED",
 			);
 		expect(state.closed).toEqual(
 			phase === "startup"
 				? ["requests", "research", "access", "persistence"]
 				: [
-						"poll-stopped",
+						...(phase === "configuration" ? [] : ["poll-stopped"]),
 						"drain",
 						"store",
 						"requests",

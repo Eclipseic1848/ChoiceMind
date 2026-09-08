@@ -16,6 +16,7 @@
     "@choicemind/source-access": "workspace:*",
     "@choicemind/source-research": "workspace:*",
     "@choicemind/task-persistence": "workspace:*",
-    "playwright": "1.62.1"
+    "playwright": "1.62.1",
+    "@choicemind/local-services": "workspace:*"
   }
 }

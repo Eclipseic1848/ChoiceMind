@@ -1,14 +1,34 @@
-import { createCredentialVault } from "@choicemind/security";
+import { randomUUID } from "node:crypto";
+import { lookup } from "node:dns/promises";
+
+import {
+  createEvidenceIngestionService,
+  createFileRawEvidenceObjectStore,
+  createHttpDataSourceConnector,
+  createPublicWebEvidenceGenerator,
+  createStaticPublicWebPageCollector
+} from "@choicemind/evidence-ingestion";
+import {
+  executeLocalServiceRequest,
+  loadLocalServiceConfiguration
+} from "@choicemind/local-services";
+import { createCredentialVault, createEgressGuard } from "@choicemind/security";
 import { openPostgresSourceAccess } from "@choicemind/source-access";
 import { openPostgresCandidateResearchRequests, openPostgresCandidateStore } from "@choicemind/source-research/candidate-store";
 import {
+  createPublicWebSourceCatalog,
   openPostgresSourceResearch,
-  openSourceResearchNotificationPublisher
+  openSourceResearchNotificationPublisher,
+  type PublicWebSourceDefinition
 } from "@choicemind/source-research";
 import { openPersistentDecisionTaskModule } from "@choicemind/task-persistence";
+import { chromium, type Browser } from "playwright";
 
 import { createFixtureSourceAdapter } from "./fixture-adapter.js";
 import { createCandidateReviewWorker } from "./candidate-wheel-review.js";
+import { createPinnedHttpsFetch } from "./pinned-https-fetch.js";
+import { createPlaywrightPublicWebIngestion } from "./playwright-public-web-ingestion.js";
+import { createStaticPublicWebSourceAdapter } from "./static-public-web-adapter.js";
 import { createSourceWorker, type SourceAdapter } from "./worker.js";
 
 const databaseUrl = requireEnvironment("CHOICEMIND_DATABASE_URL");
@@ -77,6 +97,188 @@ try {
       })
     ]
   ]);
+  const publicWebCatalog = createPublicWebSourceCatalog(readPublicWebDefinitions());
+  let retentionTimer: ReturnType<typeof setInterval> | undefined;
+  let publicWebBrowser: Browser | undefined;
+  const evidenceObjectRoot = process.env.CHOICEMIND_EVIDENCE_OBJECT_ROOT?.trim();
+  const objectStore =
+    evidenceObjectRoot === undefined || evidenceObjectRoot === ""
+      ? undefined
+      : createFileRawEvidenceObjectStore({ rootDirectory: evidenceObjectRoot });
+  if (objectStore !== undefined) {
+    await objectStore.purgeExpired(new Date());
+    retentionTimer = setInterval(() => {
+      void objectStore.purgeExpired(new Date()).catch((error) => {
+        console.error("公开网页原始材料到期清理失败", error);
+      });
+    }, 60 * 60 * 1_000);
+    retentionTimer.unref();
+    cleanups.push(() => { if (retentionTimer !== undefined) clearInterval(retentionTimer); });
+  }
+  if (publicWebCatalog.size > 0) {
+    if (objectStore === undefined) {
+      throw new Error("CHOICEMIND_EVIDENCE_OBJECT_ROOT 未配置");
+    }
+    const localServiceTarget = loadLocalServiceConfiguration(process.env).targets.find(
+      (target) => target.serviceId === "choicemind-html-parser"
+    );
+    if (localServiceTarget === undefined) {
+      throw new Error("ChoiceMind HTML Parser 未配置");
+    }
+    let fetchStartedAt = 0;
+    const pinnedFetch = createPinnedHttpsFetch();
+    const connector = createHttpDataSourceConnector({
+      collectorVersion: "http-connector@1",
+      fetch: async (input) => {
+        fetchStartedAt = performance.now();
+        return pinnedFetch(input);
+      },
+      includeResponseMetadata: true,
+      now: () => new Date(),
+      objectStore,
+      readDurationMs: () => Math.max(0, Math.round(performance.now() - fetchStartedAt))
+    });
+    const egressGuard = createEgressGuard({
+      appendRecord: async (record) => persistence.appendEgressRecord(record),
+      nextId: randomUUID,
+      now: () => new Date()
+    });
+    const evidenceGenerator = createPublicWebEvidenceGenerator({
+      nextEvidenceId: randomUUID,
+      nextGapId: randomUUID,
+      nextParserRequestId: randomUUID,
+      objectStore,
+      parse: async (request, signal) =>
+        executeLocalServiceRequest(
+          localServiceTarget,
+          request,
+          signal === undefined ? {} : { signal }
+        )
+    });
+    if (
+      [...publicWebCatalog.values()].some(
+        (definition) => definition.renderMode === "AUTO" || definition.renderMode === "DYNAMIC"
+      )
+    ) {
+      publicWebBrowser = await chromium.launch({
+        headless: true,
+        args: [
+          "--disable-background-networking",
+          "--disable-features=WebTransport",
+          "--disable-quic",
+          "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+          "--host-resolver-rules=MAP * ~NOTFOUND"
+        ]
+      });
+      const ownedBrowser = publicWebBrowser;
+      cleanups.push(() => ownedBrowser.close());
+    }
+    for (const definition of publicWebCatalog.values()) {
+      if (adapters.has(definition.sourceId)) {
+        throw new Error(`公开来源 ID 与现有 Adapter 冲突：${definition.sourceId}`);
+      }
+      const ingestion = createEvidenceIngestionService({
+        approvedSourceOrigins: new Set(definition.allowedOrigins),
+        approvedSourceUrls: new Set(definition.entryUrls),
+        collectionPolicy: { allowedMediaTypes: ["text/html"], maxBytes: 1_000_000 },
+        connector,
+        egressGuard,
+        nextGapId: randomUUID,
+        resolveHost: async (hostname) =>
+          (await lookup(hostname, { all: true, verbatim: true })).map((entry) => entry.address)
+      });
+      const dynamicIngestion =
+        definition.renderMode === "STATIC" || publicWebBrowser === undefined
+          ? undefined
+          : createPlaywrightPublicWebIngestion({
+              approvedSourceOrigins: new Set(definition.allowedOrigins),
+              approvedSourceUrls: new Set(definition.entryUrls),
+              browser: publicWebBrowser,
+              nextGapId: randomUUID,
+              now: () => new Date(),
+              objectStore,
+              safeResourceLoader: {
+                async load(input) {
+                  const resourceIngestion = createEvidenceIngestionService({
+                    approvedSourceOrigins: new Set(definition.allowedOrigins),
+                    approvedSourceUrls: new Set([input.url]),
+                    collectionPolicy: {
+                      allowedMediaTypes: [
+                        "application/javascript",
+                        "application/json",
+                        "text/css",
+                        "text/html",
+                        "text/javascript",
+                        "text/plain"
+                      ],
+                      maxBytes: Math.min(1_000_000, input.maxBytes)
+                    },
+                    connector,
+                    egressGuard,
+                    nextGapId: randomUUID,
+                    redirectMode: "manual",
+                    resolveHost: async (hostname) =>
+                      (await lookup(hostname, { all: true, verbatim: true })).map(
+                        (entry) => entry.address
+                      )
+                  });
+                  const result = await resourceIngestion.ingest({
+                    correlationId: input.correlationId,
+                    decisionTaskId: input.decisionTaskId,
+                    operationId: input.operationId,
+                    signal: input.signal,
+                    source: {
+                      sourceId: input.sourceId,
+                      title: definition.title,
+                      url: input.url
+                    },
+                    userId: input.userId
+                  });
+                  if (result.status === "EVIDENCE_GAP") return result;
+                  if (result.status === "REDIRECT") {
+                    return {
+                      status: "LOADED" as const,
+                      response: {
+                        body: new Uint8Array(),
+                        headers: { location: result.location },
+                        status: 302
+                      }
+                    };
+                  }
+                  return {
+                    status: "LOADED" as const,
+                    response: {
+                      body: await objectStore.read(
+                        result.collection.rawArtifact,
+                        input.signal
+                      ),
+                      headers: result.collection.response.headers,
+                      status: result.collection.response.status
+                    }
+                  };
+                }
+              }
+            });
+      adapters.set(
+        definition.sourceId,
+        createStaticPublicWebSourceAdapter({
+          definition,
+          pageCollector: createStaticPublicWebPageCollector({
+            ingestion,
+            evidenceGenerator
+          }),
+          ...(dynamicIngestion === undefined
+            ? {}
+            : {
+                dynamicPageCollector: createStaticPublicWebPageCollector({
+                  ingestion: dynamicIngestion,
+                  evidenceGenerator
+                })
+              })
+        })
+      );
+    }
+  }
   let notificationPublisher: Awaited<ReturnType<typeof openSourceResearchNotificationPublisher>> | undefined;
   try {
     const redisUrl = process.env.CHOICEMIND_REDIS_URL;
@@ -149,4 +351,14 @@ function requireEnvironment(name: string): string {
   const value = process.env[name];
   if (value === undefined || value.length === 0) throw new Error(`${name} 未配置`);
   return value;
+}
+
+function readPublicWebDefinitions(): readonly PublicWebSourceDefinition[] {
+  const configured = process.env.CHOICEMIND_PUBLIC_WEB_SOURCES_JSON;
+  if (configured === undefined || configured.trim() === "") return [];
+  try {
+    return JSON.parse(configured) as readonly PublicWebSourceDefinition[];
+  } catch {
+    throw new Error("CHOICEMIND_PUBLIC_WEB_SOURCES_JSON 必须是有效 JSON");
+  }
 }

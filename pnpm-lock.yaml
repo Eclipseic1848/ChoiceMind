@@ -88,6 +88,9 @@ importers:
 
   apps/source-worker:
     dependencies:
+      '@choicemind/local-services':
+        specifier: workspace:*
+        version: link:../../packages/local-services
       '@choicemind/evidence-ingestion':
         specifier: workspace:*
         version: link:../../packages/evidence-ingestion
