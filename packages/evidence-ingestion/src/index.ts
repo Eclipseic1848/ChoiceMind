@@ -24,6 +24,7 @@ export type DataSourceCollectionResult =
       ok: true;
       sourceFacts: Readonly<{
         capturedAt: string;
+        collectorVersion?: string;
         mediaType: string;
         sourceId: string;
         title: string;
@@ -62,7 +63,7 @@ export interface RawEvidenceObjectStore {
 }
 
 export interface ReadableRawEvidenceObjectStore extends RawEvidenceObjectStore {
-  read(reference: DataSourceArtifactRef): Promise<Uint8Array>;
+  read(reference: DataSourceArtifactRef, signal?: AbortSignal): Promise<Uint8Array>;
 }
 
 export function createFileRawEvidenceObjectStore(options: Readonly<{
@@ -86,7 +87,7 @@ export function createFileRawEvidenceObjectStore(options: Readonly<{
       }
       return reference;
     },
-    async read(reference) {
+    async read(reference, signal) {
       if (
         reference.algorithm !== "sha256" ||
         !/^[0-9a-f]{64}$/.test(reference.digest) ||
@@ -96,7 +97,8 @@ export function createFileRawEvidenceObjectStore(options: Readonly<{
       }
       return readVerifiedRawArtifact(
         rawArtifactPath(options.rootDirectory, reference.digest),
-        reference.digest
+        reference.digest,
+        signal
       );
     }
   };
@@ -116,9 +118,10 @@ function rawArtifactPath(rootDirectory: string, digest: string): string {
 
 async function readVerifiedRawArtifact(
   filePath: string,
-  expectedDigest: string
+  expectedDigest: string,
+  signal?: AbortSignal
 ): Promise<Uint8Array> {
-  const bytes = await readFile(filePath);
+  const bytes = await readFile(filePath, signal === undefined ? undefined : { signal });
   const actualDigest = createHash("sha256").update(bytes).digest("hex");
   if (actualDigest !== expectedDigest) {
     throw new Error("原始 Evidence 对象完整性校验失败");
@@ -140,18 +143,23 @@ export function createPublicWebEvidenceGenerator(options: Readonly<{
   nextGapId: () => string;
   nextParserRequestId: () => string;
   objectStore: ReadableRawEvidenceObjectStore;
-  parse(request: DocumentParserRequestV1): Promise<LocalServiceResultV1>;
+  parse(request: DocumentParserRequestV1, signal?: AbortSignal): Promise<LocalServiceResultV1>;
 }>) {
   return {
     async generate(input: Readonly<{
       collection: Extract<DataSourceCollectionResult, Readonly<{ ok: true }>>;
       decisionTaskId: string;
+      signal?: AbortSignal;
       validUntil: string;
     }>) {
       if (input.collection.sourceFacts.mediaType !== "text/html") {
         return parserEvidenceGap(options, input.decisionTaskId, false);
       }
-      const rawBytes = await options.objectStore.read(input.collection.rawArtifact);
+      const rawBytes = await options.objectStore.read(
+        input.collection.rawArtifact,
+        input.signal
+      );
+      const documentSignals = inspectHtmlDocumentSignals(rawBytes);
       const request: DocumentParserRequestV1 = {
         contractType: "local-service-request",
         contractVersion: "1.0",
@@ -164,7 +172,7 @@ export function createPublicWebEvidenceGenerator(options: Readonly<{
           }
         }
       };
-      const parsed = decodeLocalServiceResultV1(await options.parse(request));
+      const parsed = decodeLocalServiceResultV1(await options.parse(request, input.signal));
       if (!parsed.ok || !parsed.value.ok || parsed.value.port !== "DOCUMENT_PARSER") {
         const retryable = parsed.ok && !parsed.value.ok ? parsed.value.error.retryable : false;
         return parserEvidenceGap(options, input.decisionTaskId, retryable);
@@ -174,6 +182,7 @@ export function createPublicWebEvidenceGenerator(options: Readonly<{
       const excerptDigest = createHash("sha256").update(excerpt, "utf8").digest("hex");
       return {
         status: "EVIDENCE_CREATED" as const,
+        documentSignals,
         evidence: {
           contractType: "evidence" as const,
           contractVersion: "1.0" as const,
@@ -191,11 +200,27 @@ export function createPublicWebEvidenceGenerator(options: Readonly<{
             url: input.collection.sourceFacts.url
           },
           excerptHash: { algorithm: "sha256" as const, digest: excerptDigest },
-          parserVersion: parsed.value.output.parser,
+          parserVersion:
+            input.collection.sourceFacts.collectorVersion === undefined
+              ? parsed.value.output.parser
+              : `${input.collection.sourceFacts.collectorVersion} + ${parsed.value.output.parser}`,
           rawArtifact: input.collection.rawArtifact
         }
       };
     }
+  };
+}
+
+function inspectHtmlDocumentSignals(bytes: Uint8Array) {
+  const html = Buffer.from(bytes).toString("utf8");
+  return {
+    hasAccessForm:
+      /<input\b[^>]*\btype\s*=\s*["']?password\b/iu.test(html) ||
+      /<form\b[^>]*(?:login|sign[-_ ]?in|auth)[^>]*>/iu.test(html),
+    hasMainContent:
+      /<(?:main|article)(?:\s[^>]*)?>/iu.test(html) ||
+      /\srole\s*=\s*["']main["']/iu.test(html),
+    hasTitle: /<title(?:\s[^>]*)?>\s*[^<\s][\s\S]*?<\/title>/iu.test(html)
   };
 }
 

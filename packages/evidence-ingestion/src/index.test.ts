@@ -125,10 +125,13 @@ describe("Evidence ingestion", () => {
   });
 
   it("parses a stored HTML artifact into locatable public-web Evidence", async () => {
-    const rawBytes = new TextEncoder().encode("<main>候选 A 提供 32 GB 内存</main>");
+    const rawBytes = new TextEncoder().encode(
+      '<main>候选 A 提供 32 GB 内存</main><form><input type="password"></form>'
+    );
     const rawDigest = createHash("sha256").update(rawBytes).digest("hex");
     const excerpt = "候选 A 提供 32 GB 内存";
     const excerptDigest = createHash("sha256").update(excerpt, "utf8").digest("hex");
+    const controller = new AbortController();
     const generator = createPublicWebEvidenceGenerator({
       nextEvidenceId: () => "evidence-public-a-memory",
       nextGapId: () => "gap-unused",
@@ -137,11 +140,13 @@ describe("Evidence ingestion", () => {
         async put() {
           throw new Error("生成 Evidence 时不得重新写原始对象");
         },
-        async read() {
+        async read(_reference, signal) {
+          expect(signal).toBe(controller.signal);
           return rawBytes;
         }
       },
-      parse: async (request) => {
+      parse: async (request, signal) => {
+        expect(signal).toBe(controller.signal);
         expect(request).toEqual({
           contractType: "local-service-request",
           contractVersion: "1.0",
@@ -174,6 +179,7 @@ describe("Evidence ingestion", () => {
         ok: true,
         sourceFacts: {
           capturedAt: "2026-08-26T00:00:01.000Z",
+          collectorVersion: "http-connector@1",
           mediaType: "text/html",
           sourceId: "source-public-a",
           title: "ChoiceMind 固定公开资料",
@@ -187,11 +193,17 @@ describe("Evidence ingestion", () => {
         metrics: { bytesFetched: rawBytes.byteLength, durationMs: 11 }
       },
       decisionTaskId: "task-public-a",
+      signal: controller.signal,
       validUntil: "2026-09-26T00:00:01.000Z"
     });
 
     expect(result).toEqual({
       status: "EVIDENCE_CREATED",
+      documentSignals: {
+        hasAccessForm: true,
+        hasMainContent: true,
+        hasTitle: false
+      },
       evidence: {
         contractType: "evidence",
         contractVersion: "1.0",
@@ -209,7 +221,7 @@ describe("Evidence ingestion", () => {
           url: "https://example.com/choicemind/p0-fixture"
         },
         excerptHash: { algorithm: "sha256", digest: excerptDigest },
-        parserVersion: "choicemind-html-parser-1.0",
+        parserVersion: "http-connector@1 + choicemind-html-parser-1.0",
         rawArtifact: {
           algorithm: "sha256",
           digest: rawDigest,
