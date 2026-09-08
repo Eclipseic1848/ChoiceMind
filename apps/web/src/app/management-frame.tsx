@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useRouter } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import {
 	createContext,
 	type ReactNode,
@@ -32,6 +32,7 @@ export function ManagementFrame({
 	title: string;
 }>) {
 	const router = useRouter();
+	const pathname = usePathname();
 	const [gate, setGate] = useState<GateState>({ kind: "checking" });
 
 	useEffect(() => {
@@ -108,6 +109,16 @@ export function ManagementFrame({
 						{gate.role === "USER" ? null : (
 							<Link href="/admin/invitations">邀请管理</Link>
 						)}
+						{gate.role !== "USER" ? (
+							<Link
+								aria-current={
+									pathname === "/admin/adapter-candidates" ? "page" : undefined
+								}
+								href="/admin/adapter-candidates"
+							>
+								来源工具
+							</Link>
+						) : null}
 						{gate.role === "SUPERADMIN" ? (
 							<Link href="/admin/audit">安全审计</Link>
 						) : null}

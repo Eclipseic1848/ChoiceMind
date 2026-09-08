@@ -1,0 +1,131 @@
+.panel {
+	padding-top: 20px;
+	font-size: 14px;
+}
+.toolbar,
+.summary {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 16px;
+}
+.toolbar p {
+	margin: 0;
+}
+.toolbar {
+	min-height: 44px;
+}
+.panel button {
+	min-height: 36px;
+	padding: 7px 12px;
+	border: 1px solid var(--line);
+	border-radius: var(--radius-small);
+	background: var(--surface);
+	color: var(--ink);
+	cursor: pointer;
+}
+.panel button:hover:not(:disabled) {
+	border-color: var(--ink);
+}
+.panel button:active:not(:disabled) {
+	background: var(--paper);
+}
+.panel button:disabled {
+	opacity: 0.55;
+	cursor: not-allowed;
+}
+.panel a {
+	color: var(--ink);
+	text-underline-offset: 3px;
+}
+.panel a:hover {
+	text-decoration-thickness: 2px;
+}
+.panel h2 {
+	margin: 0;
+	font-size: 20px;
+	overflow-wrap: anywhere;
+}
+.panel h3 {
+	font-size: 16px;
+}
+.panel th,
+.panel td {
+	padding: 12px;
+	font-size: 14px;
+	letter-spacing: normal;
+	text-transform: none;
+}
+.panel td,
+.source,
+.caption {
+	color: var(--ink);
+}
+.source {
+	display: block;
+	margin-top: 4px;
+	font-size: 12px;
+	font-weight: normal;
+}
+.caption {
+	text-align: left;
+	padding: 12px 0;
+}
+.empty,
+.loading {
+	min-height: 200px;
+	padding: 36px 0;
+}
+.empty p {
+	max-width: 50ch;
+	line-height: 1.6;
+}
+.error {
+	border-left: 3px solid var(--danger);
+	padding: 10px 12px;
+	color: var(--danger);
+}
+.summary {
+	margin-top: 20px;
+	max-width: 760px;
+}
+.summary button {
+	flex-shrink: 0;
+}
+.checks {
+	margin-top: 24px;
+	max-width: 760px;
+}
+.checks div {
+	display: flex;
+	justify-content: space-between;
+	gap: 20px;
+	padding: 12px 0;
+	border-bottom: 1px solid var(--line);
+}
+.checks dd {
+	margin: 0;
+}
+.confirmation {
+	max-width: 760px;
+	margin-top: 20px;
+	padding: 16px;
+	border: 1px solid var(--copper);
+	border-radius: var(--radius-small);
+}
+.confirmation p {
+	line-height: 1.6;
+}
+.technical {
+	margin-top: 24px;
+	max-width: 760px;
+}
+.technical summary {
+	cursor: pointer;
+	padding: 10px 0;
+}
+.technical dd {
+	margin: 6px 0 16px;
+	font-family: var(--font-data);
+	overflow-wrap: anywhere;
+}
