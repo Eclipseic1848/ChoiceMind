@@ -922,8 +922,9 @@ describe("start_all.bat", () => {
 			healthServerPath,
 			[
 				'import { createServer } from "node:http";',
-				`const servers = [1029, 3100, 3200, 3300].map((port) => createServer((_request, response) => { response.writeHead(200, { 'content-type': 'application/json' }); response.end('{"status":"healthy"}'); }).listen(port + ${offset}, '127.0.0.1'));`,
-				"setTimeout(() => Promise.all(servers.map((server) => new Promise((resolveClose) => server.close(resolveClose)))).then(() => process.exit(0)), 1800);",
+				"const checked = new Set();",
+				"const deadline = setTimeout(() => process.exit(1), 10000);",
+				`const servers = [1029, 3100, 3200, 3300].map((port) => createServer((_request, response) => { response.on('finish', () => { checked.add(port); if (checked.size === 4) { clearTimeout(deadline); Promise.all(servers.map((server) => new Promise((done) => server.close(done)))).then(() => process.exit(0)); } }); response.writeHead(200, { 'content-type': 'application/json' }); response.end('{"status":"healthy"}'); }).listen(port + ${offset}, '127.0.0.1'));`,
 			].join("\n"),
 			"utf8",
 		);
