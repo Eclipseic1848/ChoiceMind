@@ -96,6 +96,7 @@ export type CreateSourceResearchBatchCommand = Readonly<{
     batchId: string;
     ownerUserId: string;
     decisionTaskId: string;
+    originAgentRunId?: string;
     idempotencyKey: string;
     query: string;
     target?: SourceResearchTarget;
@@ -222,6 +223,10 @@ export async function openPostgresSourceResearch(options: Readonly<{
     ) {
       throw new Error("SOURCE_RESEARCH_BATCH_INVALID");
     }
+    if (command.originAgentRunId !== undefined &&
+      (typeof command.originAgentRunId !== "string" || command.originAgentRunId.length === 0 || command.originAgentRunId.length > 200)) {
+      throw new Error("SOURCE_RESEARCH_ORIGIN_INVALID");
+    }
     if (command.target !== undefined && !isSourceResearchTarget(command.target)) {
       throw new Error("SOURCE_RESEARCH_TARGET_INVALID");
     }
@@ -250,6 +255,7 @@ export async function openPostgresSourceResearch(options: Readonly<{
       .update(
         JSON.stringify({
           decisionTaskId: command.decisionTaskId,
+          ...(command.originAgentRunId === undefined ? {} : { originAgentRunId: command.originAgentRunId }),
           query: command.query.trim(),
           sources: fingerprintSources,
           ...(command.target === undefined ? {} : { target: command.target })
@@ -263,8 +269,8 @@ export async function openPostgresSourceResearch(options: Readonly<{
       const inserted = await client.query<BatchRow>(
         `INSERT INTO source_research_batches (
            batch_id, owner_user_id, decision_task_id, idempotency_key,
-           request_fingerprint, query, research_target, created_at, updated_at
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $8)
+           request_fingerprint, query, research_target, created_at, updated_at, origin_agent_run_id
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $8, $9)
          ON CONFLICT (owner_user_id, idempotency_key) DO NOTHING
          RETURNING *`,
         [
@@ -275,7 +281,8 @@ export async function openPostgresSourceResearch(options: Readonly<{
           requestFingerprint,
           command.query.trim(),
           command.target === undefined ? null : JSON.stringify(command.target),
-          timestamp
+          timestamp,
+          command.originAgentRunId ?? null
         ]
       );
       if (inserted.rows[0] === undefined) {
@@ -705,6 +712,10 @@ async function migrateSourceResearch(pool: Pool): Promise<void> {
     await client.query(`
       ALTER TABLE source_research_batches
       ADD COLUMN IF NOT EXISTS research_target jsonb
+    `);
+    await client.query(`
+      ALTER TABLE source_research_batches
+      ADD COLUMN IF NOT EXISTS origin_agent_run_id text
     `);
     await client.query(`
       ALTER TABLE source_research_jobs

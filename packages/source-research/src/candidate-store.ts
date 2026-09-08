@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { Pool, type PoolClient } from "pg";
+export { openPostgresCandidateResearchRequests } from "./candidate-research-requests.js";
 import {
 	type AdapterCandidate,
 	type AdapterCandidateLifecycle,

@@ -88,7 +88,7 @@ export function createSourceWorker(options: Readonly<{
   sourceAccess: SourceAccessPort;
   sourceResearch: SourceResearchPort;
   adapters: ReadonlyMap<string, SourceAdapter>;
-  requestCandidateResearch?(sourceId: string): Promise<void>;
+  requestCandidateResearch?(sourceId: string, claim: SourceResearchClaim): Promise<void>;
   leaseDurationMs?: number;
   heartbeatIntervalMs?: number;
 }>) {
@@ -106,7 +106,7 @@ export function createSourceWorker(options: Readonly<{
       const adapter = options.adapters.get(claim.sourceId);
       if (adapter === undefined) {
         try {
-          await options.requestCandidateResearch?.(claim.sourceId);
+          await options.requestCandidateResearch?.(claim.sourceId, claim);
         } catch {
           await options.sourceResearch.complete(claim, {
             type: "FAILED_RETRYABLE",

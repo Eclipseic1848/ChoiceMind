@@ -71,7 +71,7 @@ describe.runIf(process.env.CHOICEMIND_TEST_DATABASE_URL)(
 				const request = vi.fn((id: string) => store.requestResearch(id));
 				const { worker, complete, secretAccess } = setup(request, sourceId);
 				await Promise.all([worker.runOnce(), worker.runOnce()]);
-				expect(request.mock.calls).toEqual([[sourceId], [sourceId]]);
+				expect(request.mock.calls.map(([id]) => id)).toEqual([sourceId, sourceId]);
 				expect(complete).toHaveBeenCalledWith(
 					expect.anything(),
 					expect.objectContaining({ type: "FAILED_FINAL" }),
