@@ -18,7 +18,17 @@ it("空锁清单不能启动安装", async () => {
 describe.runIf(process.env.CHOICEMIND_RUN_CANDIDATE_SANDBOX === "1")(
 	"受监督离线 wheel 安装",
 	() => {
-		it.each(["complete", "missing", "hash", "injection"])(
+		it.each([
+			"complete",
+			"missing",
+			"hash",
+			"injection",
+			"source-success",
+			"source-failure",
+			"source-missing",
+			"source-shadow",
+			"source-ambient",
+		])(
 			"%s",
 			async (mode) => {
 				const python = fileURLToPath(
@@ -44,16 +54,42 @@ describe.runIf(process.env.CHOICEMIND_RUN_CANDIDATE_SANDBOX === "1")(
 					generated.locked[0].name =
 						"candidate\n--index-url=https://example.com";
 				const bundle = Buffer.from(generated.bundle, "base64");
+				const source =
+					generated.source === null
+						? undefined
+						: Buffer.from(generated.source, "base64");
 				const result = installCandidateWheels({
 					bundle,
 					sha256: createHash("sha256").update(bundle).digest("hex"),
 					locked: generated.locked,
+					...(source === undefined
+						? {}
+						: {
+								source: {
+									archive: source,
+									sha256: createHash("sha256").update(source).digest("hex"),
+								},
+							}),
 				});
-				if (mode === "complete") {
+				if (
+					mode === "complete" ||
+					mode === "source-success" ||
+					mode === "source-shadow"
+				) {
 					await expect(result).resolves.toMatchObject({
 						summary: {
 							installed: true,
 							lockedWheels: 2,
+							...(mode === "source-success"
+								? {
+										build: {
+											status: "BUILD_EXITED",
+											wheelSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+											reviewStatus: "NOT_RUN",
+											runtimeDependencies: "NOT_RUN",
+										},
+									}
+								: {}),
 							reviewStatus: "NOT_RUN",
 						},
 						execution: { exitCode: 0, reviewStatus: "NOT_RUN" },
