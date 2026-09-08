@@ -5,6 +5,7 @@ import {
 	type AdapterCandidateLifecycle,
 	createAdapterCandidate,
 	createAdapterCandidateLifecycle,
+	readApprovedAdapterCandidate,
 	transitionAdapterCandidateLifecycle,
 } from "./adapter-candidate.js";
 
@@ -80,6 +81,25 @@ export async function openPostgresCandidateStore(databaseUrl: string) {
 					throw new Error("ADAPTER_CANDIDATE_WRITE_UNCONFIRMED");
 				return stored;
 			});
+		},
+		async readApproved(
+			candidateId: string,
+			reviewBinding: string,
+			artifactSha256: string,
+		): Promise<AdapterCandidate | undefined> {
+			const result = await pool.query<StoredCandidate>(
+				"SELECT candidate,lifecycle FROM source_research_candidate_reviews WHERE candidate_id=$1 ORDER BY revision DESC LIMIT 1",
+				[candidateId],
+			);
+			const current = result.rows[0];
+			return current === undefined
+				? undefined
+				: readApprovedAdapterCandidate(
+						current.candidate,
+						current.lifecycle,
+						reviewBinding,
+						artifactSha256,
+					);
 		},
 		async read(candidateId: string): Promise<StoredCandidate | undefined> {
 			const result = await pool.query<StoredCandidate>(

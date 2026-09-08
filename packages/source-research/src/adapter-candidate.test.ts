@@ -3,10 +3,56 @@ import { describe, expect, it } from "vitest";
 import {
 	createAdapterCandidate,
 	createAdapterCandidateLifecycle,
+	readApprovedAdapterCandidate,
 	transitionAdapterCandidateLifecycle,
 } from "./adapter-candidate.js";
 
 describe("Adapter Candidate 合同", () => {
+	it("正式读取须匹配批准报告和制品，不能伪造 ENABLED 状态", () => {
+		const candidate = validCandidate();
+		const enabled = enable(candidate);
+		expect(
+			readApprovedAdapterCandidate(
+				candidate,
+				enabled,
+				enabled.reviewBindingSha256,
+				candidate.source.artifactSha256,
+			),
+		).toEqual(candidate);
+		expect(
+			readApprovedAdapterCandidate(
+				candidate,
+				enabled,
+				"f".repeat(64),
+				candidate.source.artifactSha256,
+			),
+		).toBeUndefined();
+		expect(
+			readApprovedAdapterCandidate(
+				candidate,
+				enabled,
+				enabled.reviewBindingSha256,
+				"f".repeat(64),
+			),
+		).toBeUndefined();
+		const pending = createAdapterCandidateLifecycle(candidate);
+		expect(
+			readApprovedAdapterCandidate(
+				candidate,
+				pending,
+				pending.reviewBindingSha256,
+				candidate.source.artifactSha256,
+			),
+		).toBeUndefined();
+		expect(() =>
+			readApprovedAdapterCandidate(
+				candidate,
+				{ ...pending, state: "ENABLED" },
+				pending.reviewBindingSha256,
+				candidate.source.artifactSha256,
+			),
+		).toThrow("ADAPTER_CANDIDATE_LIFECYCLE_INVALID");
+	});
 	it("报告摘要未变但审查内容改变，也必须重新审批", () => {
 		const candidate = validCandidate();
 		const review = passedReview();

@@ -131,6 +131,21 @@ export function transitionAdapterCandidateLifecycle(
 	});
 }
 
+export function readApprovedAdapterCandidate(
+	candidateInput: unknown,
+	lifecycleInput: unknown,
+	expectedReviewBinding: string,
+	artifactSha256: string,
+): AdapterCandidate | undefined {
+	const candidate = parseCandidate(candidateInput);
+	const lifecycle = parseLifecycle(candidate, lifecycleInput);
+	return lifecycle.state === "ENABLED" &&
+		lifecycle.reviewBindingSha256 === expectedReviewBinding &&
+		candidate.source.artifactSha256 === artifactSha256
+		? candidate
+		: undefined;
+}
+
 function parseCandidate(input: unknown): AdapterCandidate {
 	if (
 		!isExactObject(input, [

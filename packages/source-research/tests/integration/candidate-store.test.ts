@@ -13,6 +13,9 @@ describe.runIf(process.env.CHOICEMIND_TEST_DATABASE_URL !== undefined)(
 				const original = await store.record(input);
 				const id = original.candidate.candidateId;
 				const binding = original.lifecycle.reviewBindingSha256;
+				expect(
+					await store.readApproved(id, binding, input.source.artifactSha256),
+				).toBeUndefined();
 				const request = randomUUID();
 				const action = {
 					type: "ENABLE",
@@ -26,6 +29,12 @@ describe.runIf(process.env.CHOICEMIND_TEST_DATABASE_URL !== undefined)(
 				]);
 				expect(approved[0]).toEqual(approved[1]);
 				expect(approved[0]?.events).toHaveLength(1);
+				expect(
+					await store.readApproved(id, binding, input.source.artifactSha256),
+				).toEqual(original.candidate);
+				expect(
+					await store.readApproved(id, binding, "f".repeat(64)),
+				).toBeUndefined();
 				expect(
 					await store.transition(id, binding, request, {
 						...action,
@@ -56,6 +65,9 @@ describe.runIf(process.env.CHOICEMIND_TEST_DATABASE_URL !== undefined)(
 					review: { ...input.review, reportSha256: "f".repeat(64) },
 				});
 				expect(newer.lifecycle.state).toBe("AWAITING_APPROVAL");
+				expect(
+					await store.readApproved(id, binding, input.source.artifactSha256),
+				).toBeUndefined();
 				await expect(
 					store.transition(id, binding, request, action),
 				).rejects.toThrow("ADAPTER_CANDIDATE_REVIEW_STALE");
