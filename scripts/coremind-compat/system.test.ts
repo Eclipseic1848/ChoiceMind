@@ -2095,6 +2095,10 @@ describe("CoreMind Git 制品边界", () => {
       choiceMindRoot: root,
       commandTimeoutMs: 50,
       stageTimeouts: {
+        GIT_FETCH: { hardDeadlineMs: 5_000, idleTimeoutMs: 5_000 },
+        VERSION_SYNC: { hardDeadlineMs: 5_000, idleTimeoutMs: 5_000 },
+        BUILD: { hardDeadlineMs: 5_000, idleTimeoutMs: 5_000 },
+        PACK: { hardDeadlineMs: 5_000, idleTimeoutMs: 5_000 },
         NPM_CI: { hardDeadlineMs: 250, idleTimeoutMs: 30 }
       },
       execute: async (request) => {
@@ -2138,6 +2142,7 @@ describe("CoreMind Git 制品边界", () => {
       choiceMindRoot: root,
       commandTimeoutMs: 50,
       stageTimeouts: {
+        GIT_FETCH: { hardDeadlineMs: 5_000, idleTimeoutMs: 5_000 },
         NPM_CI: { hardDeadlineMs: 250, idleTimeoutMs: 30 }
       },
       execute: async (request) => {
@@ -2188,6 +2193,7 @@ describe("CoreMind Git 制品边界", () => {
       choiceMindRoot: root,
       commandTimeoutMs: 50,
       stageTimeouts: {
+        GIT_FETCH: { hardDeadlineMs: 5_000, idleTimeoutMs: 5_000 },
         NPM_CI: { hardDeadlineMs: 80, idleTimeoutMs: 30 }
       },
       execute: async (request) => {
