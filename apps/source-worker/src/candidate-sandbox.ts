@@ -1,6 +1,8 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 
+import { startCandidateSupervisor } from "./candidate-sandbox-guard.js";
+
 const IMAGE =
 	"node@sha256:4f77a690f2f8946ab16fe1e791a3ac0667ae1c3575c3e4d0d4589e9ed5bfaf3d";
 const SLOT = "choicemind-adapter-candidate-slot";
@@ -42,6 +44,9 @@ export async function executeCandidateSandbox(input: {
 	const owner = randomUUID();
 	const deadline = Date.now() + timeoutMs;
 	let containerId: string | undefined;
+	let supervisor:
+		| Awaited<ReturnType<typeof startCandidateSupervisor>>
+		| undefined;
 	try {
 		// 固定槽位让 Docker 原子拒绝跨进程并发；已有槽位绝不抢占或删除。
 		const created = await docker([
@@ -113,6 +118,10 @@ export async function executeCandidateSandbox(input: {
 		)
 			throw new Error("CANDIDATE_POLICY_MISMATCH");
 		if (input.signal?.aborted) throw new Error("CANDIDATE_CANCELLED");
+		supervisor = await startCandidateSupervisor(id, deadline);
+		if (supervisor.signal.aborted)
+			throw new Error("CANDIDATE_SUPERVISION_LOST");
+		if (input.signal?.aborted) throw new Error("CANDIDATE_CANCELLED");
 		const remainingMs = deadline - Date.now();
 		if (remainingMs <= 0) throw new Error("CANDIDATE_DEADLINE_EXPIRED");
 		const execution = await command(
@@ -120,9 +129,14 @@ export async function executeCandidateSandbox(input: {
 			{
 				stdin: artifact,
 				timeoutMs: remainingMs,
-				...(input.signal === undefined ? {} : { signal: input.signal }),
+				signal: AbortSignal.any([
+					supervisor.signal,
+					...(input.signal === undefined ? [] : [input.signal]),
+				]),
 			},
 		);
+		if (supervisor.signal.aborted && Date.now() < deadline)
+			throw new Error("CANDIDATE_SUPERVISION_LOST");
 		let exitCode: number | null = null;
 		if (execution.outcome === "EXITED") {
 			const state = JSON.parse(
@@ -168,6 +182,7 @@ export async function executeCandidateSandbox(input: {
 			if (containerId !== undefined) {
 				await removeContainer(containerId);
 			}
+			supervisor?.stop();
 		} catch {
 			// biome-ignore lint/correctness/noUnsafeFinally: 回收未确认必须覆盖成功结果，不能把残留容器报告为成功。
 			throw new Error("CANDIDATE_CLEANUP_UNCONFIRMED");
@@ -176,9 +191,14 @@ export async function executeCandidateSandbox(input: {
 }
 
 // 启动/恢复入口可重复调用；超时回收不等于候选成功，也不续用遗留输出。
-export async function recoverCandidateSandbox(): Promise<
-	"EMPTY" | "ACTIVE" | "RECOVERED"
-> {
+export async function recoverCandidateSandbox(
+	expectedContainerId?: string,
+): Promise<"EMPTY" | "ACTIVE" | "RECOVERED"> {
+	if (
+		expectedContainerId !== undefined &&
+		!/^[a-f0-9]{64}$/.test(expectedContainerId)
+	)
+		throw new Error("CANDIDATE_INPUT_INVALID");
 	const endpoint = await docker([
 		"context",
 		"inspect",
@@ -194,6 +214,8 @@ export async function recoverCandidateSandbox(): Promise<
 	}
 	const slot = await inspectSlot();
 	if (slot === undefined) return "EMPTY";
+	if (expectedContainerId !== undefined && slot.Id !== expectedContainerId)
+		return "EMPTY";
 	const labels = slot.Config.Labels;
 	const deadline = Number(labels?.[DEADLINE_LABEL]);
 	const createdAt = Date.parse(slot.Created);

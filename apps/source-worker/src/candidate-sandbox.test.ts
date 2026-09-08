@@ -3,7 +3,6 @@ import { createHash, randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { readFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
-import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 
@@ -119,18 +118,6 @@ describe.runIf(process.env.CHOICEMIND_RUN_CANDIDATE_SANDBOX === "1")(
 				{ windowsHide: true, stdio: "ignore" },
 			);
 			const exited = once(child, "exit");
-			const supervisor = spawn(
-				process.execPath,
-				[
-					"--import",
-					"tsx",
-					fileURLToPath(
-						new URL("./candidate-sandbox-supervisor.ts", import.meta.url),
-					),
-				],
-				{ windowsHide: true, stdio: "ignore" },
-			);
-			const supervisorExited = once(supervisor, "exit");
 			const runDocker = (args: string[]) =>
 				promisify(execFile)("docker", ["--context", "desktop-linux", ...args], {
 					windowsHide: true,
@@ -191,19 +178,12 @@ describe.runIf(process.env.CHOICEMIND_RUN_CANDIDATE_SANDBOX === "1")(
 					if (!recovered) await delay(200);
 				}
 				expect(recovered).toBe(true);
-				expect(supervisor.exitCode).toBeNull();
 				ownedId = undefined;
 				expect(await recoverCandidateSandbox()).toBe("EMPTY");
 				expect(
 					(await executeCandidateSandbox(input("1"))).report.exitCode,
 				).toBe(0);
-				await delay(1100);
-				expect(supervisor.exitCode).toBeNull();
-				supervisor.kill("SIGKILL");
-				await supervisorExited;
 			} finally {
-				if (supervisor.exitCode === null && supervisor.signalCode === null)
-					supervisor.kill("SIGKILL");
 				if (child.exitCode === null && child.signalCode === null)
 					child.kill("SIGKILL");
 				// 仅清理带本次随机合成制品摘要且已核验的容器 ID。
