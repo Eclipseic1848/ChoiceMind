@@ -15,6 +15,7 @@ const payload = {
 };
 function setup() {
 	const store = {
+		list: vi.fn(async () => ({ items: [], nextCursor: null })),
 		read: vi.fn(async () => undefined),
 		transition: vi.fn(async () => ({ state: "ENABLED" })),
 		record: vi.fn(),
@@ -31,6 +32,45 @@ function setup() {
 	apps.push(app);
 	return { app, store };
 }
+
+it("候选列表只对管理员开放，分页参数有界且不缓存", async () => {
+	const { app, store } = setup();
+	const listUrl = "/api/v1/admin/adapter-candidates";
+	for (const token of [undefined, "user"]) {
+		const response = await app.inject({
+			url: listUrl,
+			...(token ? { headers: { authorization: `Bearer ${token}` } } : {}),
+		});
+		expect(response.statusCode).toBe(token ? 403 : 401);
+	}
+	expect(store.list).not.toHaveBeenCalled();
+	const headers = { authorization: "Bearer admin" };
+	for (const query of [
+		"limit=51",
+		"limit=0",
+		"cursor=0",
+		"cursor=abc",
+		"cursor=9223372036854775808",
+		"actorRole=SUPERADMIN",
+	]) {
+		expect(
+			(await app.inject({ url: `${listUrl}?${query}`, headers })).statusCode,
+		).toBe(422);
+	}
+	expect(store.list).not.toHaveBeenCalled();
+	const response = await app.inject({
+		url: `${listUrl}?limit=2&cursor=123`,
+		headers,
+	});
+	expect(response.statusCode).toBe(200);
+	expect(response.headers["cache-control"]).toBe("no-store");
+	expect(response.json()).toEqual({ items: [], nextCursor: null });
+	expect(store.list).toHaveBeenCalledWith({ limit: 2, cursor: "123" });
+	store.list.mockRejectedValueOnce(new Error("synthetic-db-secret"));
+	const failed = await app.inject({ url: listUrl, headers });
+	expect(failed.statusCode).toBe(503);
+	expect(failed.body).not.toContain("synthetic-db-secret");
+});
 it("未登录和普通用户不能读写候选", async () => {
 	const { app, store } = setup();
 	for (const method of ["GET", "POST"] as const)

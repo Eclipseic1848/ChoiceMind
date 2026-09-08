@@ -6,6 +6,47 @@ import { openPostgresCandidateStore } from "../../src/candidate-store.js";
 describe.runIf(process.env.CHOICEMIND_TEST_DATABASE_URL !== undefined)(
 	"候选报告与审批持久化",
 	() => {
+		it("候选列表分页只取最新报告，重开后稳定且拒绝越界游标", async () => {
+			const url = process.env.CHOICEMIND_TEST_DATABASE_URL ?? "";
+			let store = await openPostgresCandidateStore(url);
+			try {
+				const first = candidateInput();
+				await store.record(first);
+				const second = await store.record(candidateInput());
+				const third = await store.record(candidateInput());
+				const remaining = [second, third];
+				for (let index = 0; index < 10; index++)
+					remaining.push(await store.record(candidateInput()));
+				const newest = await store.record({
+					...first,
+					review: { ...first.review, reportSha256: "f".repeat(64) },
+				});
+				const page = await store.list({ limit: 2 });
+				expect(page.items).toEqual([newest, remaining.at(-1)]);
+				expect(page.nextCursor).toMatch(/^[1-9][0-9]*$/);
+				await store.close();
+				store = await openPostgresCandidateStore(url);
+				expect(await store.list({ limit: 2 })).toEqual(page);
+				if (!page.nextCursor) throw new Error("CURSOR_MISSING");
+				const next = await store.list({ limit: 50, cursor: page.nextCursor });
+				expect(next.items).toEqual(remaining.slice(0, -1).reverse());
+				expect(
+					next.items.some(
+						(item) =>
+							item.candidate.candidateId === newest.candidate.candidateId,
+					),
+				).toBe(false);
+				for (const cursor of ["0", "abc", "9223372036854775808"])
+					await expect(store.list({ cursor })).rejects.toThrow(
+						"ADAPTER_CANDIDATE_REQUEST_INVALID",
+					);
+				await expect(store.list({ limit: 51 })).rejects.toThrow(
+					"ADAPTER_CANDIDATE_REQUEST_INVALID",
+				);
+			} finally {
+				await store.close();
+			}
+		});
 		it("批准不替代制品存在与完整性检查，损坏制品不能被静默覆盖", async () => {
 			const databaseUrl = process.env.CHOICEMIND_TEST_DATABASE_URL ?? "";
 			const store = await openPostgresCandidateStore(databaseUrl);

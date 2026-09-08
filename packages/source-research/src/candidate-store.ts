@@ -60,6 +60,36 @@ export async function openPostgresCandidateStore(databaseUrl: string) {
 	}
 
 	return {
+		async list(input: { limit?: number; cursor?: string } = {}) {
+			const limit = input.limit ?? 20;
+			if (
+				!Number.isInteger(limit) ||
+				limit < 1 ||
+				limit > 50 ||
+				(input.cursor !== undefined &&
+					(!/^[1-9][0-9]{0,18}$/.test(input.cursor) ||
+						BigInt(input.cursor) > 9223372036854775807n))
+			)
+				throw new Error("ADAPTER_CANDIDATE_REQUEST_INVALID");
+			// 先选各候选最新报告再分页，不能把旧报告当成下一页的新候选。
+			const result = await pool.query<StoredCandidate & { revision: string }>(
+				`SELECT candidate,lifecycle,revision::text FROM (
+				 SELECT DISTINCT ON (candidate_id) candidate,lifecycle,revision
+				 FROM source_research_candidate_reviews ORDER BY candidate_id,revision DESC
+				) AS latest WHERE ($1::bigint IS NULL OR revision < $1::bigint)
+				ORDER BY latest.revision DESC LIMIT $2`,
+				[input.cursor ?? null, limit + 1],
+			);
+			const rows = result.rows.slice(0, limit);
+			return {
+				items: rows.map(({ candidate, lifecycle }) => ({
+					candidate,
+					lifecycle,
+				})),
+				nextCursor:
+					result.rows.length > limit ? (rows.at(-1)?.revision ?? null) : null,
+			};
+		},
 		// 仅存公开候选制品，不接受用户文件或秘密；存入不代表审查通过。
 		async saveArtifact(input: Uint8Array): Promise<string> {
 			if (
