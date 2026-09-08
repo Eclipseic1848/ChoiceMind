@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createCandidateResearchWorker } from "./candidate-research-worker.js";
+import { createCandidateReviewWorker } from "./candidate-wheel-review.js";
 
 type ExecutionInput = Parameters<
 	Parameters<typeof createCandidateResearchWorker>[0]["execute"]
@@ -34,6 +35,19 @@ afterEach(() => {
 });
 
 describe("候选研究消费者", () => {
+	it("生产审查入口只领取已支持类型，停止后不再领取", async () => {
+		const queue = requests();
+		queue.claimNext.mockReset().mockResolvedValue(undefined);
+		const store = { record: vi.fn(), saveArtifact: vi.fn() };
+		const worker = createCandidateReviewWorker(queue, store);
+		expect(await worker.runOnce()).toEqual({ claimed: 0, completed: 0 });
+		expect(queue.claimNext).toHaveBeenCalledWith(30_000, ["PYPI"]);
+		await worker.drain();
+		expect(await worker.runOnce()).toEqual({ claimed: 0, completed: 0 });
+		expect(queue.claimNext).toHaveBeenCalledTimes(1);
+		expect(store.record).not.toHaveBeenCalled();
+		expect(store.saveArtifact).not.toHaveBeenCalled();
+	});
 	it.each([true, false])(
 		"提案按宿主持有的token提交，成功记录=%s才完成模型阶段",
 		async (recorded) => {
