@@ -8,16 +8,1112 @@ import type { PublicWebEvidenceV1 } from "@choicemind/contracts/decision/v1";
 import { describe, expect, expectTypeOf, it, vi } from "vitest";
 
 import {
+  createEvidenceModule,
   createEvidenceIngestionService,
   createFileRawEvidenceObjectStore,
   createHttpDataSourceConnector,
   createLocalEvidenceRetrievalService,
   createPublicWebEvidenceGenerator,
   type DataSourceConnector,
+  type ResearchEvidenceMaterial,
   type DataSourceResponseMetadata
 } from "./index.js";
 
 describe("Evidence ingestion", () => {
+  it("loads an owned Source Research Batch through its stable Interface", async () => {
+    const readEvidenceCandidates = vi.fn(async () => ({
+      batchId: "batch-a",
+      ownerUserId: "user-a",
+      decisionTaskId: "task-a",
+      results: [{ resultKey: "jd:owned", material: researchMaterial() }]
+    }));
+    const nextEvidenceId = vi.fn(() => "unstable-evidence-id");
+    const nextLinkId = vi.fn(() => "unstable-link-id");
+    const module = createEvidenceModule({
+      nextEvidenceId,
+      nextGapId: () => "gap-unused",
+      nextLinkId,
+      sourceResearch: { readEvidenceCandidates }
+    });
+
+    const command = {
+      batchId: "batch-a",
+      ownerUserId: "user-a",
+      decisionTaskId: "task-a",
+      claimIds: ["claim-price"]
+    } as const;
+    const first = await module.normalizeResearchBatchById(command);
+    const second = await module.normalizeResearchBatchById(command);
+    expect(second).toEqual(first);
+    expect(first).toMatchObject({
+      evidence: [
+        {
+          evidenceId: expect.stringMatching(/^evidence-[0-9a-f]{32}$/),
+          ownerUserId: "user-a"
+        }
+      ],
+      claimEvidenceLinks: [
+        {
+          linkId: expect.stringMatching(/^claim-evidence-link-[0-9a-f]{32}$/),
+          claimId: "claim-price"
+        }
+      ],
+      gaps: []
+    });
+    expect(first.claimEvidenceLinks[0]?.evidenceId).toBe(first.evidence[0]?.evidenceId);
+    expect(nextEvidenceId).not.toHaveBeenCalled();
+    expect(nextLinkId).not.toHaveBeenCalled();
+    expect(readEvidenceCandidates).toHaveBeenCalledWith({
+      batchId: "batch-a",
+      ownerUserId: "user-a"
+    });
+  });
+
+  it("indexes normalized Live Platform Evidence through the existing retrieval seam", async () => {
+    const index = vi.fn(async () => ({
+      status: "INDEXED" as const,
+      evidenceId: "evidence-live"
+    }));
+    const module = createEvidenceModule({
+      nextEvidenceId: () => "evidence-live",
+      nextGapId: () => "gap-unused",
+      nextLinkId: () => "link-live",
+      retrieval: {
+        index,
+        search: async () => ({ status: "RETRIEVED" as const, results: [] })
+      }
+    });
+    const normalized = module.normalizeResearchBatch({
+      ownerUserId: "user-a",
+      decisionTaskId: "task-a",
+      claimIds: ["claim-price"],
+      batch: {
+        ownerUserId: "user-a",
+        decisionTaskId: "task-a",
+        results: [{ resultKey: "jd:index", material: researchMaterial() }]
+      }
+    });
+
+    await expect(
+      module.indexEvidence({ ownerUserId: "user-a", evidence: normalized.evidence })
+    ).resolves.toEqual({ indexed: 1, skipped: 0, gaps: [] });
+    expect(index).toHaveBeenCalledWith({
+      ownerUserId: "user-a",
+      evidence: expect.objectContaining({
+        contractType: "evidence",
+        contractVersion: "1.0",
+        evidenceId: "evidence-live",
+        decisionTaskId: "task-a",
+        synthetic: false,
+        source: {
+          sourceKind: "PUBLIC_WEB",
+          sourceId: "jd",
+          title: "京东商品详情",
+          url: "https://item.jd.com/1001.html"
+        }
+      })
+    });
+  });
+
+  it("retrieves ranked Evidence as a bounded CoreMind projection", async () => {
+    const search = vi.fn(async () => ({
+      status: "RETRIEVED" as const,
+      results: [
+        { evidenceId: "evidence-2", score: 0.98 },
+        { evidenceId: "evidence-from-another-task", score: 0.97 }
+      ]
+    }));
+    let evidenceSequence = 0;
+    let linkSequence = 0;
+    const module = createEvidenceModule({
+      nextEvidenceId: () => `evidence-${++evidenceSequence}`,
+      nextGapId: () => "gap-unused",
+      nextLinkId: () => `link-${++linkSequence}`,
+      projectionLimits: { maxEvidence: 2, maxExcerptCharacters: 10 },
+      retrieval: {
+        index: async ({ evidence }) => ({
+          status: "INDEXED" as const,
+          evidenceId: evidence.evidenceId
+        }),
+        search
+      }
+    });
+    const normalized = module.normalizeResearchBatch({
+      ownerUserId: "user-a",
+      decisionTaskId: "task-a",
+      claimIds: ["claim-price"],
+      batch: {
+        ownerUserId: "user-a",
+        decisionTaskId: "task-a",
+        results: [
+          { resultKey: "jd:first", material: researchMaterial({ excerpt: "第一条证据" }) },
+          { resultKey: "jd:second", material: researchMaterial({ excerpt: "第二条证据" }) }
+        ]
+      }
+    });
+
+    await expect(
+      module.retrieveForCoreMind({
+        ownerUserId: "user-a",
+        decisionTaskId: "task-a",
+        decisionValidFrom: "2026-08-28T12:00:00.000Z",
+        query: "当前价格",
+        topK: 2,
+        evidence: normalized.evidence,
+        claimEvidenceLinks: normalized.claimEvidenceLinks
+      })
+    ).resolves.toMatchObject({
+      status: "RETRIEVED",
+      projection: {
+        items: [{ evidenceId: "evidence-2", excerpt: "第二条证据" }],
+        hasMore: false
+      }
+    });
+    expect(search).toHaveBeenCalledWith({
+      ownerUserId: "user-a",
+      decisionTaskId: "task-a",
+      query: "当前价格",
+      topK: 2
+    });
+  });
+
+  it("normalizes a Source Research result into locatable Evidence and Claim links", () => {
+    const module = createEvidenceModule({
+      nextEvidenceId: () => "evidence-a",
+      nextGapId: () => "gap-unused",
+      nextLinkId: () => "link-a"
+    });
+
+    expect(
+      module.normalizeResearchBatch({
+        ownerUserId: "user-a",
+        decisionTaskId: "task-a",
+        claimIds: ["claim-price"],
+        batch: {
+          ownerUserId: "user-a",
+          decisionTaskId: "task-a",
+          results: [
+            {
+              resultKey: "jd:item-1001:offer",
+              material: {
+                capturedAt: "2026-08-28T10:00:00.000Z",
+                validUntil: "2026-08-29T10:00:00.000Z",
+                excerpt: "京东自营当前价格为 2999 元",
+                locator: { section: "商品价格", field: "当前售价" },
+                parserVersion: "fixture-adapter@1",
+                rawArtifact: {
+                  algorithm: "sha256",
+                  digest: "a".repeat(64),
+                  objectKey: `source-artifacts/sha256/${"a".repeat(64)}`,
+                  lifecycle: "TRANSIENT_PLATFORM",
+                  expiresAt: "2026-09-04T10:00:00.000Z"
+                },
+                source: {
+                  sourceType: "LIVE_PLATFORM",
+                  sourceId: "jd",
+                  platform: "JD",
+                  title: "京东商品详情",
+                  url: "https://item.jd.com/1001.html",
+                  contentId: "1001"
+                },
+                sourceRole: "OFFER",
+                subject: {
+                  subjectType: "OFFER",
+                  candidateId: "candidate-monitor-a",
+                  offerId: "offer-jd-1001",
+                  channel: "JD",
+                  sku: "1001"
+                },
+                claimLinks: [{ claimId: "claim-price", direction: "SUPPORTS" }]
+              }
+            }
+          ]
+        }
+      })
+    ).toEqual({
+      evidence: [
+        {
+          evidenceId: "evidence-a",
+          ownerUserId: "user-a",
+          decisionTaskId: "task-a",
+          capturedAt: "2026-08-28T10:00:00.000Z",
+          validUntil: "2026-08-29T10:00:00.000Z",
+          excerpt: "京东自营当前价格为 2999 元",
+          excerptHash: {
+            algorithm: "sha256",
+            digest: createHash("sha256")
+              .update("京东自营当前价格为 2999 元", "utf8")
+              .digest("hex")
+          },
+          locator: { section: "商品价格", field: "当前售价" },
+          parserVersion: "fixture-adapter@1",
+          rawArtifact: {
+            algorithm: "sha256",
+            digest: "a".repeat(64),
+            objectKey: `source-artifacts/sha256/${"a".repeat(64)}`,
+            lifecycle: "TRANSIENT_PLATFORM",
+            expiresAt: "2026-09-04T10:00:00.000Z"
+          },
+          source: {
+            sourceType: "LIVE_PLATFORM",
+            sourceId: "jd",
+            platform: "JD",
+            title: "京东商品详情",
+            url: "https://item.jd.com/1001.html",
+            contentId: "1001"
+          },
+          sourceRole: "OFFER",
+          subject: {
+            subjectType: "OFFER",
+            candidateId: "candidate-monitor-a",
+            offerId: "offer-jd-1001",
+            channel: "JD",
+            sku: "1001"
+          }
+        }
+      ],
+      claimEvidenceLinks: [
+        {
+          linkId: "link-a",
+          ownerUserId: "user-a",
+          decisionTaskId: "task-a",
+          claimId: "claim-price",
+          evidenceId: "evidence-a",
+          direction: "SUPPORTS"
+        }
+      ],
+      gaps: []
+    });
+  });
+
+  it("rejects a Source Research batch from another User before generating Evidence", () => {
+    const nextEvidenceId = vi.fn(() => "evidence-never");
+    const nextGapId = vi.fn(() => "gap-never");
+    const nextLinkId = vi.fn(() => "link-never");
+    const module = createEvidenceModule({ nextEvidenceId, nextGapId, nextLinkId });
+
+    expect(() =>
+      module.normalizeResearchBatch({
+        ownerUserId: "user-a",
+        decisionTaskId: "task-a",
+        claimIds: ["claim-a"],
+        batch: {
+          ownerUserId: "user-b",
+          decisionTaskId: "task-a",
+          results: []
+        }
+      })
+    ).toThrow("EVIDENCE_BATCH_SCOPE_MISMATCH");
+    expect(nextEvidenceId).not.toHaveBeenCalled();
+    expect(nextGapId).not.toHaveBeenCalled();
+    expect(nextLinkId).not.toHaveBeenCalled();
+  });
+
+  it("turns Source Research material without a Locator into an Evidence Gap", () => {
+    const nextEvidenceId = vi.fn(() => "evidence-never");
+    const nextLinkId = vi.fn(() => "link-never");
+    const module = createEvidenceModule({
+      nextEvidenceId,
+      nextGapId: () => "gap-invalid-material",
+      nextLinkId
+    });
+
+    expect(
+      module.normalizeResearchBatch({
+        ownerUserId: "user-a",
+        decisionTaskId: "task-a",
+        claimIds: ["claim-price"],
+        batch: {
+          ownerUserId: "user-a",
+          decisionTaskId: "task-a",
+          results: [
+            {
+              resultKey: "jd:item-1001:offer",
+              material: {
+                capturedAt: "2026-08-28T10:00:00.000Z",
+                validUntil: "2026-08-29T10:00:00.000Z",
+                excerpt: "京东自营当前价格为 2999 元",
+                parserVersion: "fixture-adapter@1",
+                rawArtifact: {
+                  algorithm: "sha256",
+                  digest: "a".repeat(64),
+                  objectKey: `source-artifacts/sha256/${"a".repeat(64)}`,
+                  lifecycle: "TRANSIENT_PLATFORM",
+                  expiresAt: "2026-09-04T10:00:00.000Z"
+                },
+                source: {
+                  sourceType: "LIVE_PLATFORM",
+                  sourceId: "jd",
+                  platform: "JD",
+                  title: "京东商品详情",
+                  url: "https://item.jd.com/1001.html"
+                },
+                sourceRole: "OFFER",
+                subject: {
+                  subjectType: "OFFER",
+                  candidateId: "candidate-monitor-a",
+                  offerId: "offer-jd-1001",
+                  channel: "JD",
+                  sku: "1001"
+                },
+                claimLinks: [{ claimId: "claim-price", direction: "SUPPORTS" }]
+              } as never
+            }
+          ]
+        }
+      })
+    ).toEqual({
+      evidence: [],
+      claimEvidenceLinks: [],
+      gaps: [
+        {
+          gapId: "gap-invalid-material",
+          code: "EVIDENCE_MATERIAL_INVALID",
+          decisionTaskId: "task-a",
+          resultKey: "jd:item-1001:offer",
+          critical: true
+        }
+      ]
+    });
+    expect(nextEvidenceId).not.toHaveBeenCalled();
+    expect(nextLinkId).not.toHaveBeenCalled();
+  });
+
+  it("turns an untrusted non-object Adapter result into an Evidence Gap", () => {
+    const module = createEvidenceModule({
+      nextEvidenceId: () => "evidence-never",
+      nextGapId: () => "gap-untrusted-material",
+      nextLinkId: () => "link-never"
+    });
+
+    expect(() =>
+      module.normalizeResearchBatch({
+        ownerUserId: "user-a",
+        decisionTaskId: "task-a",
+        claimIds: ["claim-price"],
+        batch: {
+          ownerUserId: "user-a",
+          decisionTaskId: "task-a",
+          results: [{ resultKey: "adapter:invalid", material: null as never }]
+        }
+      })
+    ).not.toThrow();
+    expect(
+      module.normalizeResearchBatch({
+        ownerUserId: "user-a",
+        decisionTaskId: "task-a",
+        claimIds: ["claim-price"],
+        batch: {
+          ownerUserId: "user-a",
+          decisionTaskId: "task-a",
+          results: [{ resultKey: "adapter:invalid", material: null as never }]
+        }
+      })
+    ).toEqual({
+      evidence: [],
+      claimEvidenceLinks: [],
+      gaps: [
+        {
+          gapId: "gap-untrusted-material",
+          code: "EVIDENCE_MATERIAL_INVALID",
+          decisionTaskId: "task-a",
+          resultKey: "adapter:invalid",
+          critical: true
+        }
+      ]
+    });
+  });
+
+  it("rejects Source Research material linked to an unknown Claim", () => {
+    const nextEvidenceId = vi.fn(() => "evidence-never");
+    const nextLinkId = vi.fn(() => "link-never");
+    const module = createEvidenceModule({
+      nextEvidenceId,
+      nextGapId: () => "gap-claim-link",
+      nextLinkId
+    });
+
+    expect(
+      module.normalizeResearchBatch({
+        ownerUserId: "user-a",
+        decisionTaskId: "task-a",
+        claimIds: ["claim-price"],
+        batch: {
+          ownerUserId: "user-a",
+          decisionTaskId: "task-a",
+          results: [
+            {
+              resultKey: "jd:item-1001:offer",
+              material: researchMaterial({
+                claimLinks: [{ claimId: "claim-from-another-task", direction: "SUPPORTS" }]
+              })
+            }
+          ]
+        }
+      })
+    ).toEqual({
+      evidence: [],
+      claimEvidenceLinks: [],
+      gaps: [
+        {
+          gapId: "gap-claim-link",
+          code: "CLAIM_LINK_INVALID",
+          decisionTaskId: "task-a",
+          resultKey: "jd:item-1001:offer",
+          critical: true
+        }
+      ]
+    });
+    expect(nextEvidenceId).not.toHaveBeenCalled();
+    expect(nextLinkId).not.toHaveBeenCalled();
+  });
+
+  it("projects only bounded Evidence excerpts to CoreMind without raw artifacts", () => {
+    let evidenceSequence = 0;
+    let linkSequence = 0;
+    const module = createEvidenceModule({
+      nextEvidenceId: () => `evidence-${++evidenceSequence}`,
+      nextGapId: () => "gap-unused",
+      nextLinkId: () => `link-${++linkSequence}`,
+      projectionLimits: { maxEvidence: 1, maxExcerptCharacters: 8 }
+    });
+    const normalized = module.normalizeResearchBatch({
+      ownerUserId: "user-a",
+      decisionTaskId: "task-a",
+      claimIds: ["claim-price"],
+      batch: {
+        ownerUserId: "user-a",
+        decisionTaskId: "task-a",
+        results: [
+          {
+            resultKey: "jd:first",
+            material: researchMaterial({ excerpt: "1234567890ABCDEF" })
+          },
+          {
+            resultKey: "jd:second",
+            material: researchMaterial({ excerpt: "第二条不应进入本次投影" })
+          }
+        ]
+      }
+    });
+
+    const projection = module.projectForCoreMind({
+      ownerUserId: "user-a",
+      decisionTaskId: "task-a",
+      decisionValidFrom: "2026-08-28T12:00:00.000Z",
+      evidence: normalized.evidence,
+      claimEvidenceLinks: normalized.claimEvidenceLinks
+    });
+
+    expect(projection).toEqual({
+      items: [
+        {
+          evidenceId: "evidence-1",
+          capturedAt: "2026-08-28T10:00:00.000Z",
+          validUntil: "2026-08-29T10:00:00.000Z",
+          excerpt: "12345678",
+          excerptTruncated: true,
+          locator: { section: "商品价格", field: "当前售价" },
+          source: {
+            sourceType: "LIVE_PLATFORM",
+            sourceId: "jd",
+            platform: "JD",
+            title: "京东商品详情",
+            url: "https://item.jd.com/1001.html",
+            contentId: "1001"
+          },
+          sourceRole: "OFFER",
+          subject: {
+            subjectType: "OFFER",
+            candidateId: "candidate-monitor-a",
+            offerId: "offer-jd-1001",
+            channel: "JD",
+            sku: "1001"
+          },
+          claimLinks: [{ claimId: "claim-price", direction: "SUPPORTS" }]
+        }
+      ],
+      hasMore: true
+    });
+    expect(JSON.stringify(projection)).not.toContain("source-artifacts/");
+    expect(JSON.stringify(projection)).not.toContain("rawArtifact");
+  });
+
+  it("strips untrusted nested fields before creating a CoreMind projection", () => {
+    const module = createEvidenceModule({
+      nextEvidenceId: () => "evidence-sanitized",
+      nextGapId: () => "gap-unused",
+      nextLinkId: () => "link-sanitized"
+    });
+    const material = researchMaterial();
+    const normalized = module.normalizeResearchBatch({
+      ownerUserId: "user-a",
+      decisionTaskId: "task-a",
+      claimIds: ["claim-price"],
+      batch: {
+        ownerUserId: "user-a",
+        decisionTaskId: "task-a",
+        results: [
+          {
+            resultKey: "jd:untrusted-extra-fields",
+            material: {
+              ...material,
+              locator: { ...material.locator, fullPage: "不得进入模型" },
+              source: { ...material.source, cookie: "session-secret" },
+              subject: { ...material.subject, rawComments: "不得进入模型" }
+            }
+          }
+        ]
+      }
+    });
+
+    const projection = module.projectForCoreMind({
+      ownerUserId: "user-a",
+      decisionTaskId: "task-a",
+      decisionValidFrom: "2026-08-28T12:00:00.000Z",
+      evidence: normalized.evidence,
+      claimEvidenceLinks: normalized.claimEvidenceLinks
+    });
+    const serialized = JSON.stringify(projection);
+    expect(serialized).not.toContain("fullPage");
+    expect(serialized).not.toContain("session-secret");
+    expect(serialized).not.toContain("rawComments");
+  });
+
+  it.each([
+    "https://user:synthetic-secret@brand.example/product",
+    "https://user@brand.example/product",
+    "https://:synthetic-secret@brand.example/product"
+  ])("rejects credential-bearing Evidence source URLs: %s", (url) => {
+    const module = createEvidenceModule({
+      nextEvidenceId: () => "evidence-never",
+      nextGapId: () => "gap-invalid-source",
+      nextLinkId: () => "link-never"
+    });
+    const material = researchMaterial();
+    const normalized = module.normalizeResearchBatch({
+      ownerUserId: "user-a",
+      decisionTaskId: "task-a",
+      claimIds: ["claim-price"],
+      batch: {
+        ownerUserId: "user-a",
+        decisionTaskId: "task-a",
+        results: [{
+          resultKey: "source:credentials",
+          material: { ...material, source: { ...material.source, url } }
+        }]
+      }
+    });
+    expect(normalized).toMatchObject({
+      evidence: [],
+      claimEvidenceLinks: [],
+      gaps: [{ code: "EVIDENCE_MATERIAL_INVALID" }]
+    });
+    expect(JSON.stringify(normalized)).not.toContain("synthetic-secret");
+  });
+
+  it("enforces hard CoreMind limits even when configured limits are larger", () => {
+    let evidenceSequence = 0;
+    let linkSequence = 0;
+    const module = createEvidenceModule({
+      nextEvidenceId: () => `evidence-hard-limit-${++evidenceSequence}`,
+      nextGapId: () => "gap-unused",
+      nextLinkId: () => `link-hard-limit-${++linkSequence}`,
+      projectionLimits: { maxEvidence: 100, maxExcerptCharacters: 5_000 }
+    });
+    const normalized = module.normalizeResearchBatch({
+      ownerUserId: "user-a",
+      decisionTaskId: "task-a",
+      claimIds: ["claim-price"],
+      batch: {
+        ownerUserId: "user-a",
+        decisionTaskId: "task-a",
+        results: Array.from({ length: 21 }, (_, index) => ({
+          resultKey: `jd:hard-limit:${index}`,
+          material: researchMaterial({ excerpt: "x".repeat(2_001) })
+        }))
+      }
+    });
+
+    const projection = module.projectForCoreMind({
+      ownerUserId: "user-a",
+      decisionTaskId: "task-a",
+      decisionValidFrom: "2026-08-28T12:00:00.000Z",
+      evidence: normalized.evidence,
+      claimEvidenceLinks: normalized.claimEvidenceLinks
+    });
+    expect(projection.items).toHaveLength(20);
+    expect(projection.items.every((item) => item.excerpt.length === 2_000)).toBe(true);
+    expect(projection.hasMore).toBe(true);
+  });
+
+  it("rejects oversized excerpts instead of treating full payloads as Evidence", () => {
+    const module = createEvidenceModule({
+      nextEvidenceId: () => "evidence-never",
+      nextGapId: () => "gap-oversized-excerpt",
+      nextLinkId: () => "link-never"
+    });
+
+    expect(
+      module.normalizeResearchBatch({
+        ownerUserId: "user-a",
+        decisionTaskId: "task-a",
+        claimIds: ["claim-price"],
+        batch: {
+          ownerUserId: "user-a",
+          decisionTaskId: "task-a",
+          results: [
+            {
+              resultKey: "jd:full-page",
+              material: researchMaterial({ excerpt: "x".repeat(8_001) })
+            }
+          ]
+        }
+      })
+    ).toEqual({
+      evidence: [],
+      claimEvidenceLinks: [],
+      gaps: [
+        {
+          gapId: "gap-oversized-excerpt",
+          code: "EVIDENCE_MATERIAL_INVALID",
+          decisionTaskId: "task-a",
+          resultKey: "jd:full-page",
+          critical: true
+        }
+      ]
+    });
+  });
+
+  it("rejects projection inputs that would expose orphan Evidence", () => {
+    const module = createEvidenceModule({
+      nextEvidenceId: () => "evidence-linked",
+      nextGapId: () => "gap-unused",
+      nextLinkId: () => "link-linked"
+    });
+    const normalized = module.normalizeResearchBatch({
+      ownerUserId: "user-a",
+      decisionTaskId: "task-a",
+      claimIds: ["claim-price"],
+      batch: {
+        ownerUserId: "user-a",
+        decisionTaskId: "task-a",
+        results: [{ resultKey: "jd:linked", material: researchMaterial() }]
+      }
+    });
+
+    expect(() =>
+      module.projectForCoreMind({
+        ownerUserId: "user-a",
+        decisionTaskId: "task-a",
+        decisionValidFrom: "2026-08-28T12:00:00.000Z",
+        evidence: normalized.evidence,
+        claimEvidenceLinks: []
+      })
+    ).toThrowError("EVIDENCE_PROJECTION_LINK_INVALID");
+  });
+
+  it("expands one owned Evidence excerpt without exposing its raw artifact", () => {
+    const module = createEvidenceModule({
+      nextEvidenceId: () => "evidence-expand",
+      nextGapId: () => "gap-unused",
+      nextLinkId: () => "link-expand",
+      projectionLimits: { maxEvidence: 1, maxExcerptCharacters: 8 }
+    });
+    const normalized = module.normalizeResearchBatch({
+      ownerUserId: "user-a",
+      decisionTaskId: "task-a",
+      claimIds: ["claim-price"],
+      batch: {
+        ownerUserId: "user-a",
+        decisionTaskId: "task-a",
+        results: [
+          {
+            resultKey: "jd:expand",
+            material: researchMaterial({ excerpt: "这是完整但仍然有界的证据短摘录" })
+          }
+        ]
+      }
+    });
+
+    const expanded = module.expandEvidence({
+      ownerUserId: "user-a",
+      decisionTaskId: "task-a",
+      evidenceId: "evidence-expand",
+      evidence: normalized.evidence
+    });
+    expect(expanded).toMatchObject({
+      evidenceId: "evidence-expand",
+      excerpt: "这是完整但仍然有界的证据短摘录",
+      locator: { section: "商品价格", field: "当前售价" }
+    });
+    expect(JSON.stringify(expanded)).not.toContain("rawArtifact");
+    expect(
+      module.expandEvidence({
+        ownerUserId: "user-b",
+        decisionTaskId: "task-a",
+        evidenceId: "evidence-expand",
+        evidence: normalized.evidence
+      })
+    ).toBeUndefined();
+  });
+
+  it("turns an inverted Evidence validity interval into a Critical Gap", () => {
+    const nextEvidenceId = vi.fn(() => "evidence-never");
+    const module = createEvidenceModule({
+      nextEvidenceId,
+      nextGapId: () => "gap-invalid-time",
+      nextLinkId: () => "link-never"
+    });
+
+    expect(
+      module.normalizeResearchBatch({
+        ownerUserId: "user-a",
+        decisionTaskId: "task-a",
+        claimIds: ["claim-price"],
+        batch: {
+          ownerUserId: "user-a",
+          decisionTaskId: "task-a",
+          results: [
+            {
+              resultKey: "jd:invalid-time",
+              material: researchMaterial({
+                capturedAt: "2026-08-29T10:00:00.000Z",
+                validUntil: "2026-08-28T10:00:00.000Z"
+              })
+            }
+          ]
+        }
+      })
+    ).toEqual({
+      evidence: [],
+      claimEvidenceLinks: [],
+      gaps: [
+        {
+          gapId: "gap-invalid-time",
+          code: "EVIDENCE_TIME_INVALID",
+          decisionTaskId: "task-a",
+          resultKey: "jd:invalid-time",
+          critical: true
+        }
+      ]
+    });
+    expect(nextEvidenceId).not.toHaveBeenCalled();
+  });
+
+  it("rejects a Live Platform artifact whose retention exceeds seven days", () => {
+    const module = createEvidenceModule({
+      nextEvidenceId: () => "evidence-never",
+      nextGapId: () => "gap-artifact-lifecycle",
+      nextLinkId: () => "link-never"
+    });
+
+    expect(
+      module.normalizeResearchBatch({
+        ownerUserId: "user-a",
+        decisionTaskId: "task-a",
+        claimIds: ["claim-price"],
+        batch: {
+          ownerUserId: "user-a",
+          decisionTaskId: "task-a",
+          results: [
+            {
+              resultKey: "jd:retention-too-long",
+              material: researchMaterial({
+                rawArtifact: {
+                  algorithm: "sha256",
+                  digest: "a".repeat(64),
+                  objectKey: `source-artifacts/sha256/${"a".repeat(64)}`,
+                  lifecycle: "TRANSIENT_PLATFORM",
+                  expiresAt: "2026-09-05T10:00:00.000Z"
+                }
+              })
+            }
+          ]
+        }
+      })
+    ).toEqual({
+      evidence: [],
+      claimEvidenceLinks: [],
+      gaps: [
+        {
+          gapId: "gap-artifact-lifecycle",
+          code: "EVIDENCE_ARTIFACT_LIFECYCLE_INVALID",
+          decisionTaskId: "task-a",
+          resultKey: "jd:retention-too-long",
+          critical: true
+        }
+      ]
+    });
+  });
+
+  it("keeps historical eligibility while excluding Evidence from decisions after retirement", () => {
+    const module = createEvidenceModule({
+      nextEvidenceId: () => "evidence-retired",
+      nextGapId: () => "gap-unused",
+      nextLinkId: () => "link-retired"
+    });
+    const normalized = module.normalizeResearchBatch({
+      ownerUserId: "user-a",
+      decisionTaskId: "task-a",
+      claimIds: ["claim-price"],
+      batch: {
+        ownerUserId: "user-a",
+        decisionTaskId: "task-a",
+        results: [
+          {
+            resultKey: "jd:retired",
+            material: researchMaterial({ validUntil: "2026-09-30T10:00:00.000Z" })
+          }
+        ]
+      }
+    });
+    const retiredEvidence = normalized.evidence.map((item) => ({
+      ...item,
+      retiredAt: "2026-08-29T10:00:00.000Z"
+    }));
+
+    expect(
+      module.projectForCoreMind({
+        ownerUserId: "user-a",
+        decisionTaskId: "task-a",
+        decisionValidFrom: "2026-08-28T12:00:00.000Z",
+        evidence: retiredEvidence,
+        claimEvidenceLinks: normalized.claimEvidenceLinks
+      }).items
+    ).toHaveLength(1);
+    expect(
+      module.projectForCoreMind({
+        ownerUserId: "user-a",
+        decisionTaskId: "task-a",
+        decisionValidFrom: "2026-08-30T12:00:00.000Z",
+        evidence: retiredEvidence,
+        claimEvidenceLinks: normalized.claimEvidenceLinks
+      })
+    ).toEqual({ items: [], hasMore: false });
+  });
+
+  it("does not create orphan Evidence when Source Research supplies no Claim relation", () => {
+    const module = createEvidenceModule({
+      nextEvidenceId: () => "evidence-never",
+      nextGapId: () => "gap-orphan",
+      nextLinkId: () => "link-never"
+    });
+
+    expect(
+      module.normalizeResearchBatch({
+        ownerUserId: "user-a",
+        decisionTaskId: "task-a",
+        claimIds: ["claim-price"],
+        batch: {
+          ownerUserId: "user-a",
+          decisionTaskId: "task-a",
+          results: [
+            {
+              resultKey: "jd:orphan",
+              material: researchMaterial({ claimLinks: [] })
+            }
+          ]
+        }
+      })
+    ).toEqual({
+      evidence: [],
+      claimEvidenceLinks: [],
+      gaps: [
+        {
+          gapId: "gap-orphan",
+          code: "CLAIM_LINK_INVALID",
+          decisionTaskId: "task-a",
+          resultKey: "jd:orphan",
+          critical: true
+        }
+      ]
+    });
+  });
+
+  it("rejects opposite directions for the same Claim and Evidence material", () => {
+    const module = createEvidenceModule({
+      nextEvidenceId: () => "evidence-never",
+      nextGapId: () => "gap-opposite-link",
+      nextLinkId: () => "link-never"
+    });
+
+    expect(
+      module.normalizeResearchBatch({
+        ownerUserId: "user-a",
+        decisionTaskId: "task-a",
+        claimIds: ["claim-price"],
+        batch: {
+          ownerUserId: "user-a",
+          decisionTaskId: "task-a",
+          results: [
+            {
+              resultKey: "jd:ambiguous",
+              material: researchMaterial({
+                claimLinks: [
+                  { claimId: "claim-price", direction: "SUPPORTS" },
+                  { claimId: "claim-price", direction: "REFUTES" }
+                ]
+              })
+            }
+          ]
+        }
+      })
+    ).toEqual({
+      evidence: [],
+      claimEvidenceLinks: [],
+      gaps: [
+        {
+          gapId: "gap-opposite-link",
+          code: "CLAIM_LINK_INVALID",
+          decisionTaskId: "task-a",
+          resultKey: "jd:ambiguous",
+          critical: true
+        }
+      ]
+    });
+  });
+
+  it("preserves conflicting links from separate Evidence for Decision Basis", () => {
+    const evidenceIds = ["evidence-support", "evidence-refute"];
+    const linkIds = ["link-support", "link-refute"];
+    const module = createEvidenceModule({
+      nextEvidenceId: () => evidenceIds.shift() ?? "evidence-unexpected",
+      nextGapId: () => "gap-unexpected",
+      nextLinkId: () => linkIds.shift() ?? "link-unexpected"
+    });
+
+    const normalized = module.normalizeResearchBatch({
+      ownerUserId: "user-a",
+      decisionTaskId: "task-a",
+      claimIds: ["claim-price"],
+      batch: {
+        ownerUserId: "user-a",
+        decisionTaskId: "task-a",
+        results: [
+          {
+            resultKey: "jd:price",
+            material: researchMaterial({
+              excerpt: "京东自营当前价格为 2999 元",
+              claimLinks: [{ claimId: "claim-price", direction: "SUPPORTS" }]
+            })
+          },
+          {
+            resultKey: "smzdm:price-history",
+            material: researchMaterial({
+              excerpt: "历史价格显示 2999 元并非近期低价",
+              claimLinks: [{ claimId: "claim-price", direction: "REFUTES" }]
+            })
+          }
+        ]
+      }
+    });
+
+    expect(normalized.gaps).toEqual([]);
+    expect(normalized.evidence).toHaveLength(2);
+    expect(normalized.claimEvidenceLinks).toEqual([
+      expect.objectContaining({
+        evidenceId: "evidence-support",
+        claimId: "claim-price",
+        direction: "SUPPORTS"
+      }),
+      expect.objectContaining({
+        evidenceId: "evidence-refute",
+        claimId: "claim-price",
+        direction: "REFUTES"
+      })
+    ]);
+  });
+
+  it("normalizes Private File derived material through the same Evidence chain", () => {
+    const module = createEvidenceModule({
+      nextEvidenceId: () => "evidence-private-file",
+      nextGapId: () => "gap-unused",
+      nextLinkId: () => "link-private-file"
+    });
+
+    const normalized = module.normalizeResearchBatch({
+      ownerUserId: "user-a",
+      decisionTaskId: "task-a",
+      claimIds: ["claim-usb-c"],
+      batch: {
+        ownerUserId: "user-a",
+        decisionTaskId: "task-a",
+        results: [
+          {
+            resultKey: "private-file:manual:page-8",
+            material: privateFileMaterial()
+          }
+        ]
+      }
+    });
+
+    expect(normalized.gaps).toEqual([]);
+    expect(normalized.evidence).toMatchObject([
+      {
+        evidenceId: "evidence-private-file",
+        sourceRole: "OFFICIAL",
+        source: {
+          sourceType: "PRIVATE_FILE",
+          sourceId: "private-file-manual",
+          fileId: "file-manual",
+          title: "显示器说明书.pdf",
+          mediaType: "application/pdf"
+        },
+        rawArtifact: {
+          lifecycle: "PRIVATE_FILE"
+        }
+      }
+    ]);
+  });
+
+  it("purges only expired transient artifacts while retaining reviewable Evidence", async () => {
+    const deletedArtifacts: string[] = [];
+    let evidenceSequence = 0;
+    let linkSequence = 0;
+    const module = createEvidenceModule({
+      deleteRawArtifact: async (artifact) => {
+        deletedArtifacts.push(artifact.objectKey);
+      },
+      nextEvidenceId: () => `evidence-${++evidenceSequence}`,
+      nextGapId: () => "gap-unused",
+      nextLinkId: () => `link-${++linkSequence}`
+    });
+    const normalized = module.normalizeResearchBatch({
+      ownerUserId: "user-a",
+      decisionTaskId: "task-a",
+      claimIds: ["claim-price", "claim-usb-c"],
+      batch: {
+        ownerUserId: "user-a",
+        decisionTaskId: "task-a",
+        results: [
+          { resultKey: "jd:expired", material: researchMaterial() },
+          { resultKey: "file:retained", material: privateFileMaterial() }
+        ]
+      }
+    });
+
+    await expect(
+      module.purgeExpiredRawArtifacts({
+        now: "2026-09-05T10:00:00.000Z",
+        ownerUserId: "user-a",
+        evidence: normalized.evidence
+      })
+    ).resolves.toEqual({ deleted: 1 });
+    expect(deletedArtifacts).toEqual([
+      `source-artifacts/sha256/${"a".repeat(64)}`
+    ]);
+    expect(
+      module.projectForCoreMind({
+        ownerUserId: "user-a",
+        decisionTaskId: "task-a",
+        decisionValidFrom: "2026-08-28T12:00:00.000Z",
+        evidence: normalized.evidence,
+        claimEvidenceLinks: normalized.claimEvidenceLinks
+      }).items
+    ).toHaveLength(2);
+  });
+
   it("purges retained public-web bytes after their registered seven-day expiry", async () => {
     const rootDirectory = await mkdtemp(join(tmpdir(), "choicemind-evidence-retention-"));
     try {
@@ -1871,5 +2967,71 @@ function publicEvidence(evidenceId: string, excerpt: string): PublicWebEvidenceV
       digest: rawDigest,
       objectKey: `evidence-raw/sha256/${rawDigest}`
     }
+  };
+}
+
+function researchMaterial(
+  overrides: Partial<ResearchEvidenceMaterial> = {}
+): ResearchEvidenceMaterial {
+  return {
+    capturedAt: "2026-08-28T10:00:00.000Z",
+    validUntil: "2026-08-29T10:00:00.000Z",
+    excerpt: "京东自营当前价格为 2999 元",
+    locator: { section: "商品价格", field: "当前售价" },
+    parserVersion: "fixture-adapter@1",
+    rawArtifact: {
+      algorithm: "sha256",
+      digest: "a".repeat(64),
+      objectKey: `source-artifacts/sha256/${"a".repeat(64)}`,
+      lifecycle: "TRANSIENT_PLATFORM",
+      expiresAt: "2026-09-04T10:00:00.000Z"
+    },
+    source: {
+      sourceType: "LIVE_PLATFORM",
+      sourceId: "jd",
+      platform: "JD",
+      title: "京东商品详情",
+      url: "https://item.jd.com/1001.html",
+      contentId: "1001"
+    },
+    sourceRole: "OFFER",
+    subject: {
+      subjectType: "OFFER",
+      candidateId: "candidate-monitor-a",
+      offerId: "offer-jd-1001",
+      channel: "JD",
+      sku: "1001"
+    },
+    claimLinks: [{ claimId: "claim-price", direction: "SUPPORTS" }],
+    ...overrides
+  };
+}
+
+function privateFileMaterial(): ResearchEvidenceMaterial {
+  return {
+    capturedAt: "2026-08-28T10:00:00.000Z",
+    validUntil: "2027-08-28T10:00:00.000Z",
+    excerpt: "USB-C 接口支持最高 90W 供电",
+    locator: { section: "第 8 页", field: "USB-C 端口" },
+    parserVersion: "mineru@fixture",
+    rawArtifact: {
+      algorithm: "sha256",
+      digest: "b".repeat(64),
+      objectKey: `private-files/sha256/${"b".repeat(64)}`,
+      lifecycle: "PRIVATE_FILE"
+    },
+    source: {
+      sourceType: "PRIVATE_FILE",
+      sourceId: "private-file-manual",
+      fileId: "file-manual",
+      title: "显示器说明书.pdf",
+      mediaType: "application/pdf"
+    },
+    sourceRole: "OFFICIAL",
+    subject: {
+      subjectType: "CANDIDATE",
+      candidateId: "candidate-monitor-a"
+    },
+    claimLinks: [{ claimId: "claim-usb-c", direction: "SUPPORTS" }]
   };
 }

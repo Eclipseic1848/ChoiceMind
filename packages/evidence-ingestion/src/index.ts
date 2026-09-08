@@ -122,6 +122,659 @@ export type ResearchEvidenceMaterial = Readonly<{
   }>[];
 }>;
 
+export type NormalizedEvidence = Omit<ResearchEvidenceMaterial, "claimLinks"> &
+  Readonly<{
+    evidenceId: string;
+    ownerUserId: string;
+    decisionTaskId: string;
+    excerptHash: Readonly<{ algorithm: "sha256"; digest: string }>;
+    retiredAt?: string;
+  }>;
+
+export type NormalizedClaimEvidenceLink = Readonly<{
+  linkId: string;
+  ownerUserId: string;
+  decisionTaskId: string;
+  claimId: string;
+  evidenceId: string;
+  direction: "SUPPORTS" | "REFUTES";
+}>;
+
+const MAX_EVIDENCE_EXCERPT_CHARACTERS = 8_000;
+const MAX_COREMIND_EVIDENCE = 20;
+const MAX_COREMIND_EXCERPT_CHARACTERS = 2_000;
+
+export function createEvidenceModule(options: Readonly<{
+  deleteRawArtifact?: (artifact: EvidenceRawArtifact) => Promise<void>;
+  nextEvidenceId: () => string;
+  nextGapId: () => string;
+  nextLinkId: () => string;
+  projectionLimits?: Readonly<{
+    maxEvidence: number;
+    maxExcerptCharacters: number;
+  }>;
+  sourceResearch?: Readonly<{
+    readEvidenceCandidates(input: Readonly<{
+      batchId: string;
+      ownerUserId: string;
+    }>): Promise<Readonly<{
+      batchId: string;
+      ownerUserId: string;
+      decisionTaskId: string;
+      results: readonly Readonly<{ resultKey: string; material: unknown }>[];
+    }> | undefined>;
+  }>;
+  retrieval?: Readonly<{
+    index(input: Readonly<{
+      ownerUserId: string;
+      evidence: PublicWebEvidenceV1;
+    }>): Promise<
+      | Readonly<{ status: "INDEXED"; evidenceId: string }>
+      | Readonly<{ status: "EVIDENCE_GAP"; gap: unknown }>
+    >;
+    search(input: Readonly<{
+      ownerUserId: string;
+      decisionTaskId: string;
+      query: string;
+      topK: number;
+    }>): Promise<
+      | Readonly<{
+          status: "RETRIEVED";
+          results: readonly Readonly<{ evidenceId: string; score: number }>[];
+        }>
+      | Readonly<{ status: "EVIDENCE_GAP"; gap: unknown }>
+    >;
+  }>;
+}>) {
+  const configuredProjectionLimits = options.projectionLimits ?? {
+    maxEvidence: MAX_COREMIND_EVIDENCE,
+    maxExcerptCharacters: MAX_COREMIND_EXCERPT_CHARACTERS
+  };
+  if (
+    !Number.isSafeInteger(configuredProjectionLimits.maxEvidence) ||
+    configuredProjectionLimits.maxEvidence <= 0 ||
+    !Number.isSafeInteger(configuredProjectionLimits.maxExcerptCharacters) ||
+    configuredProjectionLimits.maxExcerptCharacters <= 0
+  ) {
+    throw new Error("EVIDENCE_PROJECTION_LIMIT_INVALID");
+  }
+  const projectionLimits = {
+    maxEvidence: Math.min(
+      configuredProjectionLimits.maxEvidence,
+      MAX_COREMIND_EVIDENCE
+    ),
+    maxExcerptCharacters: Math.min(
+      configuredProjectionLimits.maxExcerptCharacters,
+      MAX_COREMIND_EXCERPT_CHARACTERS
+    )
+  };
+  const normalizeResearchBatch = (input: Readonly<{
+      ownerUserId: string;
+      decisionTaskId: string;
+      claimIds: readonly string[];
+      batch: Readonly<{
+        batchId?: string;
+        ownerUserId: string;
+        decisionTaskId: string;
+        results: readonly Readonly<{
+          resultKey: string;
+          material: unknown;
+        }>[];
+      }>;
+    }>) => {
+      if (
+        input.batch.ownerUserId !== input.ownerUserId ||
+        input.batch.decisionTaskId !== input.decisionTaskId
+      ) {
+        throw new Error("EVIDENCE_BATCH_SCOPE_MISMATCH");
+      }
+      const evidence: NormalizedEvidence[] = [];
+      const claimEvidenceLinks: NormalizedClaimEvidenceLink[] = [];
+      const gaps: Array<Readonly<{
+        gapId: string;
+        code:
+          | "EVIDENCE_MATERIAL_INVALID"
+          | "CLAIM_LINK_INVALID"
+          | "EVIDENCE_TIME_INVALID"
+          | "EVIDENCE_ARTIFACT_LIFECYCLE_INVALID";
+        decisionTaskId: string;
+        resultKey: string;
+        critical: true;
+      }>> = [];
+      const claimIds = new Set(input.claimIds);
+
+      for (const result of input.batch.results) {
+        const material = decodeResearchEvidenceMaterial(result.material);
+        if (
+          material === undefined
+        ) {
+          gaps.push({
+            gapId: options.nextGapId(),
+            code: "EVIDENCE_MATERIAL_INVALID",
+            decisionTaskId: input.decisionTaskId,
+            resultKey: result.resultKey,
+            critical: true
+          });
+          continue;
+        }
+        const linkedClaimIds = new Set<string>();
+        if (
+          material.claimLinks.length === 0 ||
+          material.claimLinks.some((link) => {
+            if (!claimIds.has(link.claimId) || linkedClaimIds.has(link.claimId)) {
+              return true;
+            }
+            linkedClaimIds.add(link.claimId);
+            return false;
+          })
+        ) {
+          gaps.push({
+            gapId: options.nextGapId(),
+            code: "CLAIM_LINK_INVALID",
+            decisionTaskId: input.decisionTaskId,
+            resultKey: result.resultKey,
+            critical: true
+          });
+          continue;
+        }
+        const capturedAt = Date.parse(material.capturedAt);
+        const validUntil = Date.parse(material.validUntil);
+        if (
+          !Number.isFinite(capturedAt) ||
+          !Number.isFinite(validUntil) ||
+          validUntil < capturedAt
+        ) {
+          gaps.push({
+            gapId: options.nextGapId(),
+            code: "EVIDENCE_TIME_INVALID",
+            decisionTaskId: input.decisionTaskId,
+            resultKey: result.resultKey,
+            critical: true
+          });
+          continue;
+        }
+        const artifactLifecycleValid =
+          material.source.sourceType === "LIVE_PLATFORM"
+            ? material.rawArtifact.lifecycle === "TRANSIENT_PLATFORM" &&
+              Number.isFinite(Date.parse(material.rawArtifact.expiresAt)) &&
+              Date.parse(material.rawArtifact.expiresAt) >= capturedAt &&
+              Date.parse(material.rawArtifact.expiresAt) <=
+                capturedAt + 7 * 24 * 60 * 60 * 1_000
+            : material.rawArtifact.lifecycle === "PRIVATE_FILE";
+        if (!artifactLifecycleValid) {
+          gaps.push({
+            gapId: options.nextGapId(),
+            code: "EVIDENCE_ARTIFACT_LIFECYCLE_INVALID",
+            decisionTaskId: input.decisionTaskId,
+            resultKey: result.resultKey,
+            critical: true
+          });
+          continue;
+        }
+        const evidenceId =
+          input.batch.batchId === undefined
+            ? options.nextEvidenceId()
+            : stableEvidenceIdentity("evidence", [
+                input.ownerUserId,
+                input.decisionTaskId,
+                input.batch.batchId,
+                result.resultKey,
+                material.source.sourceId
+              ]);
+        evidence.push({
+          evidenceId,
+          ownerUserId: input.ownerUserId,
+          decisionTaskId: input.decisionTaskId,
+          capturedAt: material.capturedAt,
+          validUntil: material.validUntil,
+          excerpt: material.excerpt,
+          excerptHash: {
+            algorithm: "sha256",
+            digest: createHash("sha256").update(material.excerpt, "utf8").digest("hex")
+          },
+          locator: material.locator,
+          parserVersion: material.parserVersion,
+          rawArtifact: material.rawArtifact,
+          source: material.source,
+          sourceRole: material.sourceRole,
+          subject: material.subject
+        });
+        for (const link of material.claimLinks) {
+          claimEvidenceLinks.push({
+            linkId:
+              input.batch.batchId === undefined
+                ? options.nextLinkId()
+                : stableEvidenceIdentity("claim-evidence-link", [
+                    evidenceId,
+                    link.claimId,
+                    link.direction
+                  ]),
+            ownerUserId: input.ownerUserId,
+            decisionTaskId: input.decisionTaskId,
+            claimId: link.claimId,
+            evidenceId,
+            direction: link.direction
+          });
+        }
+      }
+
+      return { evidence, claimEvidenceLinks, gaps };
+    };
+
+  const projectForCoreMind = (input: Readonly<{
+    ownerUserId: string;
+    decisionTaskId: string;
+    decisionValidFrom: string;
+    evidence: readonly NormalizedEvidence[];
+    claimEvidenceLinks: readonly NormalizedClaimEvidenceLink[];
+  }>) => {
+    if (
+      input.evidence.some(
+        (item) =>
+          item.ownerUserId !== input.ownerUserId ||
+          item.decisionTaskId !== input.decisionTaskId
+      ) ||
+      input.claimEvidenceLinks.some(
+        (link) =>
+          link.ownerUserId !== input.ownerUserId ||
+          link.decisionTaskId !== input.decisionTaskId
+      )
+    ) {
+      throw new Error("EVIDENCE_PROJECTION_SCOPE_MISMATCH");
+    }
+    const evidenceIds = new Set(input.evidence.map((item) => item.evidenceId));
+    const linkedEvidenceIds = new Set(
+      input.claimEvidenceLinks.map((link) => link.evidenceId)
+    );
+    if (
+      input.evidence.some((item) => !linkedEvidenceIds.has(item.evidenceId)) ||
+      input.claimEvidenceLinks.some((link) => !evidenceIds.has(link.evidenceId))
+    ) {
+      throw new Error("EVIDENCE_PROJECTION_LINK_INVALID");
+    }
+    const validFrom = Date.parse(input.decisionValidFrom);
+    const eligible = input.evidence.filter(
+      (item) =>
+        Date.parse(item.capturedAt) <= validFrom &&
+        Date.parse(item.validUntil) >= validFrom &&
+        (item.retiredAt === undefined || Date.parse(item.retiredAt) > validFrom)
+    );
+    const selected = eligible.slice(0, projectionLimits.maxEvidence);
+    return {
+      items: selected.map((item) => {
+        const excerpt = item.excerpt.slice(0, projectionLimits.maxExcerptCharacters);
+        return {
+          evidenceId: item.evidenceId,
+          capturedAt: item.capturedAt,
+          validUntil: item.validUntil,
+          excerpt,
+          excerptTruncated: excerpt.length < item.excerpt.length,
+          locator: item.locator,
+          source: item.source,
+          sourceRole: item.sourceRole,
+          subject: item.subject,
+          claimLinks: input.claimEvidenceLinks
+            .filter((link) => link.evidenceId === item.evidenceId)
+            .map((link) => ({ claimId: link.claimId, direction: link.direction }))
+        };
+      }),
+      hasMore: eligible.length > selected.length
+    };
+  };
+
+  return {
+    normalizeResearchBatch,
+    async normalizeResearchBatchById(input: Readonly<{
+      batchId: string;
+      ownerUserId: string;
+      decisionTaskId: string;
+      claimIds: readonly string[];
+    }>) {
+      if (options.sourceResearch === undefined) {
+        throw new Error("EVIDENCE_SOURCE_RESEARCH_NOT_CONFIGURED");
+      }
+      const batch = await options.sourceResearch.readEvidenceCandidates({
+        batchId: input.batchId,
+        ownerUserId: input.ownerUserId
+      });
+      if (batch === undefined) {
+        throw new Error("EVIDENCE_BATCH_NOT_FOUND");
+      }
+      return normalizeResearchBatch({
+        ownerUserId: input.ownerUserId,
+        decisionTaskId: input.decisionTaskId,
+        claimIds: input.claimIds,
+        batch
+      });
+    },
+    async indexEvidence(input: Readonly<{
+      ownerUserId: string;
+      evidence: readonly NormalizedEvidence[];
+    }>) {
+      if (options.retrieval === undefined) {
+        throw new Error("EVIDENCE_RETRIEVAL_NOT_CONFIGURED");
+      }
+      if (input.evidence.some((item) => item.ownerUserId !== input.ownerUserId)) {
+        throw new Error("EVIDENCE_INDEX_SCOPE_MISMATCH");
+      }
+      let indexed = 0;
+      let skipped = 0;
+      const gaps: unknown[] = [];
+      for (const item of input.evidence) {
+        if (item.source.sourceType !== "LIVE_PLATFORM") {
+          skipped += 1;
+          continue;
+        }
+        const result = await options.retrieval.index({
+          ownerUserId: input.ownerUserId,
+          evidence: toPublicWebEvidence(item)
+        });
+        if (result.status === "INDEXED") {
+          indexed += 1;
+        } else {
+          gaps.push(result.gap);
+        }
+      }
+      return { indexed, skipped, gaps };
+    },
+    projectForCoreMind,
+    async retrieveForCoreMind(input: Readonly<{
+      ownerUserId: string;
+      decisionTaskId: string;
+      decisionValidFrom: string;
+      query: string;
+      topK: number;
+      evidence: readonly NormalizedEvidence[];
+      claimEvidenceLinks: readonly NormalizedClaimEvidenceLink[];
+    }>) {
+      if (options.retrieval === undefined) {
+        throw new Error("EVIDENCE_RETRIEVAL_NOT_CONFIGURED");
+      }
+      const retrieved = await options.retrieval.search({
+        ownerUserId: input.ownerUserId,
+        decisionTaskId: input.decisionTaskId,
+        query: input.query,
+        topK: input.topK
+      });
+      if (retrieved.status === "EVIDENCE_GAP") return retrieved;
+      const evidenceById = new Map(
+        input.evidence
+          .filter(
+            (item) =>
+              item.ownerUserId === input.ownerUserId &&
+              item.decisionTaskId === input.decisionTaskId
+          )
+          .map((item) => [item.evidenceId, item] as const)
+      );
+      const selectedIds = new Set<string>();
+      const rankedEvidence: NormalizedEvidence[] = [];
+      for (const result of retrieved.results) {
+        const item = evidenceById.get(result.evidenceId);
+        if (item !== undefined && !selectedIds.has(item.evidenceId)) {
+          selectedIds.add(item.evidenceId);
+          rankedEvidence.push(item);
+        }
+      }
+      return {
+        status: "RETRIEVED" as const,
+        projection: projectForCoreMind({
+          ownerUserId: input.ownerUserId,
+          decisionTaskId: input.decisionTaskId,
+          decisionValidFrom: input.decisionValidFrom,
+          evidence: rankedEvidence,
+          claimEvidenceLinks: input.claimEvidenceLinks.filter((link) =>
+            selectedIds.has(link.evidenceId)
+          )
+        })
+      };
+    },
+    expandEvidence(input: Readonly<{
+      ownerUserId: string;
+      decisionTaskId: string;
+      evidenceId: string;
+      evidence: readonly NormalizedEvidence[];
+    }>) {
+      const item = input.evidence.find(
+        (candidate) =>
+          candidate.ownerUserId === input.ownerUserId &&
+          candidate.decisionTaskId === input.decisionTaskId &&
+          candidate.evidenceId === input.evidenceId
+      );
+      if (item === undefined) return undefined;
+      return {
+        evidenceId: item.evidenceId,
+        capturedAt: item.capturedAt,
+        validUntil: item.validUntil,
+        excerpt: item.excerpt,
+        locator: item.locator,
+        source: item.source,
+        sourceRole: item.sourceRole,
+        subject: item.subject
+      };
+    },
+    async purgeExpiredRawArtifacts(input: Readonly<{
+      now: string;
+      ownerUserId: string;
+      evidence: readonly NormalizedEvidence[];
+    }>) {
+      if (input.evidence.some((item) => item.ownerUserId !== input.ownerUserId)) {
+        throw new Error("EVIDENCE_ARTIFACT_SCOPE_MISMATCH");
+      }
+      if (options.deleteRawArtifact === undefined) {
+        throw new Error("EVIDENCE_ARTIFACT_DELETE_NOT_CONFIGURED");
+      }
+      const now = Date.parse(input.now);
+      const expired = input.evidence.filter(
+        (item) =>
+          item.rawArtifact.lifecycle === "TRANSIENT_PLATFORM" &&
+          Date.parse(item.rawArtifact.expiresAt) <= now
+      );
+      const artifacts = new Map(expired.map((item) => [item.rawArtifact.objectKey, item.rawArtifact]));
+      await Promise.all(
+        [...artifacts.values()].map((artifact) => options.deleteRawArtifact?.(artifact))
+      );
+      return { deleted: artifacts.size };
+    }
+  };
+}
+
+function toPublicWebEvidence(evidence: NormalizedEvidence): PublicWebEvidenceV1 {
+  if (evidence.source.sourceType !== "LIVE_PLATFORM") {
+    throw new Error("EVIDENCE_PUBLIC_WEB_CONVERSION_INVALID");
+  }
+  return {
+    contractType: "evidence",
+    contractVersion: "1.0",
+    evidenceId: evidence.evidenceId,
+    decisionTaskId: evidence.decisionTaskId,
+    capturedAt: evidence.capturedAt,
+    locator: evidence.locator,
+    excerpt: evidence.excerpt,
+    validUntil: evidence.validUntil,
+    synthetic: false,
+    source: {
+      sourceKind: "PUBLIC_WEB",
+      sourceId: evidence.source.sourceId,
+      title: evidence.source.title,
+      url: evidence.source.url
+    },
+    excerptHash: evidence.excerptHash,
+    parserVersion: evidence.parserVersion,
+    rawArtifact: {
+      algorithm: evidence.rawArtifact.algorithm,
+      digest: evidence.rawArtifact.digest,
+      objectKey: evidence.rawArtifact.objectKey
+    }
+  };
+}
+
+function stableEvidenceIdentity(prefix: string, parts: readonly string[]): string {
+  const digest = createHash("sha256").update(parts.join("\0"), "utf8").digest("hex");
+  return `${prefix}-${digest.slice(0, 32)}`;
+}
+
+function decodeResearchEvidenceMaterial(value: unknown): ResearchEvidenceMaterial | undefined {
+  if (!isRecord(value)) return undefined;
+  if (
+    !isMeaningfulString(value.capturedAt) ||
+    !isMeaningfulString(value.validUntil) ||
+    !isMeaningfulString(value.excerpt) ||
+    value.excerpt.length > MAX_EVIDENCE_EXCERPT_CHARACTERS ||
+    !isMeaningfulString(value.parserVersion) ||
+    !isLocator(value.locator) ||
+    !isEvidenceRawArtifact(value.rawArtifact) ||
+    !isEvidenceSource(value.source) ||
+    !isEvidenceSourceRole(value.sourceRole) ||
+    !isEvidenceSubject(value.subject) ||
+    !Array.isArray(value.claimLinks) ||
+    !value.claimLinks.every(isClaimLinkCandidate)
+  ) {
+    return undefined;
+  }
+  const rawArtifact: EvidenceRawArtifact =
+    value.rawArtifact.lifecycle === "TRANSIENT_PLATFORM"
+      ? {
+          algorithm: "sha256",
+          digest: value.rawArtifact.digest,
+          objectKey: value.rawArtifact.objectKey,
+          lifecycle: "TRANSIENT_PLATFORM",
+          expiresAt: value.rawArtifact.expiresAt
+        }
+      : {
+          algorithm: "sha256",
+          digest: value.rawArtifact.digest,
+          objectKey: value.rawArtifact.objectKey,
+          lifecycle: "PRIVATE_FILE"
+        };
+  const source: EvidenceSource =
+    value.source.sourceType === "LIVE_PLATFORM"
+      ? {
+          sourceType: "LIVE_PLATFORM",
+          sourceId: value.source.sourceId,
+          platform: value.source.platform,
+          title: value.source.title,
+          url: value.source.url,
+          ...(isMeaningfulString(value.source.contentId)
+            ? { contentId: value.source.contentId }
+            : {})
+        }
+      : {
+          sourceType: "PRIVATE_FILE",
+          sourceId: value.source.sourceId,
+          fileId: value.source.fileId,
+          title: value.source.title,
+          mediaType: value.source.mediaType
+        };
+  const subject: EvidenceSubject =
+    value.subject.subjectType === "CANDIDATE"
+      ? {
+          subjectType: "CANDIDATE",
+          candidateId: value.subject.candidateId
+        }
+      : {
+          subjectType: "OFFER",
+          candidateId: value.subject.candidateId,
+          offerId: value.subject.offerId,
+          channel: value.subject.channel,
+          sku: value.subject.sku
+        };
+  return {
+    capturedAt: value.capturedAt,
+    validUntil: value.validUntil,
+    excerpt: value.excerpt,
+    locator: {
+      section: value.locator.section,
+      field: value.locator.field
+    },
+    parserVersion: value.parserVersion,
+    rawArtifact,
+    source,
+    sourceRole: value.sourceRole,
+    subject,
+    claimLinks: value.claimLinks.map((link) => ({
+      claimId: link.claimId,
+      direction: link.direction
+    }))
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isMeaningfulString(value: unknown): value is string {
+  return typeof value === "string" && value.trim() !== "";
+}
+
+function isLocator(value: unknown): value is ResearchEvidenceMaterial["locator"] {
+  return (
+    isRecord(value) &&
+    isMeaningfulString(value.section) &&
+    isMeaningfulString(value.field)
+  );
+}
+
+function isEvidenceRawArtifact(value: unknown): value is EvidenceRawArtifact {
+  if (
+    !isRecord(value) ||
+    value.algorithm !== "sha256" ||
+    typeof value.digest !== "string" ||
+    !/^[0-9a-f]{64}$/.test(value.digest) ||
+    !isMeaningfulString(value.objectKey)
+  ) {
+    return false;
+  }
+  return (
+    (value.lifecycle === "TRANSIENT_PLATFORM" && isMeaningfulString(value.expiresAt)) ||
+    value.lifecycle === "PRIVATE_FILE"
+  );
+}
+
+function isEvidenceSource(value: unknown): value is EvidenceSource {
+  if (!isRecord(value) || !isMeaningfulString(value.sourceId) || !isMeaningfulString(value.title)) {
+    return false;
+  }
+  if (value.sourceType === "LIVE_PLATFORM") {
+    if (!isMeaningfulString(value.platform) || !isMeaningfulString(value.url)) return false;
+    try {
+      const url = new URL(value.url);
+      return url.protocol === "https:" && url.username === "" && url.password === "";
+    } catch {
+      return false;
+    }
+  }
+  return (
+    value.sourceType === "PRIVATE_FILE" &&
+    isMeaningfulString(value.fileId) &&
+    isMeaningfulString(value.mediaType)
+  );
+}
+
+function isEvidenceSourceRole(value: unknown): value is EvidenceSourceRole {
+  return value === "OFFICIAL" || value === "OFFER" || value === "INDEPENDENT";
+}
+
+function isEvidenceSubject(value: unknown): value is EvidenceSubject {
+  if (!isRecord(value) || !isMeaningfulString(value.candidateId)) return false;
+  if (value.subjectType === "CANDIDATE") return true;
+  return (
+    value.subjectType === "OFFER" &&
+    isMeaningfulString(value.offerId) &&
+    isMeaningfulString(value.channel) &&
+    isMeaningfulString(value.sku)
+  );
+}
+
+function isClaimLinkCandidate(
+  value: unknown
+): value is ResearchEvidenceMaterial["claimLinks"][number] {
+  return (
+    isRecord(value) &&
+    isMeaningfulString(value.claimId) &&
+    (value.direction === "SUPPORTS" || value.direction === "REFUTES")
+  );
+}
+
 export interface DataSourceConnector<
   TResult extends DataSourceCollectionResult = DataSourceCollectionResult
 > {
