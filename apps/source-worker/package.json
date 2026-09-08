@@ -11,6 +11,7 @@
     "typecheck": "tsc --project tsconfig.json"
   },
   "dependencies": {
+    "@choicemind/evidence-ingestion": "workspace:*",
     "@choicemind/security": "workspace:*",
     "@choicemind/source-access": "workspace:*",
     "@choicemind/source-research": "workspace:*",
