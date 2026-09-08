@@ -66,3 +66,37 @@ jobs:
           It does not certify live Providers, platform credentials, PostgreSQL integration,
           candidate Docker execution, or Alpha product acceptance. Skipped tests are not passes.
           '@ | Out-File -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+  candidate-identity:
+    name: Candidate identity (isolated PostgreSQL)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: pgvector/pgvector@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b
+        env:
+          POSTGRES_USER: candidate_test
+          POSTGRES_PASSWORD: synthetic_test_only
+          POSTGRES_DB: candidate_test
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -U candidate_test -d candidate_test"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version-file: .node-version
+      - name: Install pinned pnpm and locked dependencies
+        run: |
+          npm install --global pnpm@11.21.0
+          pnpm install --frozen-lockfile
+      - name: Build API dependency closure
+        run: pnpm --filter @choicemind/api... build
+      - name: Verify real Cookie authorization with synthetic accounts
+        env:
+          CHOICEMIND_TEST_DATABASE_URL: postgresql://candidate_test:synthetic_test_only@127.0.0.1:${{ job.services.postgres.ports[5432] }}/candidate_test
+        run: pnpm --filter @choicemind/api exec vitest run tests/integration/candidate-identity.test.ts

@@ -3,7 +3,7 @@ import { openPostgresCandidateStore } from "@choicemind/source-research/candidat
 import { expect, it } from "vitest";
 import { buildApiApp } from "../../src/app.js";
 
-it("真实登录 Cookie 授权候选审批，普通用户拒绝，注销后权限立即失效", async () => {
+it.skipIf(process.env.CHOICEMIND_TEST_DATABASE_URL === undefined)("真实登录 Cookie 授权候选审批，普通用户拒绝，注销后权限立即失效", async () => {
 	const databaseUrl = process.env.CHOICEMIND_TEST_DATABASE_URL;
 	if (!databaseUrl) throw new Error("必须配置隔离测试数据库");
 	const identityAccess = await openPostgresIdentityAccess({ databaseUrl });
