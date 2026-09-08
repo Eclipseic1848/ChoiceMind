@@ -6,6 +6,7 @@ export function createFixtureSourceAdapter(options: Readonly<{
   loginUrl: string;
 }>): SourceAdapter {
   return {
+    accessMode: "CREDENTIAL",
     officialLoginUrl: options.loginUrl,
     async run(input) {
       input.signal.throwIfAborted();

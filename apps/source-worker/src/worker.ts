@@ -14,16 +14,28 @@ type SourceAdapterOutcome =
   | SourceResearchOutcome
   | Readonly<{ type: "AUTH_REQUIRED"; challenge: "QR_CODE" | "SMS" | "CAPTCHA" }>;
 
-export type SourceAdapter = Readonly<{
-  authorize?(): Promise<void>;
+type SourceAdapterInput = Readonly<{
+  claim: SourceResearchClaim;
+  idempotencyKey: string;
+  signal: AbortSignal;
+  saveCheckpoint(checkpoint: unknown): Promise<void>;
+}>;
+
+export type PublicSourceAdapter = Readonly<{
+  accessMode: "PUBLIC";
+  run(input: SourceAdapterInput): Promise<SourceResearchOutcome>;
+}>;
+
+type CredentialSourceAdapter = Readonly<{
+  accessMode: "CREDENTIAL";
   officialLoginUrl: string;
-  run(input: Readonly<{
-    claim: SourceResearchClaim;
-    idempotencyKey: string;
-    signal: AbortSignal;
+  run(input: SourceAdapterInput & Readonly<{
     revealCredential(): string;
-    saveCheckpoint(checkpoint: unknown): Promise<void>;
   }>): Promise<SourceAdapterOutcome>;
+}>;
+
+export type SourceAdapter = (PublicSourceAdapter | CredentialSourceAdapter) & Readonly<{
+  authorize?(): Promise<void>;
 }>;
 
 type SourceAccessPort = Readonly<{
@@ -98,7 +110,6 @@ export function createSourceWorker(options: Readonly<{
         });
         return { claimed: 1, completed: 1 };
       }
-
       try {
         await adapter.authorize?.();
       } catch {
@@ -108,27 +119,44 @@ export function createSourceWorker(options: Readonly<{
         });
         return { claimed: 1, completed: 1 };
       }
-      const status = await options.sourceAccess.read({
-        type: "GET_SOURCE_STATUS",
-        ownerUserId: claim.ownerUserId,
-        sourceId: claim.sourceId,
-        sourceAccountId: claim.sourceAccountId
-      });
-      if (status?.status !== "ACTIVE") {
-        const login = await options.sourceAccess.execute({
-          type: "BEGIN_LOGIN",
-          ownerUserId: claim.ownerUserId,
-          sourceId: claim.sourceId,
-          sourceAccountId: claim.sourceAccountId,
-          officialLoginUrl: adapter.officialLoginUrl,
-          correlationId: claim.jobId
-        });
+      if (adapter.accessMode !== claim.accessMode) {
         await options.sourceResearch.complete(claim, {
-          type: "WAITING_CHALLENGE",
-          challenge: "QR_CODE",
-          loginSessionId: login.loginSessionId
+          type: "FAILED_FINAL",
+          summary: `来源访问模式与 Adapter 不匹配：${claim.sourceId}`
         });
         return { claimed: 1, completed: 1 };
+      }
+      if (adapter.accessMode === "PUBLIC" && claim.researchTarget === null) {
+        await options.sourceResearch.complete(claim, {
+          type: "FAILED_FINAL",
+          summary: "公开来源缺少可验证的研究目标"
+        });
+        return { claimed: 1, completed: 1 };
+      }
+
+      if (adapter.accessMode === "CREDENTIAL") {
+        const status = await options.sourceAccess.read({
+          type: "GET_SOURCE_STATUS",
+          ownerUserId: claim.ownerUserId,
+          sourceId: claim.sourceId,
+          sourceAccountId: claim.sourceAccountId
+        });
+        if (status?.status !== "ACTIVE") {
+          const login = await options.sourceAccess.execute({
+            type: "BEGIN_LOGIN",
+            ownerUserId: claim.ownerUserId,
+            sourceId: claim.sourceId,
+            sourceAccountId: claim.sourceAccountId,
+            officialLoginUrl: adapter.officialLoginUrl,
+            correlationId: claim.jobId
+          });
+          await options.sourceResearch.complete(claim, {
+            type: "WAITING_CHALLENGE",
+            challenge: "QR_CODE",
+            loginSessionId: login.loginSessionId
+          });
+          return { claimed: 1, completed: 1 };
+        }
       }
 
       let adapterOutcome: SourceAdapterOutcome | undefined;
@@ -155,30 +183,38 @@ export function createSourceWorker(options: Readonly<{
           });
       }, heartbeatIntervalMs);
       try {
-        await adapter.authorize?.();
-        await options.sourceAccess.withCredential(
-          {
-            ownerUserId: claim.ownerUserId,
-            sourceId: claim.sourceId,
-            sourceAccountId: claim.sourceAccountId,
-            correlationId: claim.jobId,
-            actor: options.systemActor
-          },
-          async (secret) => {
-            adapterOutcome = await adapter.run({
-              claim,
-              idempotencyKey: claim.jobId,
-              signal: adapterController.signal,
-              revealCredential: () => secret.reveal(),
-              async saveCheckpoint(checkpoint) {
-                const saved = await options.sourceResearch.saveCheckpoint(claim, checkpoint);
-                if (saved.status !== "SAVED") throw new Error("SOURCE_RESEARCH_LEASE_LOST");
-              }
-            });
+        const adapterInput: SourceAdapterInput = {
+          claim,
+          idempotencyKey: claim.jobId,
+          signal: adapterController.signal,
+          async saveCheckpoint(checkpoint) {
+            const saved = await options.sourceResearch.saveCheckpoint(claim, checkpoint);
+            if (saved.status !== "SAVED") throw new Error("SOURCE_RESEARCH_LEASE_LOST");
           }
-        );
+        };
+        if (adapter.accessMode === "PUBLIC") {
+          adapterOutcome = await adapter.run(adapterInput);
+        } else {
+          await adapter.authorize?.();
+          await options.sourceAccess.withCredential(
+            {
+              ownerUserId: claim.ownerUserId,
+              sourceId: claim.sourceId,
+              sourceAccountId: claim.sourceAccountId,
+              correlationId: claim.jobId,
+              actor: options.systemActor
+            },
+            async (secret) => {
+              adapterOutcome = await adapter.run({
+                ...adapterInput,
+                revealCredential: () => secret.reveal()
+              });
+            }
+          );
+        }
       } catch (error) {
         if (
+          adapter.accessMode === "CREDENTIAL" &&
           error instanceof Error &&
           (error.message === "SOURCE_LOGIN_REQUIRED" ||
             error.message === "CREDENTIAL_NOT_FOUND")
@@ -215,7 +251,7 @@ export function createSourceWorker(options: Readonly<{
         await heartbeatInFlight;
       }
       if (leaseLost) return { claimed: 1, completed: 0 };
-      if (adapterOutcome?.type === "AUTH_REQUIRED") {
+      if (adapter.accessMode === "CREDENTIAL" && adapterOutcome?.type === "AUTH_REQUIRED") {
         await options.sourceAccess.execute({
           type: "MARK_INVALID",
           ownerUserId: claim.ownerUserId,
@@ -237,7 +273,7 @@ export function createSourceWorker(options: Readonly<{
           challenge: adapterOutcome.challenge,
           loginSessionId: login.loginSessionId
         };
-      } else if (adapterOutcome !== undefined) {
+      } else if (adapterOutcome !== undefined && adapterOutcome.type !== "AUTH_REQUIRED") {
         outcome = adapterOutcome;
       }
       await options.sourceResearch.complete(

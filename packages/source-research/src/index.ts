@@ -14,6 +14,19 @@ export type SourceResearchBatchState =
   | "COMPLETED"
   | "FAILED";
 
+export type SourceResearchAccessMode = "PUBLIC" | "CREDENTIAL";
+
+export type SourceResearchTarget = Readonly<{
+  subject: Readonly<{
+    kind: string;
+    value: string;
+  }>;
+  claimTargets: readonly Readonly<{
+    claimId: string;
+    statement: string;
+  }>[];
+}>;
+
 export type SourceResearchOutcome =
   | Readonly<{
       type: "EVIDENCE";
@@ -39,6 +52,8 @@ export type SourceResearchClaim = Readonly<{
   query: string;
   sourceId: string;
   sourceAccountId: string;
+  accessMode: SourceResearchAccessMode;
+  researchTarget: SourceResearchTarget | null;
   checkpoint: unknown | null;
   workerId: string;
   attemptCount: number;
@@ -49,12 +64,14 @@ export type SourceResearchBatch = Readonly<{
   ownerUserId: string;
   decisionTaskId: string;
   query: string;
+  researchTarget?: SourceResearchTarget;
   state: SourceResearchBatchState;
   costUnits: number;
   jobs: readonly Readonly<{
     jobId: string;
     sourceId: string;
     sourceAccountId: string;
+    accessMode: SourceResearchAccessMode;
     state:
       | "QUEUED"
       | "RUNNING"
@@ -81,7 +98,12 @@ export type CreateSourceResearchBatchCommand = Readonly<{
     decisionTaskId: string;
     idempotencyKey: string;
     query: string;
-    sources: readonly Readonly<{ sourceId: string; sourceAccountId: string }>[];
+    target?: SourceResearchTarget;
+    sources: readonly Readonly<{
+      sourceId: string;
+      sourceAccountId: string;
+      accessMode?: SourceResearchAccessMode;
+    }>[];
   }>;
 
 export type ResumeSourceResearchCommand = Readonly<{
@@ -124,6 +146,7 @@ type BatchRow = Readonly<{
   decision_task_id: string;
   query: string;
   request_fingerprint: string;
+  research_target: SourceResearchTarget | null;
   created_at: Date;
   updated_at: Date;
 }>;
@@ -136,6 +159,8 @@ type JobRow = Readonly<{
   query: string;
   source_id: string;
   source_account_id: string;
+  access_mode: SourceResearchAccessMode;
+  research_target: SourceResearchTarget | null;
   state: SourceResearchBatch["jobs"][number]["state"];
   checkpoint: unknown | null;
   worker_id: string | null;
@@ -186,22 +211,48 @@ export async function openPostgresSourceResearch(options: Readonly<{
       command.decisionTaskId.length > 200 ||
       command.idempotencyKey.length > 200 ||
       command.sources.some(
-        (source) => source.sourceId.length > 100 || source.sourceAccountId.length > 200
+        (source) =>
+          source.sourceId.length > 100 ||
+          source.sourceAccountId.length > 200 ||
+          (source.accessMode !== undefined &&
+            source.accessMode !== "PUBLIC" &&
+            source.accessMode !== "CREDENTIAL") ||
+          (source.accessMode === "PUBLIC" && source.sourceAccountId !== "public")
       )
     ) {
       throw new Error("SOURCE_RESEARCH_BATCH_INVALID");
     }
-    const normalizedSources = [...command.sources].sort((left, right) =>
-      `${left.sourceId}\0${left.sourceAccountId}`.localeCompare(
-        `${right.sourceId}\0${right.sourceAccountId}`
-      )
+    if (command.target !== undefined && !isSourceResearchTarget(command.target)) {
+      throw new Error("SOURCE_RESEARCH_TARGET_INVALID");
+    }
+    if (
+      command.sources.some((source) => source.accessMode === "PUBLIC") &&
+      command.target === undefined
+    ) {
+      throw new Error("SOURCE_RESEARCH_TARGET_REQUIRED");
+    }
+    const normalizedSources = command.sources
+      .map((source) => ({
+        ...source,
+        accessMode: source.accessMode ?? "CREDENTIAL" as const
+      }))
+      .sort((left, right) =>
+        `${left.sourceId}\0${left.sourceAccountId}`.localeCompare(
+          `${right.sourceId}\0${right.sourceAccountId}`
+        ) || left.accessMode.localeCompare(right.accessMode)
+      );
+    const fingerprintSources = normalizedSources.map((source) =>
+      source.accessMode === "CREDENTIAL"
+        ? { sourceId: source.sourceId, sourceAccountId: source.sourceAccountId }
+        : source
     );
     const requestFingerprint = createHash("sha256")
       .update(
         JSON.stringify({
           decisionTaskId: command.decisionTaskId,
           query: command.query.trim(),
-          sources: normalizedSources
+          sources: fingerprintSources,
+          ...(command.target === undefined ? {} : { target: command.target })
         })
       )
       .digest("hex");
@@ -212,8 +263,8 @@ export async function openPostgresSourceResearch(options: Readonly<{
       const inserted = await client.query<BatchRow>(
         `INSERT INTO source_research_batches (
            batch_id, owner_user_id, decision_task_id, idempotency_key,
-           request_fingerprint, query, created_at, updated_at
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
+           request_fingerprint, query, research_target, created_at, updated_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $8)
          ON CONFLICT (owner_user_id, idempotency_key) DO NOTHING
          RETURNING *`,
         [
@@ -223,6 +274,7 @@ export async function openPostgresSourceResearch(options: Readonly<{
           command.idempotencyKey,
           requestFingerprint,
           command.query.trim(),
+          command.target === undefined ? null : JSON.stringify(command.target),
           timestamp
         ]
       );
@@ -243,8 +295,8 @@ export async function openPostgresSourceResearch(options: Readonly<{
         const jobResult = await client.query<{ job_id: string }>(
           `INSERT INTO source_research_jobs (
              batch_id, owner_user_id, decision_task_id, query,
-             source_id, source_account_id, state, created_at, updated_at
-           ) VALUES ($1, $2, $3, $4, $5, $6, 'QUEUED', $7, $7)
+             source_id, source_account_id, access_mode, state, created_at, updated_at
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'QUEUED', $8, $8)
            RETURNING job_id`,
           [
             command.batchId,
@@ -253,6 +305,7 @@ export async function openPostgresSourceResearch(options: Readonly<{
             command.query.trim(),
             source.sourceId,
             source.sourceAccountId,
+            source.accessMode,
             timestamp
           ]
         );
@@ -306,12 +359,14 @@ export async function openPostgresSourceResearch(options: Readonly<{
           [timestamp]
         );
         const result = await client.query<JobRow>(
-          `SELECT * FROM source_research_jobs
-           WHERE state = 'QUEUED'
-              OR (state = 'FAILED_RETRYABLE' AND next_attempt_at <= $1)
-              OR (state = 'RUNNING' AND lease_expires_at <= $1 AND attempt_count < 5)
-           ORDER BY created_at, job_id
-           FOR UPDATE SKIP LOCKED
+          `SELECT jobs.*, batches.research_target
+           FROM source_research_jobs AS jobs
+           JOIN source_research_batches AS batches USING (batch_id)
+           WHERE jobs.state = 'QUEUED'
+              OR (jobs.state = 'FAILED_RETRYABLE' AND jobs.next_attempt_at <= $1)
+              OR (jobs.state = 'RUNNING' AND jobs.lease_expires_at <= $1 AND jobs.attempt_count < 5)
+           ORDER BY jobs.created_at, jobs.job_id
+           FOR UPDATE OF jobs SKIP LOCKED
            LIMIT 1`,
           [timestamp]
         );
@@ -338,6 +393,8 @@ export async function openPostgresSourceResearch(options: Readonly<{
           query: job.query,
           sourceId: job.source_id,
           sourceAccountId: job.source_account_id,
+          accessMode: job.access_mode,
+          researchTarget: job.research_target,
           checkpoint: job.checkpoint,
           workerId,
           attemptCount: job.attempt_count + 1
@@ -564,12 +621,14 @@ async function readBatch(
     ownerUserId: batch.owner_user_id,
     decisionTaskId: batch.decision_task_id,
     query: batch.query,
+    ...(batch.research_target === null ? {} : { researchTarget: batch.research_target }),
     state,
     costUnits: jobResult.rows.reduce((sum, row) => sum + row.cost_units, 0),
     jobs: jobResult.rows.map((row) => ({
       jobId: row.job_id,
       sourceId: row.source_id,
       sourceAccountId: row.source_account_id,
+      accessMode: row.access_mode,
       state: row.state,
       ...(
         row.state === "WAITING_SOURCE_LOGIN" &&
@@ -606,6 +665,7 @@ async function migrateSourceResearch(pool: Pool): Promise<void> {
         idempotency_key text NOT NULL,
         request_fingerprint text NOT NULL,
         query text NOT NULL,
+        research_target jsonb,
         created_at timestamptz NOT NULL,
         updated_at timestamptz NOT NULL,
         UNIQUE (owner_user_id, idempotency_key)
@@ -620,6 +680,8 @@ async function migrateSourceResearch(pool: Pool): Promise<void> {
         query text NOT NULL,
         source_id text NOT NULL,
         source_account_id text NOT NULL,
+        access_mode text NOT NULL DEFAULT 'CREDENTIAL'
+          CHECK (access_mode IN ('PUBLIC', 'CREDENTIAL')),
         state text NOT NULL CHECK (state IN (
           'QUEUED', 'RUNNING', 'WAITING_SOURCE_LOGIN', 'COMPLETED',
           'NO_RESULT', 'FAILED_RETRYABLE', 'FAILED_FINAL'
@@ -639,6 +701,15 @@ async function migrateSourceResearch(pool: Pool): Promise<void> {
     await client.query(`
       ALTER TABLE source_research_batches
       ADD COLUMN IF NOT EXISTS request_fingerprint text NOT NULL DEFAULT ''
+    `);
+    await client.query(`
+      ALTER TABLE source_research_batches
+      ADD COLUMN IF NOT EXISTS research_target jsonb
+    `);
+    await client.query(`
+      ALTER TABLE source_research_jobs
+      ADD COLUMN IF NOT EXISTS access_mode text NOT NULL DEFAULT 'CREDENTIAL'
+      CHECK (access_mode IN ('PUBLIC', 'CREDENTIAL'))
     `);
     await client.query(`
       ALTER TABLE source_research_jobs
@@ -691,4 +762,44 @@ function requireBatch(batch: SourceResearchBatch | undefined): SourceResearchBat
 function requireRow<T>(row: T | undefined): T {
   if (row === undefined) throw new Error("SOURCE_RESEARCH_WRITE_FAILED");
   return row;
+}
+
+function isSourceResearchTarget(value: unknown): value is SourceResearchTarget {
+  if (typeof value !== "object" || value === null) return false;
+  const target = value as Record<string, unknown>;
+  if (
+    typeof target.subject !== "object" ||
+    target.subject === null ||
+    !Array.isArray(target.claimTargets)
+  ) {
+    return false;
+  }
+  const subject = target.subject as Record<string, unknown>;
+  return (
+    typeof subject.kind === "string" &&
+    /^[A-Z][A-Z0-9_]{0,49}$/.test(subject.kind) &&
+    typeof subject.value === "string" &&
+    isBoundedTrimmedString(subject.value, 200) &&
+    target.claimTargets.length > 0 &&
+    target.claimTargets.length <= 10 &&
+    target.claimTargets.every(
+      (claim) => {
+        if (typeof claim !== "object" || claim === null) return false;
+        const candidate = claim as Record<string, unknown>;
+        return (
+          typeof candidate.claimId === "string" &&
+          isBoundedTrimmedString(candidate.claimId, 200) &&
+          typeof candidate.statement === "string" &&
+          isBoundedTrimmedString(candidate.statement, 2_000)
+        );
+      }
+    ) &&
+    new Set(
+      target.claimTargets.map((claim) => (claim as { claimId: string }).claimId)
+    ).size === target.claimTargets.length
+  );
+}
+
+function isBoundedTrimmedString(value: string, maxLength: number): boolean {
+  return value.length > 0 && value.length <= maxLength && value.trim() === value;
 }

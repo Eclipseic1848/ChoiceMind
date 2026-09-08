@@ -16,6 +16,8 @@ const claim = {
   query: "通勤耳机",
   sourceId: "fixture",
   sourceAccountId: "default",
+  accessMode: "CREDENTIAL" as const,
+  researchTarget: null,
   checkpoint: null,
   workerId: "worker-a",
   attemptCount: 1
@@ -26,6 +28,97 @@ const systemActor = Object.freeze({
 });
 
 describe("Source Worker", () => {
+  it("公开来源不读取登录状态或凭据，直接提交研究结果", async () => {
+    const complete = vi.fn(async () => ({ status: "COMMITTED" as const }));
+    const sourceAccessUsed = vi.fn(() => {
+      throw new Error("公开来源不应访问 Source Access");
+    });
+    const publicClaim = {
+      ...claim,
+      sourceId: "brand-web",
+      sourceAccountId: "public",
+      accessMode: "PUBLIC" as const,
+      researchTarget: {
+        subject: { kind: "CANDIDATE", value: "candidate-a" },
+        claimTargets: [{ claimId: "claim-a", statement: "候选产品支持 USB-C" }]
+      }
+    };
+    const run = vi.fn(async () => ({
+      type: "NO_RESULT" as const,
+      summary: "公开页面没有匹配内容",
+      costUnits: 0
+    }));
+    const worker = createSourceWorker({
+      workerId: "worker-a",
+      systemActor,
+      sourceAccess: {
+        read: sourceAccessUsed,
+        execute: sourceAccessUsed as never,
+        withCredential: sourceAccessUsed as never
+      },
+      sourceResearch: {
+        claimNext: vi.fn(async () => publicClaim),
+        saveCheckpoint: vi.fn(),
+        renewLease: vi.fn(async () => ({ status: "RENEWED" as const })),
+        complete
+      },
+      adapters: new Map([
+        [
+          "brand-web",
+          {
+            accessMode: "PUBLIC" as const,
+            run
+          }
+        ]
+      ])
+    });
+
+    await expect(worker.runOnce()).resolves.toEqual({ claimed: 1, completed: 1 });
+    expect(sourceAccessUsed).not.toHaveBeenCalled();
+    expect(run).toHaveBeenCalledOnce();
+    expect(complete).toHaveBeenCalledWith(
+      publicClaim,
+      expect.objectContaining({ type: "NO_RESULT" })
+    );
+  });
+
+  it("公开来源缺少研究目标时失败关闭，不运行 Adapter", async () => {
+    const complete = vi.fn(async () => ({ status: "COMMITTED" as const }));
+    const run = vi.fn();
+    const publicClaim = {
+      ...claim,
+      sourceId: "brand-web",
+      sourceAccountId: "public",
+      accessMode: "PUBLIC" as const,
+      researchTarget: null
+    };
+    const worker = createSourceWorker({
+      workerId: "worker-a",
+      systemActor,
+      sourceAccess: {
+        read: vi.fn(),
+        execute: vi.fn() as never,
+        withCredential: vi.fn()
+      },
+      sourceResearch: {
+        claimNext: vi.fn(async () => publicClaim),
+        saveCheckpoint: vi.fn(),
+        renewLease: vi.fn(async () => ({ status: "RENEWED" as const })),
+        complete
+      },
+      adapters: new Map([
+        ["brand-web", { accessMode: "PUBLIC" as const, run }]
+      ])
+    });
+
+    await expect(worker.runOnce()).resolves.toEqual({ claimed: 1, completed: 1 });
+    expect(run).not.toHaveBeenCalled();
+    expect(complete).toHaveBeenCalledWith(publicClaim, {
+      type: "FAILED_FINAL",
+      summary: "公开来源缺少可验证的研究目标"
+    });
+  });
+
   it("没有有效登录时发起挑战并暂停，而不是报告失败", async () => {
     const complete = vi.fn(async () => ({ status: "COMMITTED" as const }));
     const beginLogin = vi.fn(async () => ({
@@ -53,7 +146,7 @@ describe("Source Worker", () => {
         complete
       },
       adapters: new Map([
-        ["fixture", { officialLoginUrl: "http://127.0.0.1:3000/source-login", run: vi.fn() }]
+        ["fixture", { accessMode: "CREDENTIAL", officialLoginUrl: "http://127.0.0.1:3000/source-login", run: vi.fn() }]
       ])
     });
 
@@ -105,7 +198,7 @@ describe("Source Worker", () => {
         renewLease: vi.fn(async () => ({ status: "RENEWED" as const })),
         complete
       },
-      adapters: new Map([["fixture", { officialLoginUrl: "fixture", run }]])
+      adapters: new Map([["fixture", { accessMode: "CREDENTIAL", officialLoginUrl: "fixture", run }]])
     });
 
     await worker.runOnce();
@@ -197,6 +290,7 @@ describe("Source Worker", () => {
         [
           "fixture",
           {
+            accessMode: "CREDENTIAL",
             officialLoginUrl: "fixture",
             run: vi.fn(async () => ({ type: "AUTH_REQUIRED" as const, challenge: "QR_CODE" as const }))
           }
@@ -272,7 +366,7 @@ describe("Source Worker", () => {
         renewLease: vi.fn(async () => ({ status: "RENEWED" as const })),
         complete
       },
-      adapters: new Map([["fixture", { officialLoginUrl: "fixture", run: vi.fn() }]])
+      adapters: new Map([["fixture", { accessMode: "CREDENTIAL", officialLoginUrl: "fixture", run: vi.fn() }]])
     });
 
     await worker.runOnce();
@@ -323,7 +417,7 @@ describe("Source Worker", () => {
 					renewLease,
 					complete: vi.fn(async () => ({ status: "COMMITTED" as const })),
 				},
-				adapters: new Map([["fixture", { officialLoginUrl: "fixture", run }]]),
+				adapters: new Map([["fixture", { accessMode: "CREDENTIAL", officialLoginUrl: "fixture", run }]]),
 			});
 			const running = worker.runOnce();
 			await vi.advanceTimersByTimeAsync(110);
