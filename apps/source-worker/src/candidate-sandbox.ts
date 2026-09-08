@@ -50,6 +50,11 @@ const EXECUTION_RUNTIMES = {
 			"sha256:866ebea5648adbc74fd4dfe345bdd057fe78329a2c986e4bbb7e28110c091768",
 		policy: "local-python-secrets-sandbox.v1",
 	},
+	PYTHON_INVOKE: {
+		...RUNTIMES.PYTHON,
+		policy: "local-python-invoke-sandbox.v1",
+		outputLimit: 65_536,
+	},
 } as const;
 const SLOT = "choicemind-adapter-candidate-slot";
 const LIMIT = 65_536;

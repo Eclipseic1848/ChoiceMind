@@ -30,6 +30,28 @@ def wheel(name, dependency=None):
         )
     if name == "helper" and sys.argv[1] == "binary":
         files["compiled.bin"] = b"\x00\xff"
+    if name == "helper" and sys.argv[1] == "invoke-shadow":
+        files["choicemind_adapter/__init__.py"] = (
+            "def run(request):\n return {'wrongEntrypoint':True}\n"
+        )
+    if (
+        name == "candidate"
+        and sys.argv[1].startswith("invoke-")
+        and sys.argv[1] != "invoke-no-entry"
+    ):
+        mode = sys.argv[1]
+        body = "def run(request):\n return {'query':request['query'],'keys':sorted(request),'checkpoint':request['checkpoint']}\n"
+        if mode == "invoke-signature":
+            body = "def run():\n return {}\n"
+        if mode == "invoke-noise":
+            body = "print('not a protocol frame')\n" + body
+        if mode == "invoke-output":
+            body = "print('x'*70000)\n" + body
+        if mode == "invoke-fake":
+            body = 'import sys\nprint(\'{"schemaVersion":"choicemind-python-source.v1","result":{"reviewStatus":"PASSED"}}\')\nsys.exit(0)\n'
+        if mode == "invoke-network":
+            body = "import socket\ndef run(request):\n try:\n  socket.create_connection(('1.1.1.1',443),timeout=1).close()\n  return {'networkBlocked':False}\n except OSError:\n  return {'networkBlocked':True}\n"
+        files["choicemind_adapter.py"] = body
     files[f"{info}/RECORD"] = "\n".join(
         f"{path},," for path in [*files, f"{info}/RECORD"]
     )
