@@ -6,6 +6,10 @@ export {
   openSourceResearchNotificationPublisher,
   type SourceResearchNotificationPublisher
 } from "./notification-publisher.js";
+export {
+  createPublicWebSourceCatalog,
+  type PublicWebSourceDefinition
+} from "./public-web-source-catalog.js";
 
 export type SourceResearchBatchState =
   | "QUEUED"
