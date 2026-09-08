@@ -291,10 +291,10 @@ if ($LASTEXITCODE -ne 0) {
 Remove-Item Env:CHOICEMIND_CREDENTIAL_MASTER_KEY_BASE64 -ErrorAction SilentlyContinue
 
 $healthUrls = [ordered]@{
-    'Web' = 'http://127.0.0.1:1029/health/live'
-    'API' = 'http://127.0.0.1:3100/health/live'
-    'Orchestrator' = 'http://127.0.0.1:3200/health/live'
-    'Data Worker' = 'http://127.0.0.1:3300/health/live'
+    'Web' = "http://127.0.0.1:$($servicePorts['Web'])/health/live"
+    'API' = "http://127.0.0.1:$($servicePorts['API'])/health/live"
+    'Orchestrator' = "http://127.0.0.1:$($servicePorts['Orchestrator'])/health/live"
+    'Data Worker' = "http://127.0.0.1:$($servicePorts['Data Worker'])/health/live"
 }
 $applicationProcess = $null
 $scriptExitCode = 0

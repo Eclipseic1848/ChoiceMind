@@ -982,7 +982,7 @@ describe("start_all.bat", () => {
 			expect(result.status, output).toBe(0);
 			expect(output).toContain("ChoiceMind Alpha 已启动，前端开发热更新已启用");
 			expect(output).toContain("Identity Lifecycle Worker 后台进程：运行中");
-			expect(output).toContain("Web 健康：http://127.0.0.1:1029/health/live");
+			expect(output).toContain(`Web 健康：http://127.0.0.1:${1029 + offset}/health/live`);
 			expect(output).toContain("API Publisher 后台进程：运行中");
 			expect(output).toContain("Orchestrator Worker 后台进程：运行中");
 			expect(dockerLog).toContain("stop postgres redis");

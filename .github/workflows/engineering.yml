@@ -65,7 +65,7 @@ jobs:
             if (process.env[key] !== undefined) minimal[key] = process.env[key];
           }
           for (const [environment, env] of [['minimal', minimal], ['inherited', process.env]]) {
-            for (const [phase, script] of [['startup', '[Console]::Out.Write(1)'], ['cim', 'Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId | Measure-Object | Select-Object -ExpandProperty Count']]) {
+            for (const [phase, script] of [['startup', '[Console]::Out.Write(1)'], ['cim', 'Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId | Measure-Object | Select-Object -ExpandProperty Count'], ['explicit-cim', "Import-Module (Join-Path $PSHOME 'Modules/CimCmdlets/CimCmdlets.psd1') -ErrorAction Stop; Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId | Measure-Object | Select-Object -ExpandProperty Count"]]) {
               const start = Date.now();
               try {
                 execFileSync('powershell.exe', ['-NoLogo','-NoProfile','-NonInteractive','-Command',script], { env, timeout: 5000, windowsHide: true, stdio: 'pipe' });
