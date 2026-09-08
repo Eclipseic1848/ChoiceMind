@@ -8,6 +8,39 @@ export async function acquireCandidateArtifact(
 	signal?: AbortSignal,
 ) {
 	const source = parseAdapterCandidateSource(input);
+	return acquire(source, signal);
+}
+
+// 发现阶段只解析精确版本；PyPI 多制品必须明确文件名，不猜宿主平台。
+export async function resolveCandidateArtifact(
+	input: unknown,
+	signal?: AbortSignal,
+) {
+	if (!object(input) || "artifactSha256" in input)
+		throw new Error("CANDIDATE_RESOLUTION_INPUT_INVALID");
+	const { filename, ...locator } = input;
+	if (
+		(input.kind === "PYPI" &&
+			(typeof filename !== "string" ||
+				!/^[A-Za-z0-9][A-Za-z0-9._+-]{0,239}$/.test(filename))) ||
+		(input.kind !== "PYPI" && filename !== undefined)
+	)
+		throw new Error("CANDIDATE_RESOLUTION_INPUT_INVALID");
+	const source = parseAdapterCandidateSource({
+		...locator,
+		artifactSha256: "0".repeat(64),
+	});
+	return acquire(source, signal, {
+		filename: typeof filename === "string" ? filename : undefined,
+	});
+}
+
+async function acquire(
+	source: ReturnType<typeof parseAdapterCandidateSource>,
+	signal?: AbortSignal,
+	resolution?: { filename: string | undefined },
+) {
+	let expectedSha256 = resolution ? undefined : source.artifactSha256;
 	const deadline = AbortSignal.timeout(90_000);
 	const combined = signal ? AbortSignal.any([signal, deadline]) : deadline;
 	const metadataSha256: string[] = [];
@@ -88,6 +121,7 @@ export async function acquireCandidateArtifact(
 						encoding: "base64",
 					};
 				} else if (
+					resolution === undefined &&
 					metadata.dist.integrity === undefined &&
 					typeof metadata.dist.shasum === "string" &&
 					/^[a-f0-9]{40}$/.test(metadata.dist.shasum)
@@ -112,14 +146,20 @@ export async function acquireCandidateArtifact(
 					(item: unknown) =>
 						object(item) &&
 						object(item.digests) &&
-						item.digests.sha256 === source.artifactSha256,
+						(resolution
+							? item.filename === resolution.filename
+							: item.digests.sha256 === source.artifactSha256),
 				);
 				if (
 					matches.length !== 1 ||
 					!object(matches[0]) ||
-					typeof matches[0].url !== "string"
+					typeof matches[0].url !== "string" ||
+					!object(matches[0].digests) ||
+					typeof matches[0].digests.sha256 !== "string" ||
+					!/^[a-f0-9]{64}$/.test(matches[0].digests.sha256)
 				)
 					throw new Error("INVALID");
+				expectedSha256 = matches[0].digests.sha256;
 				const url = new URL(matches[0].url);
 				if (
 					url.origin !== "https://files.pythonhosted.org" ||
@@ -139,7 +179,10 @@ export async function acquireCandidateArtifact(
 			combined,
 		);
 		combined.throwIfAborted();
-		if (artifact.length === 0 || hash(artifact) !== source.artifactSha256)
+		if (
+			artifact.length === 0 ||
+			(expectedSha256 !== undefined && hash(artifact) !== expectedSha256)
+		)
 			throw new Error("INVALID");
 		if (
 			npmDigest &&
@@ -151,7 +194,7 @@ export async function acquireCandidateArtifact(
 		return {
 			artifact,
 			receipt: {
-				schemaVersion: "candidate-acquisition.v1",
+				schemaVersion: "candidate-acquisition.v2",
 				policyVersion: "public-pinned-artifact.v1",
 				limits: {
 					metadataBytes: 4 * 1024 * 1024,
@@ -159,7 +202,13 @@ export async function acquireCandidateArtifact(
 					deadlineMs: 90_000,
 					idleMs: 15_000,
 				},
-				source,
+				source: parseAdapterCandidateSource({
+					...source,
+					artifactSha256: hash(artifact),
+				}),
+				identityOrigin: resolution
+					? ("RESOLVED" as const)
+					: ("CALLER_PIN" as const),
 				metadataSha256,
 				artifactSha256: hash(artifact),
 				artifactBytes: artifact.length,
@@ -191,7 +240,10 @@ async function request(url: string, signal: AbortSignal) {
 				credentials: "omit",
 				signal: AbortSignal.any([signal, controller.signal]),
 				headers: {
-					accept: "application/octet-stream",
+					accept:
+						new URL(url).hostname === "api.github.com"
+							? "application/vnd.github+json"
+							: "application/octet-stream",
 					"user-agent": "ChoiceMind-Candidate-Acquisition",
 				},
 			}),
