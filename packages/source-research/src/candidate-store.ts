@@ -103,8 +103,13 @@ export async function openPostgresCandidateStore(databaseUrl: string) {
 			if (encoded === undefined || Buffer.byteLength(encoded, "utf8") > 4096)
 				throw new Error("ADAPTER_CANDIDATE_ACTION_INVALID");
 			const snapshot: unknown = JSON.parse(encoded);
+			// 服务端重试时间可以不同；幂等身份绑定业务动作、操作者和报告。
 			const commandHash = createHash("sha256")
-				.update(JSON.stringify([reviewBinding, snapshot]))
+				.update(
+					JSON.stringify([reviewBinding, snapshot], (key, value) =>
+						key === "occurredAt" ? undefined : value,
+					),
+				)
 				.digest("hex");
 			return transaction(candidateId, async (client) => {
 				const current = (

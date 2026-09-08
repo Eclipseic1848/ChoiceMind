@@ -26,6 +26,12 @@ describe.runIf(process.env.CHOICEMIND_TEST_DATABASE_URL !== undefined)(
 				]);
 				expect(approved[0]).toEqual(approved[1]);
 				expect(approved[0]?.events).toHaveLength(1);
+				expect(
+					await store.transition(id, binding, request, {
+						...action,
+						occurredAt: "2026-09-08T12:01:30.000Z",
+					}),
+				).toEqual(approved[0]);
 				await expect(
 					store.transition(id, binding, request, {
 						...action,

@@ -4,6 +4,10 @@
   "private": true,
   "type": "module",
   "exports": {
+    "./candidate-store": {
+      "types": "./src/candidate-store.ts",
+      "default": "./dist/candidate-store.js"
+    },
     ".": {
       "types": "./src/index.ts",
       "default": "./dist/index.js"
