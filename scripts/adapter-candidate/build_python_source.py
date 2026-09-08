@@ -102,4 +102,4 @@ def build_python_source(data, sha256, inspect_archive, max_archive_bytes, locked
         "status": "BUILD_EXITED",
         "runtimeDependencies": "NOT_RUN",
         "reviewStatus": "NOT_RUN",
-    }
+    }, wheel

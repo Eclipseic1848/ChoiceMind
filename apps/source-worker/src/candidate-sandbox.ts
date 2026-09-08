@@ -25,6 +25,15 @@ const RUNTIMES = {
 		],
 	},
 } as const;
+const EXECUTION_RUNTIMES = {
+	...RUNTIMES,
+	PYTHON_BUILD: {
+		...RUNTIMES.PYTHON,
+		policy: "local-python-build-sandbox.v1",
+		// 二进制 wheel 最多 64 MiB，帧头与摘要不足 1 MiB；普通日志额度不变。
+		outputLimit: 65 * 1024 * 1024,
+	},
+} as const;
 const SLOT = "choicemind-adapter-candidate-slot";
 const LIMIT = 65_536;
 const OWNER_LABEL = "choicemind.candidate.owner";
@@ -39,7 +48,7 @@ export async function executeCandidateSandbox(input: {
 	artifactSha256: string;
 	timeoutMs?: number;
 	signal?: AbortSignal;
-	runtime?: keyof typeof RUNTIMES;
+	runtime?: keyof typeof EXECUTION_RUNTIMES;
 	stdin?: Uint8Array;
 }) {
 	const timeoutMs = input.timeoutMs ?? 600_000;
@@ -52,9 +61,9 @@ export async function executeCandidateSandbox(input: {
 		!Number.isSafeInteger(timeoutMs) ||
 		timeoutMs < 100 ||
 		timeoutMs > 600_000 ||
-		!Object.hasOwn(RUNTIMES, runtimeName) ||
+		!Object.hasOwn(EXECUTION_RUNTIMES, runtimeName) ||
 		(input.stdin !== undefined &&
-			(runtimeName !== "PYTHON" ||
+			(runtimeName === "NODE" ||
 				!(input.stdin instanceof Uint8Array) ||
 				input.stdin.byteLength > 64 * 1024 * 1024))
 	) {
@@ -64,9 +73,9 @@ export async function executeCandidateSandbox(input: {
 	const artifact = Buffer.from(input.artifact);
 	const data =
 		input.stdin === undefined ? Buffer.alloc(0) : Buffer.from(input.stdin);
-	const runtime = RUNTIMES[runtimeName];
+	const runtime = EXECUTION_RUNTIMES[runtimeName];
 	let stdin = artifact;
-	if (runtimeName === "PYTHON") {
+	if (runtimeName !== "NODE") {
 		const length = Buffer.alloc(4);
 		length.writeUInt32BE(artifact.byteLength);
 		stdin = Buffer.concat([length, artifact, data]);
@@ -194,7 +203,7 @@ export async function executeCandidateSandbox(input: {
 			policyVersion: runtime.policy,
 			artifactSha256: digest(artifact),
 			image: runtime.image,
-			...(runtimeName === "PYTHON" ? { inputSha256: digest(data) } : {}),
+			...(runtimeName !== "NODE" ? { inputSha256: digest(data) } : {}),
 			outcome: execution.outcome,
 			exitCode,
 			stdoutSha256: digest(execution.stdout),
@@ -259,7 +268,7 @@ export async function recoverCandidateSandbox(
 	const createdAt = Date.parse(slot.Created);
 	if (
 		slot.Name !== `/${SLOT}` ||
-		!Object.values(RUNTIMES).some(
+		!Object.values(EXECUTION_RUNTIMES).some(
 			(runtime) =>
 				slot.Config.Image === runtime.image &&
 				labels?.[POLICY_LABEL] === runtime.policy,

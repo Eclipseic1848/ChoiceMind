@@ -3,7 +3,31 @@ import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
-import { installCandidateWheels } from "./candidate-wheel-install.js";
+import {
+	decodeCandidateWheelOutput,
+	installCandidateWheels,
+} from "./candidate-wheel-install.js";
+
+it("构建帧拒绝截断、意外尾部及缺失制品；哈希取自实际字节", () => {
+	const summary = Buffer.from('{"reviewStatus":"NOT_RUN"}');
+	const header = Buffer.alloc(4);
+	header.writeUInt32BE(summary.length);
+	const bytes = Buffer.from("synthetic-wheel");
+	const frame = Buffer.concat([header, summary, bytes]);
+	expect(decodeCandidateWheelOutput(frame, true).builtArtifact?.sha256).toBe(
+		createHash("sha256").update(bytes).digest("hex"),
+	);
+	for (const invalid of [
+		Buffer.alloc(0),
+		Buffer.from([255, 255, 255, 255]),
+		frame.subarray(0, 5),
+		Buffer.concat([header, summary]),
+	])
+		expect(() => decodeCandidateWheelOutput(invalid, true)).toThrow();
+	expect(() => decodeCandidateWheelOutput(frame, false)).toThrow(
+		"CANDIDATE_BUILD_FRAME_INVALID",
+	);
+});
 
 it("空锁清单不能启动安装", async () => {
 	await expect(
@@ -77,6 +101,14 @@ describe.runIf(process.env.CHOICEMIND_RUN_CANDIDATE_SANDBOX === "1")(
 					mode === "source-shadow"
 				) {
 					await expect(result).resolves.toMatchObject({
+						...(mode.startsWith("source-")
+							? {
+									builtArtifact: {
+										bytes: expect.any(Buffer),
+										sha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+									},
+								}
+							: { builtArtifact: undefined }),
 						summary: {
 							installed: true,
 							lockedWheels: 2,

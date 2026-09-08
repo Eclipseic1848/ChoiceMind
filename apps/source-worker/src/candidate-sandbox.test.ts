@@ -37,6 +37,28 @@ it("启动任何进程前拒绝制品变化、越界预算与已取消作业", a
 describe.runIf(process.env.CHOICEMIND_RUN_CANDIDATE_SANDBOX === "1")(
 	"本机 Docker 合成候选",
 	() => {
+		it("构建制品策略允许大于普通摘要的输出，但仍截断超额内容并回收", async () => {
+			for (const [megabytes, outcome] of [
+				[33, "EXITED"],
+				[66, "OUTPUT_LIMIT"],
+			] as const) {
+				const result = await executeCandidateSandbox({
+					...input(
+						`import sys\nsys.stdout.buffer.write(b'x' * ${megabytes} * 1024 * 1024)`,
+					),
+					runtime: "PYTHON_BUILD",
+				});
+				expect(result.report.outcome).toBe(outcome);
+				expect(result.report.policyVersion).toBe(
+					"local-python-build-sandbox.v1",
+				);
+				expect(result.report.outputLimitBytes).toBe(65 * 1024 * 1024);
+				expect(result.untrustedStdout.length).toBeLessThanOrEqual(
+					65 * 1024 * 1024,
+				);
+				expect(await recoverCandidateSandbox()).toBe("EMPTY");
+			}
+		}, 40_000);
 		it("创建阶段已耗尽预算的自有容器仍可安全回收", async () => {
 			expect(await recoverCandidateSandbox()).toBe("EMPTY");
 			const runDocker = (args: string[]) =>
