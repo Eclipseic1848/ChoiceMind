@@ -2546,7 +2546,7 @@ async function listWindowsDescendantPids(rootPid: number): Promise<number[]> {
   const script = [
     "$ErrorActionPreference = 'Stop'",
     `$rootPid = [uint32]${rootPid}`,
-    "$processes = @(Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId)",
+    "$processes = @(Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId | Select-Object ProcessId, ParentProcessId)",
     "$pending = @($rootPid)",
     "$descendants = @()",
     "while ($pending.Count -gt 0) {",
@@ -2567,7 +2567,8 @@ async function listWindowsDescendantPids(rootPid: number): Promise<number[]> {
     ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
     {
       encoding: "utf8",
-      env: minimalEnvironment(),
+      // 仅内部清理查询继承模块路径，候选命令仍使用原有最小环境。
+      env: { ...minimalEnvironment(), PSModulePath: process.env.PSModulePath },
       timeout: 5000,
       windowsHide: true
     }

@@ -14,7 +14,7 @@ type Fetch = (
 export async function executeLocalServiceRequest(
 	target: LocalServiceTargetV1,
 	request: LocalServiceRequestV1,
-	dependencies: Readonly<{ fetch?: Fetch }> = {},
+	dependencies: Readonly<{ fetch?: Fetch; signal?: AbortSignal }> = {},
 ): Promise<LocalServiceResultV1> {
 	if (target.port !== request.port) {
 		return failure(
@@ -38,7 +38,9 @@ export async function executeLocalServiceRequest(
 	const fetcher = dependencies.fetch ?? fetch;
 	let response: Response;
 	try {
-		response = await fetcher(...buildUpstreamRequest(target, request));
+		response = await fetcher(
+			...buildUpstreamRequest(target, request, dependencies.signal),
+		);
 	} catch (error) {
 		if (isTimeoutError(error)) {
 			return failure(target, request.requestId, "TIMEOUT", "本地服务调用超时");
@@ -66,7 +68,10 @@ export async function executeLocalServiceRequest(
 	let payload: unknown;
 	try {
 		payload = await response.json();
-	} catch {
+	} catch (error) {
+		if (isTimeoutError(error)) {
+			return failure(target, request.requestId, "TIMEOUT", "本地服务调用超时");
+		}
 		return failure(
 			target,
 			request.requestId,
@@ -90,8 +95,13 @@ export async function executeLocalServiceRequest(
 function buildUpstreamRequest(
 	target: LocalServiceTargetV1,
 	request: LocalServiceRequestV1,
+	callerSignal?: AbortSignal,
 ): [string, RequestInit] {
-	const signal = AbortSignal.timeout(target.timeoutMs);
+	const timeoutSignal = AbortSignal.timeout(target.timeoutMs);
+	const signal =
+		callerSignal === undefined
+			? timeoutSignal
+			: AbortSignal.any([callerSignal, timeoutSignal]);
 	switch (target.protocol) {
 		case "OPENAI_CHAT_COMPLETIONS": {
 			if (request.port !== "MODEL_PROVIDER") {

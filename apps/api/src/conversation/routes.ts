@@ -157,6 +157,12 @@ export function registerConversationRoutes(
 			const decisionTaskId = readNonEmptyString(request.body, "decisionTaskId");
 			if (decisionTaskId === undefined)
 				return sendInvalid(reply, "decisionTaskId 无效");
+			const requirementRevisionId = readNonEmptyString(
+				request.body,
+				"requirementRevisionId",
+			);
+			if (requirementRevisionId === undefined)
+				return sendInvalid(reply, "requirementRevisionId 无效");
 			try {
 				const ownedTask = await decisionTaskPersistence.get(
 					decisionTaskId,
@@ -168,6 +174,7 @@ export function registerConversationRoutes(
 						type: "LINK_DECISION_TASK",
 						decisionTaskId,
 						ownerUserId: principal.userId,
+						requirementRevisionId,
 						sessionId: request.params.sessionId,
 					}),
 				);

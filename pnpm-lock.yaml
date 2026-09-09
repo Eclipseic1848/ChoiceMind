@@ -53,6 +53,9 @@ importers:
       fastify:
         specifier: 5.11.3
         version: 5.11.3
+      zod:
+        specifier: 4.4.3
+        version: 4.4.3
     devDependencies:
       '@types/pg':
         specifier: 8.23.1
@@ -85,6 +88,12 @@ importers:
 
   apps/source-worker:
     dependencies:
+      '@choicemind/local-services':
+        specifier: workspace:*
+        version: link:../../packages/local-services
+      '@choicemind/evidence-ingestion':
+        specifier: workspace:*
+        version: link:../../packages/evidence-ingestion
       '@choicemind/security':
         specifier: workspace:*
         version: link:../../packages/security
@@ -97,6 +106,9 @@ importers:
       '@choicemind/task-persistence':
         specifier: workspace:*
         version: link:../../packages/task-persistence
+      playwright:
+        specifier: 1.62.1
+        version: 1.62.1
 
   apps/web:
     dependencies:
@@ -182,11 +194,40 @@ importers:
         specifier: workspace:*
         version: link:../contracts
 
+  packages/memory:
+    dependencies:
+      pg:
+        specifier: 8.23.0
+        version: 8.23.0
+    devDependencies:
+      '@types/pg':
+        specifier: 8.23.1
+        version: 8.23.1
+
   packages/p0-gold-gate:
     dependencies:
       '@choicemind/contracts':
         specifier: workspace:*
         version: link:../contracts
+
+  packages/provider-routing:
+    dependencies:
+      '@choicemind/security':
+        specifier: workspace:*
+        version: link:../security
+      pg:
+        specifier: 8.23.0
+        version: 8.23.0
+      zod:
+        specifier: 4.4.3
+        version: 4.4.3
+    devDependencies:
+      '@choicemind/task-persistence':
+        specifier: workspace:*
+        version: link:../task-persistence
+      '@types/pg':
+        specifier: 8.23.1
+        version: 8.23.1
 
   packages/security: {}
 

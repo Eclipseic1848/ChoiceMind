@@ -20,7 +20,8 @@
     "@choicemind/source-access": "workspace:*",
     "@choicemind/source-research": "workspace:*",
     "@choicemind/task-persistence": "workspace:*",
-    "fastify": "5.11.3"
+    "fastify": "5.11.3",
+    "zod": "4.4.3"
   },
   "devDependencies": {
     "@types/pg": "8.23.1",

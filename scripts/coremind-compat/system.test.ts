@@ -69,6 +69,22 @@ afterEach(async () => {
   );
 });
 
+test("真实命令不继承宿主秘密或 PowerShell 模块路径且能完成清理", async () => {
+  vi.stubEnv("CHOICEMIND_TEST_HOST_SECRET", "synthetic-secret");
+  try {
+    const output = await executeSystemCommand({
+      command: "node",
+      args: [
+        "-e",
+        'process.stdout.write(JSON.stringify([process.env.CHOICEMIND_TEST_HOST_SECRET ?? null, process.env.PSModulePath ?? null]));'
+      ]
+    });
+    expect(JSON.parse(output.toString("utf8"))).toEqual([null, null]);
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});
+
 test("真实命令取消后父子进程均已退出", async () => {
   const root = await createTemporaryDirectory();
   const pidPath = path.join(root, "processes.json");
@@ -360,6 +376,7 @@ test.runIf(process.platform === "win32")(
     const output = await executeSystemCommand({
       command: "pnpm",
       args: ["--dir", workspace, "--version"],
+      environment: { COREPACK_ENABLE_NETWORK: "0" },
       signal: AbortSignal.timeout(15_000)
     });
 
@@ -2078,6 +2095,10 @@ describe("CoreMind Git 制品边界", () => {
       choiceMindRoot: root,
       commandTimeoutMs: 50,
       stageTimeouts: {
+        GIT_FETCH: { hardDeadlineMs: 5_000, idleTimeoutMs: 5_000 },
+        VERSION_SYNC: { hardDeadlineMs: 5_000, idleTimeoutMs: 5_000 },
+        BUILD: { hardDeadlineMs: 5_000, idleTimeoutMs: 5_000 },
+        PACK: { hardDeadlineMs: 5_000, idleTimeoutMs: 5_000 },
         NPM_CI: { hardDeadlineMs: 250, idleTimeoutMs: 30 }
       },
       execute: async (request) => {
@@ -2121,6 +2142,7 @@ describe("CoreMind Git 制品边界", () => {
       choiceMindRoot: root,
       commandTimeoutMs: 50,
       stageTimeouts: {
+        GIT_FETCH: { hardDeadlineMs: 5_000, idleTimeoutMs: 5_000 },
         NPM_CI: { hardDeadlineMs: 250, idleTimeoutMs: 30 }
       },
       execute: async (request) => {
@@ -2171,6 +2193,7 @@ describe("CoreMind Git 制品边界", () => {
       choiceMindRoot: root,
       commandTimeoutMs: 50,
       stageTimeouts: {
+        GIT_FETCH: { hardDeadlineMs: 5_000, idleTimeoutMs: 5_000 },
         NPM_CI: { hardDeadlineMs: 80, idleTimeoutMs: 30 }
       },
       execute: async (request) => {

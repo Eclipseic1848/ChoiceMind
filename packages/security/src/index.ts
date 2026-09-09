@@ -39,7 +39,7 @@ export type SecurityActor = Readonly<{
 
 export type SystemCredentialAccess = Readonly<{
   actor: Readonly<{ userId: string; role: "SYSTEM" }>;
-  secretType: "SOURCE_CREDENTIAL";
+  secretType: EncryptedCredentialRecord["secretType"];
   actions: readonly ("USE" | "DELETE")[];
 }>;
 

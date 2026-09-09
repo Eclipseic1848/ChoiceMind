@@ -2,7 +2,10 @@ import { randomUUID } from "node:crypto";
 import { Pool } from "pg";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { openPostgresConversation } from "../../src/index.js";
+import {
+	openPostgresConversation,
+	type RequirementUpdate,
+} from "../../src/index.js";
 
 const databaseUrl = process.env.CHOICEMIND_TEST_DATABASE_URL;
 const schemasToDelete: string[] = [];
@@ -106,6 +109,8 @@ describe.skipIf(databaseUrl === undefined)("Conversation 用户旅程", () => {
 		});
 		expect(unchanged.currentRequirement?.revisionNumber).toBe(3);
 		expect(unchanged.messages).toHaveLength(ready.messages.length + 2);
+		const { turn: completedTurn, ...unchangedSession } = unchanged;
+		void completedTurn;
 		await conversation.close();
 
 		const reopened = await openPostgresConversation({ databaseUrl: isolated });
@@ -115,7 +120,7 @@ describe.skipIf(databaseUrl === undefined)("Conversation 用户旅程", () => {
 				ownerUserId: "user-a",
 				sessionId: created.sessionId,
 			}),
-		).resolves.toEqual(unchanged);
+		).resolves.toEqual(unchangedSession);
 		await expect(
 			reopened.read({
 				type: "GET_SESSION",
@@ -170,6 +175,31 @@ describe.skipIf(databaseUrl === undefined)("Conversation 用户旅程", () => {
 		});
 		expect(retried).toEqual(afterTurn);
 		expect(retried.messages).toHaveLength(3);
+		expect(retried.turn).toEqual(afterTurn.turn);
+		currentTime = new Date("2026-08-27T22:13:00.000Z");
+		const laterSameText = await conversation.execute({
+			type: "APPEND_USER_TURN",
+			clientTurnId: "turn-same-text-later",
+			ownerUserId: "user-a",
+			sessionId: first.sessionId,
+			text: "我要买一台显示器。",
+			requirementUpdate: { consumptionGoal: "购买显示器" },
+		});
+		const restarted = await openPostgresConversation({
+			databaseUrl: isolated,
+			now: () => currentTime,
+		});
+		const replayedFirstTurn = await restarted.execute({
+			type: "APPEND_USER_TURN",
+			clientTurnId: "turn-idempotent",
+			ownerUserId: "user-a",
+			sessionId: first.sessionId,
+			text: "我要买一台显示器。",
+			requirementUpdate: { consumptionGoal: "购买显示器" },
+		});
+		expect(replayedFirstTurn.turn).toEqual(afterTurn.turn);
+		expect(replayedFirstTurn.turn).not.toEqual(laterSameText.turn);
+		await restarted.close();
 
 		await expect(
 			conversation.execute({
@@ -256,6 +286,220 @@ describe.skipIf(databaseUrl === undefined)("Conversation 用户旅程", () => {
 		await conversation.close();
 	});
 
+	it("解释失败仍保存 User 原文，重试同一轮次成功后复用结果", async () => {
+		if (databaseUrl === undefined) throw new Error("测试数据库未配置");
+		const isolated = await createIsolatedDatabaseUrl(databaseUrl);
+		let currentTime = new Date("2026-08-29T08:00:00.000Z");
+		const interpretations: unknown[] = [];
+		const requirementInterpreter = {
+			async interpret(input: unknown) {
+				interpretations.push(input);
+				if (interpretations.length === 1) {
+					throw new Error("模拟模型暂时不可用");
+				}
+				return {
+					consumptionGoal: "购买人体工学椅",
+					hardConstraints: ["预算不超过 3000 元"],
+					primaryScenario: "每天在家办公八小时",
+				};
+			},
+		};
+		const conversation = await openPostgresConversation({
+			databaseUrl: isolated,
+			now: () => currentTime,
+			requirementInterpreter,
+		});
+		const created = await conversation.execute({
+			type: "CREATE_SESSION",
+			clientRequestId: "create-natural-language",
+			ownerUserId: "user-a",
+		});
+		const command = {
+			type: "APPEND_USER_TURN" as const,
+			clientTurnId: "turn-natural-language",
+			ownerUserId: "user-a",
+			sessionId: created.sessionId,
+			text: "想买人体工学椅，每天在家办公八小时，预算不超过 3000 元。",
+		};
+
+		await expect(conversation.execute(command)).rejects.toThrow(
+			"模拟模型暂时不可用",
+		);
+		const afterFailure = await conversation.read({
+			type: "GET_SESSION",
+			ownerUserId: "user-a",
+			sessionId: created.sessionId,
+		});
+		expect(afterFailure).toMatchObject({
+			currentRequirement: null,
+			messages: [{ role: "ASSISTANT" }, { role: "USER", text: command.text }],
+		});
+		const crashSimulation = new Pool({ connectionString: isolated });
+		try {
+			await crashSimulation.query(
+				`UPDATE conversation_messages
+				 SET interpretation_status = 'PROCESSING'
+				 WHERE session_id = $1 AND client_turn_id = $2`,
+				[created.sessionId, command.clientTurnId],
+			);
+		} finally {
+			await crashSimulation.end();
+		}
+		currentTime = new Date("2026-08-29T08:03:00.000Z");
+
+		const completed = await conversation.execute(command);
+		expect(completed.currentRequirement).toMatchObject({
+			consumptionGoal: "购买人体工学椅",
+			hardConstraints: ["预算不超过 3000 元"],
+			missingKeys: [],
+			primaryScenario: "每天在家办公八小时",
+			readiness: "READY_FOR_RESEARCH",
+		});
+		expect(completed.messages).toHaveLength(3);
+		expect(interpretations).toHaveLength(2);
+
+		await expect(conversation.execute(command)).resolves.toEqual(completed);
+		expect(interpretations).toHaveLength(2);
+		await expect(
+			conversation.execute({ ...command, text: "同一轮次换成另一段文字" }),
+		).rejects.toMatchObject({ code: "CONVERSATION_IDEMPOTENCY_CONFLICT" });
+		expect(interpretations).toHaveLength(2);
+		await conversation.close();
+	});
+
+	it("较早轮次失败后重试仍返回该轮自己的 Assistant 回复", async () => {
+		if (databaseUrl === undefined) throw new Error("测试数据库未配置");
+		const isolated = await createIsolatedDatabaseUrl(databaseUrl);
+		let oldTurnAttempts = 0;
+		const conversation = await openPostgresConversation({
+			databaseUrl: isolated,
+			requirementInterpreter: {
+				async interpret(input) {
+					if (input.clientTurnId === "turn-older") {
+						oldTurnAttempts += 1;
+						if (oldTurnAttempts === 1) throw new Error("模拟旧轮次失败");
+						return { primaryScenario: "长时间编程" };
+					}
+					return { consumptionGoal: "购买编程显示器" };
+				},
+			},
+		});
+		const created = await conversation.execute({
+			type: "CREATE_SESSION",
+			clientRequestId: "create-out-of-order-retry",
+			ownerUserId: "user-a",
+		});
+		const olderCommand = {
+			type: "APPEND_USER_TURN" as const,
+			clientTurnId: "turn-older",
+			ownerUserId: "user-a",
+			sessionId: created.sessionId,
+			text: "主要用于长时间编程。",
+		};
+		await expect(conversation.execute(olderCommand)).rejects.toThrow(
+			"模拟旧轮次失败",
+		);
+		const afterFailure = await conversation.read({
+			type: "GET_SESSION",
+			ownerUserId: "user-a",
+			sessionId: created.sessionId,
+		});
+		const olderUserMessage = afterFailure?.messages.find(
+			(message) => message.role === "USER",
+		);
+		if (olderUserMessage === undefined) throw new Error("缺少旧轮次 User 消息");
+
+		await conversation.execute({
+			type: "APPEND_USER_TURN",
+			clientTurnId: "turn-newer",
+			ownerUserId: "user-a",
+			sessionId: created.sessionId,
+			text: "我想买一台编程显示器。",
+		});
+		const retried = await conversation.execute(olderCommand);
+		expect(retried.turn.userMessageId).toBe(olderUserMessage.messageId);
+		expect(
+			retried.messages.find(
+				(message) => message.messageId === retried.turn.assistantMessageId,
+			),
+		).toMatchObject({
+			role: "ASSISTANT",
+			text: "哪些条件一旦不满足，你就不会考虑？如果没有，也可以明确告诉我没有硬性条件。",
+		});
+		await expect(conversation.execute(olderCommand)).resolves.toEqual(retried);
+		expect(oldTurnAttempts).toBe(2);
+		await conversation.close();
+	});
+
+	it("过期 attempt 的迟到结果不能覆盖新 attempt", async () => {
+		if (databaseUrl === undefined) throw new Error("测试数据库未配置");
+		const isolated = await createIsolatedDatabaseUrl(databaseUrl);
+		let currentTime = new Date("2026-08-29T09:00:00.000Z");
+		let signalStarted: (() => void) | undefined;
+		const started = new Promise<void>((resolve) => {
+			signalStarted = resolve;
+		});
+		let resolveFirst: ((update: RequirementUpdate) => void) | undefined;
+		const firstModelResult = new Promise<RequirementUpdate>((resolve) => {
+			resolveFirst = resolve;
+		});
+		const firstConversation = await openPostgresConversation({
+			databaseUrl: isolated,
+			now: () => currentTime,
+			requirementInterpreter: {
+				interpret() {
+					signalStarted?.();
+					return firstModelResult;
+				},
+			},
+		});
+		const created = await firstConversation.execute({
+			type: "CREATE_SESSION",
+			clientRequestId: "create-stale-attempt",
+			ownerUserId: "user-a",
+		});
+		const command = {
+			type: "APPEND_USER_TURN" as const,
+			clientTurnId: "turn-stale-attempt",
+			ownerUserId: "user-a",
+			sessionId: created.sessionId,
+			text: "我想买显示器",
+		};
+		const staleAttempt = firstConversation.execute(command);
+		await started;
+
+		currentTime = new Date("2026-08-29T09:03:00.000Z");
+		const recoveringConversation = await openPostgresConversation({
+			databaseUrl: isolated,
+			now: () => currentTime,
+			requirementInterpreter: {
+				async interpret() {
+					return { consumptionGoal: "购买新 attempt 的显示器" };
+				},
+			},
+		});
+		const recovered = await recoveringConversation.execute(command);
+		expect(recovered.currentRequirement?.consumptionGoal).toBe(
+			"购买新 attempt 的显示器",
+		);
+
+		resolveFirst?.({ consumptionGoal: "旧 attempt 的迟到结果" });
+		await expect(staleAttempt).rejects.toMatchObject({
+			code: "CONVERSATION_TURN_IN_PROGRESS",
+		});
+		const finalSession = await recoveringConversation.read({
+			type: "GET_SESSION",
+			ownerUserId: "user-a",
+			sessionId: created.sessionId,
+		});
+		expect(finalSession?.currentRequirement?.consumptionGoal).toBe(
+			"购买新 attempt 的显示器",
+		);
+		expect(finalSession?.messages).toHaveLength(3);
+		await firstConversation.close();
+		await recoveringConversation.close();
+	});
+
 	it("并发重试同一创建请求只生成一个 Session", async () => {
 		if (databaseUrl === undefined) throw new Error("测试数据库未配置");
 		const isolated = await createIsolatedDatabaseUrl(databaseUrl);
@@ -304,16 +548,29 @@ describe.skipIf(databaseUrl === undefined)("Conversation 用户旅程", () => {
 			clientRequestId: "create-task-link",
 			ownerUserId: "user-a",
 		});
+		const turn = await conversation.execute({
+			type: "APPEND_USER_TURN",
+			clientTurnId: "turn-task-link",
+			ownerUserId: "user-a",
+			sessionId: created.sessionId,
+			text: "我想买一台显示器。",
+			requirementUpdate: { consumptionGoal: "购买显示器" },
+		});
+		const requirementRevisionId = turn.currentRequirement?.revisionId;
+		if (requirementRevisionId === undefined)
+			throw new Error("缺少 Requirement Revision");
 
 		const linked = await conversation.execute({
 			type: "LINK_DECISION_TASK",
 			decisionTaskId: "task-conversation-1",
+			requirementRevisionId,
 			ownerUserId: "user-a",
 			sessionId: created.sessionId,
 		});
 		expect(linked.decisionTasks).toEqual([
 			{
 				decisionTaskId: "task-conversation-1",
+				requirementRevisionId,
 				linkedAt: "2026-08-27T23:20:00.000Z",
 			},
 		]);
@@ -322,6 +579,7 @@ describe.skipIf(databaseUrl === undefined)("Conversation 用户旅程", () => {
 				type: "LINK_DECISION_TASK",
 				decisionTaskId: "task-conversation-1",
 				ownerUserId: "user-a",
+				requirementRevisionId,
 				sessionId: created.sessionId,
 			}),
 		).resolves.toEqual(linked);
@@ -330,7 +588,158 @@ describe.skipIf(databaseUrl === undefined)("Conversation 用户旅程", () => {
 				type: "LINK_DECISION_TASK",
 				decisionTaskId: "task-forged",
 				ownerUserId: "user-b",
+				requirementRevisionId,
 				sessionId: created.sessionId,
+			}),
+		).rejects.toMatchObject({ code: "CONVERSATION_NOT_FOUND" });
+		const otherUserSession = await conversation.execute({
+			type: "CREATE_SESSION",
+			clientRequestId: "create-other-user-task-link",
+			ownerUserId: "user-b",
+		});
+		const otherUserTurn = await conversation.execute({
+			type: "APPEND_USER_TURN",
+			clientTurnId: "turn-other-user-task-link",
+			ownerUserId: "user-b",
+			sessionId: otherUserSession.sessionId,
+			text: "我想买一台电视。",
+			requirementUpdate: { consumptionGoal: "购买电视" },
+		});
+		const otherUserRequirementRevisionId =
+			otherUserTurn.currentRequirement?.revisionId;
+		if (otherUserRequirementRevisionId === undefined)
+			throw new Error("缺少其他 User 的 Requirement Revision");
+		await expect(
+			conversation.execute({
+				type: "LINK_DECISION_TASK",
+				decisionTaskId: "task-conversation-1",
+				ownerUserId: "user-b",
+				requirementRevisionId: otherUserRequirementRevisionId,
+				sessionId: otherUserSession.sessionId,
+			}),
+		).rejects.toMatchObject({ code: "CONVERSATION_NOT_FOUND" });
+		await conversation.close();
+	});
+
+	it("只按所属 User、Decision Task 与 Requirement Revision 解析精确触发消息", async () => {
+		if (databaseUrl === undefined) throw new Error("测试数据库未配置");
+		const isolated = await createIsolatedDatabaseUrl(databaseUrl);
+		const conversation = await openPostgresConversation({
+			databaseUrl: isolated,
+		});
+		const created = await conversation.execute({
+			type: "CREATE_SESSION",
+			clientRequestId: "create-task-context",
+			ownerUserId: "user-a",
+		});
+		const turn = await conversation.execute({
+			type: "APPEND_USER_TURN",
+			clientTurnId: "turn-task-context",
+			ownerUserId: "user-a",
+			sessionId: created.sessionId,
+			text: "我想买一台用于长时间编程的显示器。",
+			requirementUpdate: { consumptionGoal: "购买编程显示器" },
+		});
+		const requirementRevisionId = turn.currentRequirement?.revisionId;
+		if (requirementRevisionId === undefined)
+			throw new Error("缺少 Requirement Revision");
+		const laterTurn = await conversation.execute({
+			type: "APPEND_USER_TURN",
+			clientTurnId: "turn-task-context-later",
+			ownerUserId: "user-a",
+			sessionId: created.sessionId,
+			text: "还要支持 USB-C 一线连接。",
+			requirementUpdate: { hardConstraints: ["支持 USB-C 一线连接"] },
+		});
+		const laterRequirementRevisionId = laterTurn.currentRequirement?.revisionId;
+		if (laterRequirementRevisionId === undefined)
+			throw new Error("缺少后续 Requirement Revision");
+		await conversation.execute({
+			type: "LINK_DECISION_TASK",
+			decisionTaskId: "task-context-1",
+			ownerUserId: "user-a",
+			requirementRevisionId,
+			sessionId: created.sessionId,
+		});
+
+		await expect(
+			conversation.read({
+				type: "GET_DECISION_TASK_CONTEXT",
+				ownerUserId: "user-a",
+				decisionTaskId: "task-context-1",
+				requirementRevisionId,
+			}),
+		).resolves.toMatchObject({
+			sessionId: created.sessionId,
+			triggerMessage: {
+				messageId: turn.turn.userMessageId,
+				text: "我想买一台用于长时间编程的显示器。",
+			},
+		});
+		await expect(
+			conversation.read({
+				type: "GET_DECISION_TASK_CONTEXT",
+				ownerUserId: "user-b",
+				decisionTaskId: "task-context-1",
+				requirementRevisionId,
+			}),
+		).resolves.toBeUndefined();
+		await expect(
+			conversation.read({
+				type: "GET_DECISION_TASK_CONTEXT",
+				ownerUserId: "user-a",
+				decisionTaskId: "task-context-1",
+				requirementRevisionId: laterRequirementRevisionId,
+			}),
+		).resolves.toBeUndefined();
+		await expect(
+			conversation.execute({
+				type: "LINK_DECISION_TASK",
+				decisionTaskId: "task-context-1",
+				ownerUserId: "user-a",
+				requirementRevisionId: laterRequirementRevisionId,
+				sessionId: created.sessionId,
+			}),
+		).rejects.toMatchObject({ code: "CONVERSATION_IDEMPOTENCY_CONFLICT" });
+		await conversation.close();
+	});
+
+	it("拒绝把 Decision Task 绑定到其他 Session 的 Requirement Revision", async () => {
+		if (databaseUrl === undefined) throw new Error("测试数据库未配置");
+		const isolated = await createIsolatedDatabaseUrl(databaseUrl);
+		const conversation = await openPostgresConversation({
+			databaseUrl: isolated,
+		});
+		const first = await conversation.execute({
+			type: "CREATE_SESSION",
+			clientRequestId: "create-link-first-session",
+			ownerUserId: "user-a",
+		});
+		const second = await conversation.execute({
+			type: "CREATE_SESSION",
+			clientRequestId: "create-link-second-session",
+			ownerUserId: "user-a",
+		});
+		const secondTurn = await conversation.execute({
+			type: "APPEND_USER_TURN",
+			clientTurnId: "turn-link-second-session",
+			ownerUserId: "user-a",
+			sessionId: second.sessionId,
+			text: "我想买一把人体工学椅。",
+			requirementUpdate: { consumptionGoal: "购买人体工学椅" },
+		});
+		const secondRequirementRevisionId =
+			secondTurn.currentRequirement?.revisionId;
+		if (secondRequirementRevisionId === undefined)
+			throw new Error("缺少第二个 Session 的 Requirement Revision");
+
+		await expect(
+			conversation.execute({
+				type: "LINK_DECISION_TASK",
+				decisionTaskId: "task-cross-session-revision",
+				ownerUserId: "user-a",
+				requirementRevisionId: secondRequirementRevisionId,
+				sessionId: first.sessionId,
 			}),
 		).rejects.toMatchObject({ code: "CONVERSATION_NOT_FOUND" });
 		await conversation.close();
@@ -347,7 +756,7 @@ describe.skipIf(databaseUrl === undefined)("Conversation 用户旅程", () => {
 			clientRequestId: "create-purge-owned",
 			ownerUserId: "user-a",
 		});
-		await conversation.execute({
+		const ownedTurn = await conversation.execute({
 			type: "APPEND_USER_TURN",
 			clientTurnId: "turn-purge-owned",
 			ownerUserId: "user-a",
@@ -355,10 +764,14 @@ describe.skipIf(databaseUrl === undefined)("Conversation 用户旅程", () => {
 			text: "购买显示器",
 			requirementUpdate: { consumptionGoal: "购买显示器" },
 		});
+		const ownedRequirementRevisionId = ownedTurn.currentRequirement?.revisionId;
+		if (ownedRequirementRevisionId === undefined)
+			throw new Error("缺少待删除 Session 的 Requirement Revision");
 		await conversation.execute({
 			type: "LINK_DECISION_TASK",
 			decisionTaskId: "task-purge-owned",
 			ownerUserId: "user-a",
+			requirementRevisionId: ownedRequirementRevisionId,
 			sessionId: owned.sessionId,
 		});
 		const retained = await conversation.execute({
@@ -387,6 +800,66 @@ describe.skipIf(databaseUrl === undefined)("Conversation 用户旅程", () => {
 			}),
 		).resolves.toEqual(retained);
 		await conversation.close();
+	});
+
+	it("会话删除状态跨重启保留，清理完成前拒绝读取与继续写入", async () => {
+		if (databaseUrl === undefined) throw new Error("测试数据库未配置");
+		const isolated = await createIsolatedDatabaseUrl(databaseUrl);
+		const conversation = await openPostgresConversation({
+			databaseUrl: isolated,
+		});
+		const owned = await conversation.execute({
+			type: "CREATE_SESSION",
+			clientRequestId: "create-session-delete",
+			ownerUserId: "user-a",
+		});
+
+		await expect(
+			conversation.beginPrivateDataDeletionForSession(
+				"user-b",
+				owned.sessionId,
+			),
+		).resolves.toBe(false);
+		await expect(
+			conversation.beginPrivateDataDeletionForSession(
+				"user-a",
+				owned.sessionId,
+			),
+		).resolves.toBe(true);
+		await expect(
+			conversation.read({
+				type: "GET_SESSION",
+				ownerUserId: "user-a",
+				sessionId: owned.sessionId,
+			}),
+		).resolves.toBeUndefined();
+		await expect(
+			conversation.execute({
+				type: "APPEND_USER_TURN",
+				clientTurnId: "turn-after-delete",
+				ownerUserId: "user-a",
+				sessionId: owned.sessionId,
+				text: "不能继续写入",
+				requirementUpdate: { consumptionGoal: "不应保存" },
+			}),
+		).rejects.toMatchObject({ code: "CONVERSATION_NOT_FOUND" });
+		await conversation.close();
+
+		const reopened = await openPostgresConversation({ databaseUrl: isolated });
+		await expect(
+			reopened.beginPrivateDataDeletionForSession("user-a", owned.sessionId),
+		).resolves.toBe(true);
+		await expect(
+			reopened.completePrivateDataDeletionForSession("user-a", owned.sessionId),
+		).resolves.toBe(true);
+		await expect(
+			reopened.read({
+				type: "GET_SESSION",
+				ownerUserId: "user-a",
+				sessionId: owned.sessionId,
+			}),
+		).resolves.toBeUndefined();
+		await reopened.close();
 	});
 });
 

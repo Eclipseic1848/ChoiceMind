@@ -9,6 +9,7 @@ import { openPostgresSourceAccess } from "@choicemind/source-access";
 import { openPostgresSourceResearch } from "@choicemind/source-research";
 
 import { buildApiApp } from "./app.js";
+import { openPostgresCandidateStore } from "@choicemind/source-research/candidate-store";
 import {
   createPersistentIdentityResolver,
   createSyntheticIdentityResolverFromJson,
@@ -59,6 +60,7 @@ const sourceAccess = await openPostgresSourceAccess({
   vault: credentialVault
 });
 const sourceResearch = await openPostgresSourceResearch({ databaseUrl });
+const candidateStore = await openPostgresCandidateStore(databaseUrl);
 const redisUrl = process.env.CHOICEMIND_REDIS_URL;
 let decisionTaskEventNotifications:
   | Awaited<ReturnType<typeof openRunEventNotificationSubscriber>>
@@ -76,6 +78,7 @@ if (redisUrl !== undefined && redisUrl.length > 0) {
 }
 
 const app = buildApiApp({
+  candidateStore,
   ...(decisionTaskEventNotifications === undefined ? {} : { decisionTaskEventNotifications }),
   auditLog: {
     append: async (record) => decisionTaskPersistence.appendAuditRecord(record)
@@ -119,6 +122,7 @@ app.addHook("onClose", async () => {
     decisionTaskEventNotifications?.close(),
     identityAccess.close(),
     sourceAccess.close(),
+    candidateStore.close(),
     sourceResearch.close()
   ]);
   credentialMasterKey.fill(0);

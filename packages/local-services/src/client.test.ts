@@ -139,6 +139,61 @@ describe("executeLocalServiceRequest", () => {
 		expect(result).toMatchObject({ ok: false, error: { code } });
 	});
 
+	it("调用方取消会中止在途请求并保持超时映射", async () => {
+		const controller = new AbortController();
+		let upstreamSignal: AbortSignal | undefined;
+		const fetcher = vi.fn(
+			(_input: string | URL | Request, init?: RequestInit) =>
+				new Promise<Response>((resolve, reject) => {
+					const signal = init?.signal;
+					if (signal === null || signal === undefined) {
+						throw new Error("测试请求缺少取消信号");
+					}
+					upstreamSignal = signal;
+					const timer = setTimeout(
+						() =>
+							resolve(
+								Response.json({
+									model: "Qwen3.8-27B",
+									choices: [{ message: { content: "CHOICEMIND_OK" } }],
+								}),
+							),
+						50,
+					);
+					signal.addEventListener(
+						"abort",
+						() => {
+							clearTimeout(timer);
+							reject(signal.reason);
+						},
+						{ once: true },
+					);
+				}),
+		);
+
+		const resultPromise = executeLocalServiceRequest(
+			{ ...target("qwen-model"), timeoutMs: 1_000 },
+			modelRequest(),
+			{ fetch: fetcher, signal: controller.signal },
+		);
+		controller.abort();
+		const result = await resultPromise;
+
+		expect(upstreamSignal?.aborted).toBe(true);
+		expect(result).toMatchObject({ ok: false, error: { code: "TIMEOUT" } });
+	});
+
+	it.each(["AbortError", "TimeoutError"])("正文读取期间的 %s 保持超时映射", async (name) => {
+		const response = Response.json({});
+		vi.spyOn(response, "json").mockRejectedValue(new DOMException("请求已中止", name));
+		const result = await executeLocalServiceRequest(
+			target("choicemind-html-parser"),
+			documentRequest("text/html", "PG1haW4+Q2hvaWNlTWluZDwvbWFpbj4="),
+			{ fetch: async () => response },
+		);
+		expect(result).toMatchObject({ ok: false, error: { code: "TIMEOUT" } });
+	});
+
 	it("把不符合协议的响应映射为 INVALID_RESPONSE", async () => {
 		const result = await executeLocalServiceRequest(
 			target("qwen-model"),

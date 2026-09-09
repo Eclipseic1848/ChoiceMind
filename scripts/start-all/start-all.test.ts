@@ -12,12 +12,18 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "vitest";
 
+process.env.CHOICEMIND_START_ALL_NO_PAUSE = "1";
+
 const repositoryRoot = resolve(
 	dirname(fileURLToPath(import.meta.url)),
 	"../..",
 );
 describe("start_all.bat", () => {
 	test("本地开发使用持久身份并监听 Identity 与 Conversation 包源码", () => {
+		const batchScript = readFileSync(
+			resolve(repositoryRoot, "start_all.bat"),
+			"utf8",
+		);
 		const startScript = readFileSync(
 			resolve(repositoryRoot, "scripts/start-all/start-all.ps1"),
 			"utf8",
@@ -61,10 +67,16 @@ describe("start_all.bat", () => {
 			"@choicemind/identity-access dev",
 		);
 		expect(rootManifest.scripts.dev).toContain("@choicemind/conversation dev");
-		expect(rootManifest.scripts.predev).toContain("@choicemind/source-access build");
-		expect(rootManifest.scripts.predev).toContain("@choicemind/source-research build");
+		expect(rootManifest.scripts.predev).toContain(
+			"@choicemind/source-access build",
+		);
+		expect(rootManifest.scripts.predev).toContain(
+			"@choicemind/source-research build",
+		);
 		expect(rootManifest.scripts.dev).toContain("@choicemind/source-access dev");
-		expect(rootManifest.scripts.dev).toContain("@choicemind/source-research dev");
+		expect(rootManifest.scripts.dev).toContain(
+			"@choicemind/source-research dev",
+		);
 		expect(rootManifest.scripts.dev).toContain("@choicemind/source-worker dev");
 		expect(rootManifest.scripts.dev).toContain(
 			"src/identity-lifecycle-worker.ts",
@@ -95,6 +107,12 @@ describe("start_all.bat", () => {
 		expect(startScript).toContain(
 			"Remove-Item Env:CHOICEMIND_CREDENTIAL_MASTER_KEY_BASE64",
 		);
+		expect(batchScript).toContain("[Console]::IsInputRedirected");
+		expect(batchScript).toContain("CHOICEMIND_START_ALL_NO_PAUSE");
+		expect(batchScript).toContain(
+			"ChoiceMind 启动文件：%CHOICEMIND_ROOT%start_all.bat",
+		);
+		expect(batchScript).toContain("按 Enter 键关闭此窗口");
 		expect(rootManifest.scripts.dev).toContain(
 			"run-with-credential-key.mjs pnpm --filter @choicemind/api dev",
 		);
@@ -191,6 +209,7 @@ describe("start_all.bat", () => {
 			resolve(windowsRoot, "System32"),
 			resolve(windowsRoot, "System32/WindowsPowerShell/v1.0"),
 		].join(";");
+		environment.CHOICEMIND_START_ALL_TEST_PORT_OFFSET = "20000";
 
 		try {
 			const result = spawnSync(
@@ -242,7 +261,12 @@ describe("start_all.bat", () => {
 		const fnmLogPath = resolve(commandDirectory, "fnm.log");
 		writeFileSync(
 			resolve(commandDirectory, "fnm.cmd"),
-			`@echo %*>>"${fnmLogPath}"\r\n@exit /b 37\r\n`,
+			[
+				"@echo off",
+				`echo %*>>"${fnmLogPath}"`,
+				'echo %*| findstr /c:"node --version" >nul && (echo v22.22.1& exit /b 0)',
+				"exit /b 37",
+			].join("\r\n"),
 			"utf8",
 		);
 		const environment = { ...process.env };
@@ -321,7 +345,12 @@ describe("start_all.bat", () => {
 		);
 		writeFileSync(
 			resolve(commandDirectory, "fnm.cmd"),
-			`@echo %*>>"${fnmLogPath}"\r\n@exit /b 37\r\n`,
+			[
+				"@echo off",
+				`echo %*>>"${fnmLogPath}"`,
+				'echo %*| findstr /c:"node --version" >nul && (echo v22.22.1& exit /b 0)',
+				"exit /b 37",
+			].join("\r\n"),
 			"utf8",
 		);
 		const environment = { ...process.env };
@@ -345,6 +374,50 @@ describe("start_all.bat", () => {
 				"exec --using=22.22.1 --",
 			);
 			expect(readFileSync(fnmLogPath, "utf8")).toContain("-PreflightOnly");
+		} finally {
+			rmSync(commandDirectory, { force: true, recursive: true });
+		}
+	});
+
+	test("fnm 已确认固定 Node 可用后保留内层启动失败原因", () => {
+		const windowsRoot = process.env.SystemRoot ?? "C:\\Windows";
+		const commandDirectory = mkdtempSync(
+			resolve(tmpdir(), "choicemind-start-all-"),
+		);
+		writeFileSync(
+			resolve(commandDirectory, "node.cmd"),
+			"@echo v24.16.0\r\n",
+			"utf8",
+		);
+		writeFileSync(
+			resolve(commandDirectory, "fnm.cmd"),
+			[
+				"@echo off",
+				'echo %*| findstr /c:"node --version" >nul && (echo v22.22.1& exit /b 0)',
+				"exit /b 23",
+			].join("\r\n"),
+			"utf8",
+		);
+		const environment = { ...process.env };
+		delete environment.PATH;
+		delete environment.Path;
+		environment.PATH = [
+			commandDirectory,
+			resolve(windowsRoot, "System32"),
+			resolve(windowsRoot, "System32/WindowsPowerShell/v1.0"),
+		].join(";");
+
+		try {
+			const result = spawnSync(
+				process.env.ComSpec ?? resolve(windowsRoot, "System32/cmd.exe"),
+				["/d", "/c", "start_all.bat --preflight-only"],
+				{ cwd: repositoryRoot, encoding: "utf8", env: environment },
+			);
+
+			expect(result.status, `${result.stdout}${result.stderr}`).toBe(23);
+			expect(`${result.stdout}${result.stderr}`).not.toContain(
+				"fnm 无法使用项目要求的 Node.js",
+			);
 		} finally {
 			rmSync(commandDirectory, { force: true, recursive: true });
 		}
@@ -424,7 +497,7 @@ describe("start_all.bat", () => {
 				{ cwd: repositoryRoot, encoding: "utf8", env: environment },
 			);
 
-			expect(result.status).toBe(44);
+			expect(result.status, `${result.stdout}${result.stderr}`).toBe(44);
 			expect(`${result.stdout}${result.stderr}`).toContain(
 				"fnm install 22.22.1",
 			);
@@ -476,6 +549,7 @@ describe("start_all.bat", () => {
 			resolve(windowsRoot, "System32/WindowsPowerShell/v1.0"),
 		].join(";");
 		environment.LOCALAPPDATA = localAppData;
+		environment.CHOICEMIND_START_ALL_TEST_PORT_OFFSET = "20000";
 
 		try {
 			const result = spawnSync(
@@ -501,6 +575,90 @@ describe("start_all.bat", () => {
 			rmSync(localAppData, { force: true, recursive: true });
 		}
 	});
+
+	test("PID 状态不可用但 ChoiceMind 服务健康时重复启动不会报告端口冲突", async () => {
+		const windowsRoot = process.env.SystemRoot ?? "C:\\Windows";
+		const commandDirectory = mkdtempSync(
+			resolve(tmpdir(), "choicemind-start-all-"),
+		);
+		const localAppData = mkdtempSync(
+			resolve(tmpdir(), "choicemind-local-app-data-"),
+		);
+		const healthServerPath = resolve(commandDirectory, "existing-health.mjs");
+		const offset = 10_000;
+		writeFileSync(
+			healthServerPath,
+			[
+				'import { createServer } from "node:http";',
+				`const ports = [1029, 3100, 3200, 3300].map((port) => port + ${offset});`,
+				"const servers = ports.map((port) => createServer((_request, response) => { const delay = port === 13100 ? 1500 : 0; setTimeout(() => { response.writeHead(200); response.end('healthy'); }, delay); }).listen(port, '127.0.0.1'));",
+				"Promise.all(servers.map((server) => new Promise((resolve) => server.on('listening', resolve)))).then(() => console.log('READY'));",
+				"setInterval(() => {}, 1000);",
+			].join("\n"),
+			"utf8",
+		);
+		const healthProcess = spawn(process.execPath, [healthServerPath]);
+		writeFileSync(
+			resolve(commandDirectory, "node.cmd"),
+			"@echo v22.22.1\r\n",
+			"utf8",
+		);
+		writeFileSync(
+			resolve(commandDirectory, "pnpm.cmd"),
+			"@echo 11.21.0\r\n",
+			"utf8",
+		);
+		writeFileSync(
+			resolve(commandDirectory, "uv.cmd"),
+			"@echo uv 0.9.5\r\n",
+			"utf8",
+		);
+		writeFileSync(
+			resolve(commandDirectory, "docker.cmd"),
+			"@exit /b 0\r\n",
+			"utf8",
+		);
+		const environment = { ...process.env };
+		delete environment.PATH;
+		delete environment.Path;
+		environment.PATH = [
+			commandDirectory,
+			resolve(windowsRoot, "System32"),
+			resolve(windowsRoot, "System32/WindowsPowerShell/v1.0"),
+		].join(";");
+		environment.CHOICEMIND_START_ALL_TEST_PORT_OFFSET = String(offset);
+		environment.LOCALAPPDATA = localAppData;
+
+		try {
+			await new Promise<void>((resolveReady, reject) => {
+				const timeout = setTimeout(
+					() => reject(new Error("健康测试进程启动超时")),
+					5_000,
+				);
+				healthProcess.once("error", reject);
+				healthProcess.stdout?.on("data", (chunk: Buffer) => {
+					if (chunk.toString("utf8").includes("READY")) {
+						clearTimeout(timeout);
+						resolveReady();
+					}
+				});
+			});
+			const result = spawnSync(
+				process.env.ComSpec ?? resolve(windowsRoot, "System32/cmd.exe"),
+				["/d", "/c", "start_all.bat"],
+				{ cwd: repositoryRoot, encoding: "utf8", env: environment },
+			);
+			const output = `${result.stdout}${result.stderr}`;
+			expect(result.status).toBe(0);
+			expect(output).toContain("ChoiceMind 已经在运行");
+			expect(output).toContain("http://192.168.50.123:1029");
+			expect(output).not.toContain("端口 1029 已被占用");
+		} finally {
+			healthProcess.kill();
+			rmSync(commandDirectory, { force: true, recursive: true });
+			rmSync(localAppData, { force: true, recursive: true });
+		}
+	}, 15_000);
 
 	test("Web 端口被占用时指出冲突服务和端口", async () => {
 		const windowsRoot = process.env.SystemRoot ?? "C:\\Windows";
@@ -605,6 +763,7 @@ describe("start_all.bat", () => {
 			resolve(windowsRoot, "System32/WindowsPowerShell/v1.0"),
 		].join(";");
 		environment.LOCALAPPDATA = localAppData;
+		environment.CHOICEMIND_START_ALL_TEST_PORT_OFFSET = "20000";
 
 		try {
 			const result = spawnSync(
@@ -670,6 +829,7 @@ describe("start_all.bat", () => {
 			resolve(windowsRoot, "System32/WindowsPowerShell/v1.0"),
 		].join(";");
 		environment.LOCALAPPDATA = localAppData;
+		environment.CHOICEMIND_START_ALL_TEST_PORT_OFFSET = "20000";
 
 		try {
 			const result = spawnSync(
@@ -729,6 +889,7 @@ describe("start_all.bat", () => {
 			resolve(windowsRoot, "System32/WindowsPowerShell/v1.0"),
 		].join(";");
 		environment.LOCALAPPDATA = localAppData;
+		environment.CHOICEMIND_START_ALL_TEST_PORT_OFFSET = "20000";
 
 		try {
 			const result = spawnSync(
@@ -755,13 +916,15 @@ describe("start_all.bat", () => {
 			resolve(tmpdir(), "choicemind-local-app-data-"),
 		);
 		const healthServerPath = resolve(commandDirectory, "health-child.mjs");
+		const offset = 20_000;
 		const dockerLogPath = resolve(commandDirectory, "docker.log");
 		writeFileSync(
 			healthServerPath,
 			[
 				'import { createServer } from "node:http";',
-				"const servers = [1029, 3100, 3200, 3300].map((port) => createServer((_request, response) => { response.writeHead(200, { 'content-type': 'application/json' }); response.end('{\"status\":\"healthy\"}'); }).listen(port, '127.0.0.1'));",
-				"setTimeout(() => Promise.all(servers.map((server) => new Promise((resolveClose) => server.close(resolveClose)))).then(() => process.exit(0)), 1800);",
+				"const checked = new Set();",
+				"const deadline = setTimeout(() => process.exit(1), 10000);",
+				`const servers = [1029, 3100, 3200, 3300].map((port) => createServer((_request, response) => { response.on('finish', () => { checked.add(port); if (checked.size === 4) { clearTimeout(deadline); Promise.all(servers.map((server) => new Promise((done) => server.close(done)))).then(() => process.exit(0)); } }); response.writeHead(200, { 'content-type': 'application/json' }); response.end('{"status":"healthy"}'); }).listen(port + ${offset}, '127.0.0.1'));`,
 			].join("\n"),
 			"utf8",
 		);
@@ -805,6 +968,7 @@ describe("start_all.bat", () => {
 			resolve(windowsRoot, "System32/WindowsPowerShell/v1.0"),
 		].join(";");
 		environment.LOCALAPPDATA = localAppData;
+		environment.CHOICEMIND_START_ALL_TEST_PORT_OFFSET = String(offset);
 
 		try {
 			const result = spawnSync(
@@ -815,10 +979,10 @@ describe("start_all.bat", () => {
 			const output = `${result.stdout}${result.stderr}`;
 			const dockerLog = readFileSync(dockerLogPath, "utf8");
 
-			expect(result.status).toBe(0);
+			expect(result.status, output).toBe(0);
 			expect(output).toContain("ChoiceMind Alpha 已启动，前端开发热更新已启用");
 			expect(output).toContain("Identity Lifecycle Worker 后台进程：运行中");
-			expect(output).toContain("Web 健康：http://127.0.0.1:1029/health/live");
+			expect(output).toContain(`Web 健康：http://127.0.0.1:${1029 + offset}/health/live`);
 			expect(output).toContain("API Publisher 后台进程：运行中");
 			expect(output).toContain("Orchestrator Worker 后台进程：运行中");
 			expect(dockerLog).toContain("stop postgres redis");

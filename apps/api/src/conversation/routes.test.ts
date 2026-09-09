@@ -116,17 +116,29 @@ describe("Conversation routes", () => {
 			requirementUpdate: { consumptionGoal: "购买显示器" },
 		});
 
-		const linked = await app.inject({
+		const invalidLink = await app.inject({
 			method: "POST",
 			url: `/api/v1/conversations/${session.sessionId}/decision-tasks`,
 			headers: { authorization: "Bearer user-a" },
 			payload: { decisionTaskId: "task-api-1" },
+		});
+		expect(invalidLink.statusCode).toBe(400);
+
+		const linked = await app.inject({
+			method: "POST",
+			url: `/api/v1/conversations/${session.sessionId}/decision-tasks`,
+			headers: { authorization: "Bearer user-a" },
+			payload: {
+				decisionTaskId: "task-api-1",
+				requirementRevisionId: "revision-api-1",
+			},
 		});
 		expect(linked.statusCode).toBe(200);
 		expect(commands[2]).toEqual({
 			type: "LINK_DECISION_TASK",
 			decisionTaskId: "task-api-1",
 			ownerUserId: "user-a",
+			requirementRevisionId: "revision-api-1",
 			sessionId: session.sessionId,
 		});
 
@@ -134,7 +146,10 @@ describe("Conversation routes", () => {
 			method: "POST",
 			url: `/api/v1/conversations/${session.sessionId}/decision-tasks`,
 			headers: { authorization: "Bearer user-b" },
-			payload: { decisionTaskId: "task-api-1" },
+			payload: {
+				decisionTaskId: "task-api-1",
+				requirementRevisionId: "revision-api-1",
+			},
 		});
 		expect(forgedTask.statusCode).toBe(404);
 		expect(commands).toHaveLength(3);

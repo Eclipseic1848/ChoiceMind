@@ -274,6 +274,74 @@ describe("CredentialVault", () => {
     expect(records.has("provider-a")).toBe(true);
   });
 
+  it("limits Provider Routing system access to provider credentials", async () => {
+    const records = new Map<string, EncryptedCredentialRecord>();
+    const systemActor = Object.freeze({
+      userId: "provider-routing:runtime",
+      role: "SYSTEM" as const
+    });
+    const vault = createCredentialVault({
+      masterKey: Buffer.alloc(32, 22),
+      systemAccess: {
+        actor: systemActor,
+        secretType: "PROVIDER_CREDENTIAL",
+        actions: ["USE", "DELETE"]
+      },
+      appendAuditRecord: async () => undefined,
+      storage: {
+        async save(record) { records.set(record.credentialId, record); },
+        async load(credentialId, ownerUserId) {
+          const record = records.get(credentialId);
+          return record?.ownerUserId === ownerUserId ? record : undefined;
+        },
+        async delete(credentialId, ownerUserId) {
+          const record = records.get(credentialId);
+          if (record?.ownerUserId !== ownerUserId) return false;
+          return records.delete(credentialId);
+        }
+      }
+    });
+    await vault.store({
+      credentialId: "provider-system-a",
+      ownerUserId: "admin-a",
+      secret: "provider-secret",
+      secretType: "PROVIDER_CREDENTIAL",
+      actor: { userId: "admin-a", role: "SUPERADMIN" },
+      correlationId: "store-provider-system"
+    });
+    await vault.store({
+      credentialId: "source-system-a",
+      ownerUserId: "admin-a",
+      secret: "source-secret",
+      secretType: "SOURCE_CREDENTIAL",
+      actor: { userId: "admin-a", role: "SUPERADMIN" },
+      correlationId: "store-source-system"
+    });
+
+    await expect(
+      vault.use(
+        {
+          credentialId: "provider-system-a",
+          ownerUserId: "admin-a",
+          actor: systemActor,
+          correlationId: "use-provider-system"
+        },
+        async (secret) => expect(secret.reveal()).toBe("provider-secret")
+      )
+    ).resolves.toBeUndefined();
+    await expect(
+      vault.use(
+        {
+          credentialId: "source-system-a",
+          ownerUserId: "admin-a",
+          actor: systemActor,
+          correlationId: "deny-source-system"
+        },
+        async () => undefined
+      )
+    ).rejects.toThrowError("CREDENTIAL_NOT_FOUND");
+  });
+
   it("does not save or release a secret when the initial audit record fails", async () => {
     let saves = 0;
     let operations = 0;

@@ -6,6 +6,7 @@ export function createFixtureSourceAdapter(options: Readonly<{
   loginUrl: string;
 }>): SourceAdapter {
   return {
+    accessMode: "CREDENTIAL",
     officialLoginUrl: options.loginUrl,
     async run(input) {
       input.signal.throwIfAborted();
@@ -21,6 +22,12 @@ export function createFixtureSourceAdapter(options: Readonly<{
         resultKey: `fixture:${digest}`,
         evidenceId: `evidence-fixture-${digest}`,
         summary: `Fixture 来源已验证研究骨架：${input.claim.query}`,
+        material: {
+          synthetic: true,
+          sourceId: input.claim.sourceId,
+          query: input.claim.query,
+          summary: `Fixture 来源已验证研究骨架：${input.claim.query}`
+        },
         costUnits: 0
       };
     }

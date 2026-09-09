@@ -499,6 +499,7 @@ export type RuntimePausedOutcomeV1 = Readonly<{
   contractVersion: "1.0";
   state: PausedDecisionTaskSnapshotV1["state"];
   summary: string;
+  pauseReason?: "SOURCE_LOGIN" | "SOURCE_RESEARCH" | "PRIVATE_FILE_PERMISSION" | "PRIVATE_FILE_PROCESSING" | undefined;
   snapshot: RuntimeSnapshotV1;
   effectReceipts: readonly EffectReceiptV1[];
   runEvents: readonly RunEventV1[];
@@ -944,6 +945,17 @@ export function decodeRuntimePausedOutcomeV1(
     };
   }
   const firstEvent = value.runEvents[0];
+  if (value.pauseReason !== undefined) {
+    const expectedState = {
+      SOURCE_LOGIN: "PAUSED_SOURCE_LOGIN",
+      SOURCE_RESEARCH: "PAUSED_USER",
+      PRIVATE_FILE_PERMISSION: "PAUSED_PERMISSION",
+      PRIVATE_FILE_PROCESSING: "PAUSED_USER"
+    } as const;
+    if (value.state !== expectedState[value.pauseReason]) {
+      return { ok: false, code: "CONTRACT_INVALID", issues: [{ path: "pauseReason", message: "暂停原因必须与任务状态一致" }] };
+    }
+  }
   const allFactsBelongToRun =
     firstEvent !== undefined &&
     value.snapshot.decisionTaskId === firstEvent.decisionTaskId &&

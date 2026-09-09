@@ -1,4 +1,5 @@
 import Fastify from "fastify";
+import { registerAdapterCandidateRoutes, type CandidateStore } from "./adapter-candidates/routes.js";
 import type { Conversation } from "@choicemind/conversation";
 import type { IdentityAccess } from "@choicemind/identity-access";
 import type { SourceAccess } from "@choicemind/source-access";
@@ -29,6 +30,7 @@ type ComponentHealth = {
 };
 
 export type ApiAppOptions = {
+  candidateStore?: CandidateStore;
   auditLog?: AuditLogPort;
   conversation?: Conversation;
   decisionTaskEventNotifications?: DecisionTaskEventNotificationsPort;
@@ -140,6 +142,7 @@ export function buildApiApp(options: ApiAppOptions = {}) {
   });
 
   registerIdentityAccessRoutes(app, options.identityAccess);
+  registerAdapterCandidateRoutes(app, options.candidateStore, identityResolver, options.now);
 
   registerConversationRoutes(
     app,
