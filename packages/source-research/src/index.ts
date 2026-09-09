@@ -21,6 +21,13 @@ export type SourceResearchBatchState =
 
 export type SourceResearchAccessMode = "PUBLIC" | "CREDENTIAL";
 
+export type PublicWebResearchContinuationV1 = Readonly<{
+  contractType: "public-web-research-continuation";
+  contractVersion: "1.0";
+  searchUrls: readonly string[];
+  deepReadUrls: readonly string[];
+}>;
+
 export type SourceResearchTarget = Readonly<{
   subject: Readonly<{
     kind: string;
@@ -54,6 +61,7 @@ export type SourceResearchOutcome =
         searched: number;
         deepRead: number;
         hasMore: boolean;
+        continuation?: PublicWebResearchContinuationV1;
       }>;
     }>
   | Readonly<{ type: "NO_RESULT"; summary: string; costUnits: number }>
@@ -93,6 +101,7 @@ export type SourceResearchBatch = Readonly<{
     sourceId: string;
     sourceAccountId: string;
     accessMode: SourceResearchAccessMode;
+    continuation?: PublicWebResearchContinuationV1;
     state:
       | "QUEUED"
       | "RUNNING"
@@ -125,6 +134,7 @@ export type CreateSourceResearchBatchCommand = Readonly<{
       sourceId: string;
       sourceAccountId: string;
       accessMode?: SourceResearchAccessMode;
+      continuation?: PublicWebResearchContinuationV1;
     }>[];
   }>;
 
@@ -253,7 +263,10 @@ export async function openPostgresSourceResearch(options: Readonly<{
           (source.accessMode !== undefined &&
             source.accessMode !== "PUBLIC" &&
             source.accessMode !== "CREDENTIAL") ||
-          (source.accessMode === "PUBLIC" && source.sourceAccountId !== "public")
+          (source.accessMode === "PUBLIC" && source.sourceAccountId !== "public") ||
+          (source.continuation !== undefined &&
+            (source.accessMode !== "PUBLIC" ||
+              !isPublicWebResearchContinuationV1(source.continuation)))
       )
     ) {
       throw new Error("SOURCE_RESEARCH_BATCH_INVALID");
@@ -273,8 +286,19 @@ export async function openPostgresSourceResearch(options: Readonly<{
     }
     const normalizedSources = command.sources
       .map((source) => ({
-        ...source,
-        accessMode: source.accessMode ?? "CREDENTIAL" as const
+        sourceId: source.sourceId,
+        sourceAccountId: source.sourceAccountId,
+        accessMode: source.accessMode ?? "CREDENTIAL" as const,
+        ...(source.continuation === undefined
+          ? {}
+          : {
+              continuation: {
+                contractType: source.continuation.contractType,
+                contractVersion: source.continuation.contractVersion,
+                searchUrls: [...source.continuation.searchUrls],
+                deepReadUrls: [...source.continuation.deepReadUrls]
+              }
+            })
       }))
       .sort((left, right) =>
         `${left.sourceId}\0${left.sourceAccountId}`.localeCompare(
@@ -337,8 +361,8 @@ export async function openPostgresSourceResearch(options: Readonly<{
         const jobResult = await client.query<{ job_id: string }>(
           `INSERT INTO source_research_jobs (
              batch_id, owner_user_id, decision_task_id, query,
-             source_id, source_account_id, access_mode, state, created_at, updated_at
-           ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'QUEUED', $8, $8)
+             source_id, source_account_id, access_mode, checkpoint, state, created_at, updated_at
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, 'QUEUED', $9, $9)
            RETURNING job_id`,
           [
             command.batchId,
@@ -348,6 +372,14 @@ export async function openPostgresSourceResearch(options: Readonly<{
             source.sourceId,
             source.sourceAccountId,
             source.accessMode,
+            source.continuation === undefined
+              ? null
+              : JSON.stringify({
+                  searched: 0,
+                  deepRead: 0,
+                  hasMore: true,
+                  continuation: source.continuation
+                }),
             timestamp
           ]
         );
@@ -720,22 +752,26 @@ async function readBatch(
     ...(batch.research_target === null ? {} : { researchTarget: batch.research_target }),
     state,
     costUnits: jobResult.rows.reduce((sum, row) => sum + row.cost_units, 0),
-    jobs: jobResult.rows.map((row) => ({
-      jobId: row.job_id,
-      sourceId: row.source_id,
-      sourceAccountId: row.source_account_id,
-      accessMode: row.access_mode,
-      state: row.state,
-      ...(
-        row.state === "WAITING_SOURCE_LOGIN" &&
-        typeof row.outcome === "object" &&
-        row.outcome !== null &&
-        "loginSessionId" in row.outcome &&
-        typeof row.outcome.loginSessionId === "string"
-          ? { loginSessionId: row.outcome.loginSessionId }
-          : {}
-      )
-    })),
+    jobs: jobResult.rows.map((row) => {
+      const continuation = readPublicWebResearchContinuation(row.checkpoint);
+      return {
+        jobId: row.job_id,
+        sourceId: row.source_id,
+        sourceAccountId: row.source_account_id,
+        accessMode: row.access_mode,
+        state: row.state,
+        ...(continuation === undefined ? {} : { continuation }),
+        ...(
+          row.state === "WAITING_SOURCE_LOGIN" &&
+          typeof row.outcome === "object" &&
+          row.outcome !== null &&
+          "loginSessionId" in row.outcome &&
+          typeof row.outcome.loginSessionId === "string"
+            ? { loginSessionId: row.outcome.loginSessionId }
+            : {}
+        )
+      };
+    }),
     results: resultResult.rows.map((row) => ({
       resultKey: row.result_key,
       evidenceId: row.evidence_id,
@@ -914,6 +950,75 @@ function isSourceResearchTarget(value: unknown): value is SourceResearchTarget {
   );
 }
 
+const PUBLIC_WEB_CONTINUATION_KEYS = new Set([
+  "contractType",
+  "contractVersion",
+  "searchUrls",
+  "deepReadUrls"
+]);
+
+export function isPublicWebResearchContinuationV1(
+  value: unknown
+): value is PublicWebResearchContinuationV1 {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as Record<string, unknown>;
+  const keys = Reflect.ownKeys(candidate);
+  if (
+    keys.length !== PUBLIC_WEB_CONTINUATION_KEYS.size ||
+    keys.some(
+      (key) => typeof key !== "string" || !PUBLIC_WEB_CONTINUATION_KEYS.has(key)
+    ) ||
+    candidate.contractType !== "public-web-research-continuation" ||
+    candidate.contractVersion !== "1.0" ||
+    !Array.isArray(candidate.searchUrls) ||
+    !Array.isArray(candidate.deepReadUrls)
+  ) {
+    return false;
+  }
+  const urls = [...candidate.searchUrls, ...candidate.deepReadUrls];
+  return (
+    urls.length > 0 &&
+    urls.length <= 20 &&
+    urls.every(isSafePublicWebContinuationUrl) &&
+    new Set(urls).size === urls.length
+  );
+}
+
+export function readPublicWebResearchContinuation(
+  checkpoint: unknown
+): PublicWebResearchContinuationV1 | undefined {
+  if (
+    typeof checkpoint !== "object" ||
+    checkpoint === null ||
+    !("hasMore" in checkpoint) ||
+    checkpoint.hasMore !== true ||
+    !("continuation" in checkpoint)
+  ) {
+    return undefined;
+  }
+  return isPublicWebResearchContinuationV1(checkpoint.continuation)
+    ? checkpoint.continuation
+    : undefined;
+}
+
+function isSafePublicWebContinuationUrl(value: unknown): value is string {
+  if (typeof value !== "string" || value.length > 2_048 || value.trim() !== value) {
+    return false;
+  }
+  try {
+    const url = new URL(value);
+    return (
+      url.protocol === "https:" &&
+      url.username === "" &&
+      url.password === "" &&
+      url.hash === "" &&
+      url.toString() === value
+    );
+  } catch {
+    return false;
+  }
+}
+
 function isEvidenceBatchOutcome(
   outcome: Extract<SourceResearchOutcome, { type: "EVIDENCE_BATCH" }>
 ): boolean {
@@ -946,7 +1051,10 @@ function isEvidenceBatchOutcome(
     outcome.checkpoint.deepRead <= 5 &&
     outcome.checkpoint.deepRead <= outcome.checkpoint.searched &&
     outcome.items.length <= outcome.checkpoint.deepRead &&
-    typeof outcome.checkpoint.hasMore === "boolean"
+    typeof outcome.checkpoint.hasMore === "boolean" &&
+    (outcome.checkpoint.continuation === undefined ||
+      (outcome.checkpoint.hasMore &&
+        isPublicWebResearchContinuationV1(outcome.checkpoint.continuation)))
   );
 }
 

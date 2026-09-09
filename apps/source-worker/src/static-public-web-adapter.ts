@@ -1,7 +1,11 @@
 import { createHash } from "node:crypto";
 
 import type { ResearchEvidenceMaterial } from "@choicemind/evidence-ingestion";
-import type { PublicWebSourceDefinition } from "@choicemind/source-research";
+import {
+	isPublicWebResearchContinuationV1,
+	type PublicWebResearchContinuationV1,
+	type PublicWebSourceDefinition,
+} from "@choicemind/source-research";
 
 import type { PublicSourceAdapter } from "./worker.js";
 
@@ -68,6 +72,33 @@ export function createStaticPublicWebSourceAdapter(
 					summary: `${options.definition.title}的静态品牌网页只接受 CANDIDATE 研究对象`,
 				};
 			}
+			let continuation: PublicWebResearchContinuationV1 | undefined;
+			if (
+				typeof input.claim.checkpoint === "object" &&
+				input.claim.checkpoint !== null &&
+				Object.hasOwn(input.claim.checkpoint, "continuation")
+			) {
+				const value = (input.claim.checkpoint as Record<string, unknown>).continuation;
+				if (
+					(input.claim.checkpoint as Record<string, unknown>).hasMore !== true ||
+					!isPublicWebResearchContinuationV1(value)
+				) {
+					return { type: "FAILED_FINAL", summary: "PUBLIC_WEB_CONTINUATION_INVALID" };
+				}
+				continuation = value;
+			}
+			if (continuation !== undefined) {
+				if (options.approvedSourceUrls === undefined) {
+					return { type: "FAILED_FINAL", summary: "PUBLIC_WEB_CONTINUATION_NOT_APPROVED" };
+				}
+				for (const value of [...continuation.searchUrls, ...continuation.deepReadUrls]) {
+					const url = new URL(value);
+					if (!options.definition.allowedOrigins.includes(url.origin)) {
+						return { type: "FAILED_FINAL", summary: "SOURCE_NOT_APPROVED" };
+					}
+					options.approvedSourceUrls.add(value);
+				}
+			}
 
 			const pageInputFor = (url: string, operation: string) => ({
 				correlationId: input.claim.jobId, decisionTaskId: input.claim.decisionTaskId,
@@ -77,12 +108,17 @@ export function createStaticPublicWebSourceAdapter(
 				subject: { subjectType: "CANDIDATE" as const, candidateId: target.subject.value },
 				claimTargets: target.claimTargets
 			});
-			let candidates = [...options.definition.entryUrls];
-			let discoveryHasMore = false;
+			const carriedCandidates = continuation?.deepReadUrls ?? [];
+			let candidates = continuation === undefined
+				? [...options.definition.entryUrls]
+				: [...carriedCandidates];
+			let pendingSearchUrls: string[] = [];
 			if (options.approvedSourceUrls !== undefined) {
-				const queue = [...options.definition.entryUrls];
+				const queue = [...(continuation?.searchUrls ?? options.definition.entryUrls)];
 				const visited = new Set<string>();
-				const ranked = new Map(candidates.map(url => [url, 0]));
+				const ranked = new Map(
+					(continuation === undefined ? options.definition.entryUrls : []).map((url) => [url, 0]),
+				);
 				// ponytail: 采用确定性词项排序；需要语义排序时复用现有 Reranker。
 				const terms = [...new Intl.Segmenter("zh", { granularity: "word" }).segment(input.claim.query.toLowerCase())]
 					.filter(part => part.isWordLike).map(part => part.segment);
@@ -121,8 +157,10 @@ export function createStaticPublicWebSourceAdapter(
 						}
 					}
 				}
-				candidates = [...ranked].sort((a, b) => b[1] - a[1]).slice(0, 20).map(([url]) => url);
-				discoveryHasMore = queue.length > 0 || ranked.size > 20;
+				const discovered = [...ranked].sort((a, b) => b[1] - a[1]).map(([url]) => url);
+				const ordered = [...new Set([...carriedCandidates, ...discovered])];
+				candidates = ordered.slice(0, 20);
+				pendingSearchUrls = queue;
 				for (const url of candidates) options.approvedSourceUrls.add(url);
 			}
 			const entryUrls = candidates.slice(0, 5);
@@ -224,10 +262,18 @@ export function createStaticPublicWebSourceAdapter(
 				}
 			}
 
+			const nextContinuation = options.approvedSourceUrls === undefined
+				? undefined
+				: createContinuation(
+						candidates.slice(deepRead),
+						pendingSearchUrls,
+					);
 			const checkpoint = {
 				searched: candidates.length,
 				deepRead,
-				hasMore: discoveryHasMore || candidates.length > deepRead,
+				hasMore: nextContinuation !== undefined ||
+					(options.approvedSourceUrls === undefined && candidates.length > deepRead),
+				...(nextContinuation === undefined ? {} : { continuation: nextContinuation }),
 			};
 			await input.saveCheckpoint(checkpoint);
 			if (items.length === 0) {
@@ -245,5 +291,20 @@ export function createStaticPublicWebSourceAdapter(
 			}
 			return { type: "EVIDENCE_BATCH", items, costUnits: 0, checkpoint };
 		},
+	};
+}
+
+function createContinuation(
+	deepReadUrls: readonly string[],
+	searchUrls: readonly string[],
+): PublicWebResearchContinuationV1 | undefined {
+	const unique = [...new Set([...deepReadUrls, ...searchUrls])].slice(0, 20);
+	if (unique.length === 0) return undefined;
+	const deepReadSet = new Set(deepReadUrls);
+	return {
+		contractType: "public-web-research-continuation",
+		contractVersion: "1.0",
+		deepReadUrls: unique.filter((url) => deepReadSet.has(url)),
+		searchUrls: unique.filter((url) => !deepReadSet.has(url)),
 	};
 }

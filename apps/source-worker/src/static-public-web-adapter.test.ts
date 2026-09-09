@@ -62,9 +62,9 @@ function material(url: string) {
 	};
 }
 
-function runInput() {
+function runInput(checkpoint: unknown = claim.checkpoint) {
 	return {
-		claim,
+		claim: { ...claim, checkpoint },
 		idempotencyKey: "job-a",
 		signal: new AbortController().signal,
 		saveCheckpoint: vi.fn(async () => {}),
@@ -101,6 +101,76 @@ describe("Static public web source adapter", () => {
 		expect([...approvedSourceUrls].some(url => url.includes("evil") || url.includes("secret") || url.startsWith("javascript:"))).toBe(false);
 	});
 
+	it("continues from persisted public URLs without restarting at the entry page", async () => {
+		const approvedSourceUrls = new Set(definition.entryUrls);
+		const continuation = {
+			contractType: "public-web-research-continuation" as const,
+			contractVersion: "1.0" as const,
+			searchUrls: ["https://brand.example/products?page=2"],
+			deepReadUrls: [
+				"https://brand.example/model-b",
+				"https://brand.example/model-c",
+			],
+		};
+		const discover = vi.fn(async ({ source }: { source: { url: string } }) => {
+			expect(source.url).toBe(continuation.searchUrls[0]);
+			expect(approvedSourceUrls.has(source.url)).toBe(true);
+			return {
+				status: "DISCOVERED" as const,
+				url: source.url,
+				links: [{ href: "/model-d", text: "轻薄办公电脑", next: false }],
+			};
+		});
+		const collect = vi.fn(async ({ source }: { source: { url: string } }) => {
+			expect(approvedSourceUrls.has(source.url)).toBe(true);
+			return {
+				status: "EVIDENCE_MATERIAL" as const,
+				summary: "合成证据",
+				material: material(source.url),
+			};
+		});
+		const adapter = createStaticPublicWebSourceAdapter({
+			definition,
+			approvedSourceUrls,
+			pageCollector: { discover, collect },
+		});
+
+		await expect(adapter.run(runInput({
+			searched: 20,
+			deepRead: 5,
+			hasMore: true,
+			continuation,
+		}))).resolves.toMatchObject({
+			type: "EVIDENCE_BATCH",
+			checkpoint: { searched: 3, deepRead: 3, hasMore: false },
+		});
+		expect(discover).toHaveBeenCalledOnce();
+		expect(collect.mock.calls.map((call) => call[0].source.url)).toEqual([
+			"https://brand.example/model-b",
+			"https://brand.example/model-c",
+			"https://brand.example/model-d",
+		]);
+	});
+
+	it("rejects a continuation outside the source origin before collection", async () => {
+		const discover = vi.fn();
+		const collect = vi.fn();
+		const adapter = createStaticPublicWebSourceAdapter({
+			definition,
+			approvedSourceUrls: new Set(definition.entryUrls),
+			pageCollector: { discover, collect },
+		});
+
+		await expect(adapter.run(runInput({ hasMore: true, continuation: {
+			contractType: "public-web-research-continuation",
+			contractVersion: "1.0",
+			searchUrls: ["https://evil.example/page=2"],
+			deepReadUrls: [],
+		} }))).resolves.toEqual({ type: "FAILED_FINAL", summary: "SOURCE_NOT_APPROVED" });
+		expect(discover).not.toHaveBeenCalled();
+		expect(collect).not.toHaveBeenCalled();
+	});
+
 	it("does not deep-read or dynamically bypass a discovery security failure", async () => {
 		const collect = vi.fn(async () => ({ status: "NO_MATCH" as const, summary: "不应调用" }));
 		const dynamicDiscover = vi.fn();
@@ -116,10 +186,23 @@ describe("Static public web source adapter", () => {
 
 	it("bounds an endless pagination chain and keeps continuation visible", async () => {
 		let page = 0;
-		const discover = vi.fn(async ({ source }: { source: { url: string } }) => ({
-			status: "DISCOVERED" as const, url: source.url,
-			links: [{ href: `?page=${++page}`, text: "下一页", next: true }]
-		}));
+		const discover = vi.fn(async ({ source }: { source: { url: string } }) => {
+			page += 1;
+			return {
+				status: "DISCOVERED" as const,
+				url: source.url,
+				links: [
+					{ href: `?page=${page}`, text: "下一页", next: true },
+					...(page === 1
+						? Array.from({ length: 25 }, (_, index) => ({
+								href: `/candidate-${index}`,
+								text: "普通候选",
+								next: false,
+							}))
+						: []),
+				],
+			};
+		});
 		const adapter = createStaticPublicWebSourceAdapter({
 			definition: { ...definition, entryUrls: [definition.entryUrls[0] as string] },
 			approvedSourceUrls: new Set(definition.entryUrls),
@@ -128,7 +211,15 @@ describe("Static public web source adapter", () => {
 			}) }
 		});
 		await expect(adapter.run(runInput())).resolves.toMatchObject({ type: "EVIDENCE_BATCH",
-			checkpoint: { searched: 1, deepRead: 1, hasMore: true } });
+			checkpoint: {
+				searched: 20,
+				deepRead: 5,
+				hasMore: true,
+				continuation: {
+					deepReadUrls: expect.arrayContaining(["https://brand.example/candidate-4"]),
+					searchUrls: ["https://brand.example/product-a?page=20"],
+				},
+			} });
 		expect(discover).toHaveBeenCalledTimes(20);
 	});
 
