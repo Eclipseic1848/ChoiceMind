@@ -53,6 +53,7 @@ export function createStaticPublicWebPageCollector(
 				input: Readonly<{
 					collection: CollectedSource;
 					decisionTaskId: string;
+					extractLinks?: boolean;
 					signal?: AbortSignal;
 					validUntil: string;
 				}>,
@@ -65,6 +66,7 @@ export function createStaticPublicWebPageCollector(
 							hasTitle: boolean;
 						}>;
 						evidence: PublicWebEvidenceV1;
+						links?: readonly Readonly<{ href: string; text: string; next: boolean }>[] | undefined;
 				  }>
 				| Readonly<{
 						status: "EVIDENCE_GAP";
@@ -83,8 +85,7 @@ export function createStaticPublicWebPageCollector(
 		throw new Error("STATIC_PUBLIC_WEB_MINIMUM_TEXT_INVALID");
 	}
 
-	return {
-		async collect(input: StaticPageInput) {
+	async function load(input: StaticPageInput, extractLinks = false) {
 			const collected = await options.ingestion.ingest({
 				correlationId: input.correlationId,
 				decisionTaskId: input.decisionTaskId,
@@ -115,6 +116,7 @@ export function createStaticPublicWebPageCollector(
 				capturedAt + 7 * 24 * 60 * 60 * 1_000,
 			).toISOString();
 			const generated = await options.evidenceGenerator.generate({
+				...(extractLinks ? { extractLinks: true } : {}),
 				collection: collected.collection,
 				decisionTaskId: input.decisionTaskId,
 				signal: input.signal,
@@ -135,6 +137,26 @@ export function createStaticPublicWebPageCollector(
 			) {
 				return failed(input.source.title, "SOURCE_ACCESS_CHALLENGE", false);
 			}
+			return { status: "PARSED" as const, collected, generated, text, expiresAt };
+	}
+
+	return {
+		async discover(input: StaticPageInput) {
+			const loaded = await load(input, true);
+			if (loaded.status === "FAILED") return loaded;
+			const { generated, text, collected } = loaded;
+			if (generated.links === undefined) {
+				return failed(input.source.title, "SOURCE_LINK_DISCOVERY_UNSUPPORTED", false);
+			}
+			if (isLoadingShell(text) || (!generated.documentSignals.hasMainContent && !generated.documentSignals.hasTitle)) {
+				return { status: "DYNAMIC_REQUIRED" as const, summary: `${input.source.title}尚未加载可检索页面` };
+			}
+			return { status: "DISCOVERED" as const, url: collected.collection.sourceFacts.url, links: generated.links };
+		},
+		async collect(input: StaticPageInput) {
+			const loaded = await load(input);
+			if (loaded.status === "FAILED") return loaded;
+			const { generated, collected, text, expiresAt } = loaded;
 			if (
 				text.length < minimumTextCharacters ||
 				isLoadingShell(text) ||

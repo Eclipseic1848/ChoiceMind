@@ -72,6 +72,33 @@ function input() {
 }
 
 describe("Static public web page collector", () => {
+	it("discovers links from a short index page through the same ingestion and parser", async () => {
+		const ingest = vi.fn(async () => ({ status: "COLLECTED" as const, collection }));
+		const generate = vi.fn(async () => ({ status: "EVIDENCE_CREATED" as const,
+			documentSignals: { hasMainContent: true, hasTitle: false },
+			evidence: evidenceWithText("产品目录"),
+			links: [{ href: "/product/details", text: "产品详情", next: false }] }));
+		const collector = createStaticPublicWebPageCollector({ ingestion: { ingest }, evidenceGenerator: { generate } });
+		await expect(collector.discover(input())).resolves.toEqual({ status: "DISCOVERED",
+			url: collection.sourceFacts.url, links: [{ href: "/product/details", text: "产品详情", next: false }] });
+		expect(ingest).toHaveBeenCalledOnce();
+		expect(generate).toHaveBeenCalledWith(expect.objectContaining({ extractLinks: true, signal: expect.any(AbortSignal) }));
+	});
+
+	it.each([
+		{ text: "请先登录", hasAccessForm: false, links: [], expected: "SOURCE_ACCESS_CHALLENGE" },
+		{ text: "目录", hasAccessForm: true, links: [], expected: "SOURCE_ACCESS_CHALLENGE" },
+		{ text: "目录", hasAccessForm: false, links: undefined, expected: "SOURCE_LINK_DISCOVERY_UNSUPPORTED" },
+	])("does not report discovery success for $expected", async ({ text, hasAccessForm, links, expected }) => {
+		const collector = createStaticPublicWebPageCollector({
+			ingestion: { ingest: async () => ({ status: "COLLECTED", collection }) },
+			evidenceGenerator: { generate: async () => ({ status: "EVIDENCE_CREATED",
+				documentSignals: { hasMainContent: true, hasTitle: true, hasAccessForm },
+				evidence: evidenceWithText(text), links }) }
+		});
+		await expect(collector.discover(input())).resolves.toMatchObject({ status: "FAILED", code: expected, retryable: false });
+	});
+
 	it("composes safe HTTP collection, parsing, and material creation without real network", async () => {
 		const rawBytes = new TextEncoder().encode("<main>品牌官网产品参数</main>");
 		let storedBytes: Uint8Array | undefined;
