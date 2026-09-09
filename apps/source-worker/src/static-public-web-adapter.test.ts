@@ -72,6 +72,66 @@ function runInput() {
 }
 
 describe("Static public web source adapter", () => {
+	it("discovers same-origin pages, follows pagination and ranks the query within 20/5 bounds", async () => {
+		const approvedSourceUrls = new Set([definition.entryUrls[0] as string]);
+		const discover = vi.fn(async ({ source }: { source: { url: string } }) => {
+			expect(approvedSourceUrls.has(source.url)).toBe(true);
+			return { status: "DISCOVERED" as const, url: source.url,
+				links: source.url.includes("page=2") ? [{ href: "/best", text: "轻薄办公电脑", next: false }] : [
+					{ href: "?page=2", text: "下一页", next: true },
+					{ href: "https://evil.example/", text: "轻薄办公电脑", next: false },
+					{ href: "https://user:secret@brand.example/private", text: "轻薄办公电脑", next: false },
+					{ href: "javascript:alert(1)", text: "轻薄办公电脑", next: false },
+					...Array.from({ length: 25 }, (_, i) => ({ href: `/ordinary-${i}`, text: "普通产品", next: false }))
+				] };
+		});
+		const collect = vi.fn(async ({ source }: { source: { url: string } }) => {
+			expect(approvedSourceUrls.has(source.url)).toBe(true);
+			return { status: "EVIDENCE_MATERIAL" as const, summary: "合成证据", material: material(source.url) };
+		});
+		const adapter = createStaticPublicWebSourceAdapter({
+			definition: { ...definition, entryUrls: [definition.entryUrls[0] as string] },
+			approvedSourceUrls, pageCollector: { collect, discover }
+		});
+		const result = await adapter.run(runInput());
+		expect(discover).toHaveBeenCalledTimes(2);
+		expect(collect).toHaveBeenCalledTimes(5);
+		expect(collect.mock.calls[0]?.[0].source.url).toBe("https://brand.example/best");
+		expect(result).toMatchObject({ type: "EVIDENCE_BATCH", checkpoint: { searched: 20, deepRead: 5, hasMore: true } });
+		expect([...approvedSourceUrls].some(url => url.includes("evil") || url.includes("secret") || url.startsWith("javascript:"))).toBe(false);
+	});
+
+	it("does not deep-read or dynamically bypass a discovery security failure", async () => {
+		const collect = vi.fn(async () => ({ status: "NO_MATCH" as const, summary: "不应调用" }));
+		const dynamicDiscover = vi.fn();
+		const adapter = createStaticPublicWebSourceAdapter({
+			definition: { ...definition, renderMode: "AUTO" }, approvedSourceUrls: new Set(definition.entryUrls),
+			pageCollector: { collect, discover: async () => ({ status: "FAILED", code: "SOURCE_NOT_APPROVED", retryable: false, summary: "拒绝" }) },
+			dynamicPageCollector: { collect, discover: dynamicDiscover }
+		});
+		await expect(adapter.run(runInput())).resolves.toMatchObject({ type: "FAILED_FINAL" });
+		expect(collect).not.toHaveBeenCalled();
+		expect(dynamicDiscover).not.toHaveBeenCalled();
+	});
+
+	it("bounds an endless pagination chain and keeps continuation visible", async () => {
+		let page = 0;
+		const discover = vi.fn(async ({ source }: { source: { url: string } }) => ({
+			status: "DISCOVERED" as const, url: source.url,
+			links: [{ href: `?page=${++page}`, text: "下一页", next: true }]
+		}));
+		const adapter = createStaticPublicWebSourceAdapter({
+			definition: { ...definition, entryUrls: [definition.entryUrls[0] as string] },
+			approvedSourceUrls: new Set(definition.entryUrls),
+			pageCollector: { discover, collect: async ({ source }) => ({
+				status: "EVIDENCE_MATERIAL", summary: "合成证据", material: material(source.url)
+			}) }
+		});
+		await expect(adapter.run(runInput())).resolves.toMatchObject({ type: "EVIDENCE_BATCH",
+			checkpoint: { searched: 1, deepRead: 1, hasMore: true } });
+		expect(discover).toHaveBeenCalledTimes(20);
+	});
+
 	it("returns a stable bounded Evidence batch from matching static pages", async () => {
 		const collect = vi.fn(
 			async (input: { signal?: AbortSignal; source: { url: string } }) =>

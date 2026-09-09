@@ -177,9 +177,13 @@ try {
       if (adapters.has(definition.sourceId)) {
         throw new Error(`公开来源 ID 与现有 Adapter 冲突：${definition.sourceId}`);
       }
+      adapters.set(definition.sourceId, {
+        accessMode: "PUBLIC",
+        async run(input) {
+      const approvedSourceUrls = new Set(definition.entryUrls);
       const ingestion = createEvidenceIngestionService({
         approvedSourceOrigins: new Set(definition.allowedOrigins),
-        approvedSourceUrls: new Set(definition.entryUrls),
+        approvedSourceUrls,
         collectionPolicy: { allowedMediaTypes: ["text/html"], maxBytes: 1_000_000 },
         connector,
         egressGuard,
@@ -192,7 +196,7 @@ try {
           ? undefined
           : createPlaywrightPublicWebIngestion({
               approvedSourceOrigins: new Set(definition.allowedOrigins),
-              approvedSourceUrls: new Set(definition.entryUrls),
+              approvedSourceUrls,
               browser: publicWebBrowser,
               nextGapId: randomUUID,
               now: () => new Date(),
@@ -259,10 +263,9 @@ try {
                 }
               }
             });
-      adapters.set(
-        definition.sourceId,
-        createStaticPublicWebSourceAdapter({
+      return createStaticPublicWebSourceAdapter({
           definition,
+          approvedSourceUrls,
           pageCollector: createStaticPublicWebPageCollector({
             ingestion,
             evidenceGenerator
@@ -275,8 +278,9 @@ try {
                   evidenceGenerator
                 })
               })
-        })
-      );
+        }).run(input);
+        }
+      });
     }
   }
   let notificationPublisher: Awaited<ReturnType<typeof openSourceResearchNotificationPublisher>> | undefined;

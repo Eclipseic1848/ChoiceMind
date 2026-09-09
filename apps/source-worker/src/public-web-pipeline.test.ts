@@ -28,17 +28,20 @@ it.skipIf(process.env.CHOICEMIND_TEST_DATABASE_URL === undefined)(
       const text = `${"产品规格说明。".repeat(40)}该型号配备 32 GB 内存`;
       const bytes = new TextEncoder().encode(`<main>${text}</main>`);
       const url = "https://brand.example/product";
+      const approvedSourceUrls = new Set([url]);
       const audited: string[] = [];
+      let fetched = 0;
       const connector = createHttpDataSourceConnector({
         fetch: async (input) => {
           expect(input.resolvedAddress).toBe("93.184.216.34");
-          expect(audited).toEqual([url]);
+          expect(audited.at(-1)).toBe(url);
+          expect(audited).toHaveLength(++fetched);
           return { arrayBuffer: async () => bytes.buffer,
             headers: new Headers({ "content-type": "text/html" }), ok: true, status: 200, url };
         }, now, objectStore, readDurationMs: () => 1
       });
       const ingestion = createEvidenceIngestionService({
-        approvedSourceUrls: new Set([url]), approvedSourceOrigins: new Set(["https://brand.example"]),
+        approvedSourceUrls, approvedSourceOrigins: new Set(["https://brand.example"]),
         collectionPolicy: { allowedMediaTypes: ["text/html"], maxBytes: 10_000 },
         connector, nextGapId: randomUUID, resolveHost: async () => ["93.184.216.34"],
         egressGuard: createEgressGuard({ nextId: randomUUID, now,
@@ -48,9 +51,11 @@ it.skipIf(process.env.CHOICEMIND_TEST_DATABASE_URL === undefined)(
         objectStore, nextEvidenceId: randomUUID, nextGapId: randomUUID, nextParserRequestId: randomUUID,
         parse: async (request) => ({ contractType: "local-service-result", contractVersion: "1.0",
           requestId: request.requestId, port: "DOCUMENT_PARSER", ok: true,
-          output: { parser: "synthetic-parser@1", text, pageCount: 1 } })
+          output: { parser: "synthetic-parser@1", text, pageCount: 1,
+            ...(request.input.extractLinks ? { links: [] } : {}) } })
       });
       const adapter = createStaticPublicWebSourceAdapter({
+        approvedSourceUrls,
         definition: { sourceId: "brand", title: "合成品牌官网", entryUrls: [url],
           allowedOrigins: ["https://brand.example"], renderMode: "STATIC", sourceRole: "OFFICIAL" },
         pageCollector: createStaticPublicWebPageCollector({ ingestion, evidenceGenerator: generator })
