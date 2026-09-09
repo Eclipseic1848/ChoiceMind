@@ -194,6 +194,16 @@ importers:
         specifier: workspace:*
         version: link:../contracts
 
+  packages/memory:
+    dependencies:
+      pg:
+        specifier: 8.23.0
+        version: 8.23.0
+    devDependencies:
+      '@types/pg':
+        specifier: 8.23.1
+        version: 8.23.1
+
   packages/p0-gold-gate:
     dependencies:
       '@choicemind/contracts':
