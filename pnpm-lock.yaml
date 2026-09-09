@@ -210,6 +210,25 @@ importers:
         specifier: workspace:*
         version: link:../contracts
 
+  packages/provider-routing:
+    dependencies:
+      '@choicemind/security':
+        specifier: workspace:*
+        version: link:../security
+      pg:
+        specifier: 8.23.0
+        version: 8.23.0
+      zod:
+        specifier: 4.4.3
+        version: 4.4.3
+    devDependencies:
+      '@choicemind/task-persistence':
+        specifier: workspace:*
+        version: link:../task-persistence
+      '@types/pg':
+        specifier: 8.23.1
+        version: 8.23.1
+
   packages/security: {}
 
   packages/source-access:
