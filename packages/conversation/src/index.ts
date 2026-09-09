@@ -27,6 +27,7 @@ export type ConversationMessage = Readonly<{
 
 export type ConversationDecisionTaskLink = Readonly<{
 	decisionTaskId: string;
+	requirementRevisionId?: string | undefined;
 	linkedAt: string;
 }>;
 
@@ -40,6 +41,15 @@ export type ConversationSession = Readonly<{
 	decisionTasks: readonly ConversationDecisionTaskLink[];
 }>;
 
+export type ConversationTurnResult = ConversationSession &
+	Readonly<{
+		turn: Readonly<{
+			assistantMessageId: string;
+			clientTurnId: string;
+			userMessageId: string;
+		}>;
+	}>;
+
 export type CreateSessionCommand = Readonly<{
 	type: "CREATE_SESSION";
 	clientRequestId: string;
@@ -52,18 +62,31 @@ export type RequirementUpdate = Readonly<{
 	hardConstraints?: readonly string[];
 }>;
 
+export type InterpretRequirementInput = Readonly<{
+	clientTurnId: string;
+	currentRequirement: RequirementRevision | null;
+	ownerUserId: string;
+	sessionId: string;
+	text: string;
+}>;
+
+export interface RequirementInterpreter {
+	interpret(input: InterpretRequirementInput): Promise<RequirementUpdate>;
+}
+
 export type AppendUserTurnCommand = Readonly<{
 	type: "APPEND_USER_TURN";
 	clientTurnId: string;
 	ownerUserId: string;
 	sessionId: string;
 	text: string;
-	requirementUpdate: RequirementUpdate;
+	requirementUpdate?: RequirementUpdate;
 }>;
 
 export type LinkDecisionTaskCommand = Readonly<{
 	type: "LINK_DECISION_TASK";
 	decisionTaskId: string;
+	requirementRevisionId: string;
 	ownerUserId: string;
 	sessionId: string;
 }>;
@@ -93,9 +116,25 @@ export type ListRequirementRevisionsQuery = Readonly<{
 	sessionId: string;
 }>;
 
+export type GetDecisionTaskContextQuery = Readonly<{
+	type: "GET_DECISION_TASK_CONTEXT";
+	ownerUserId: string;
+	decisionTaskId: string;
+	requirementRevisionId: string;
+}>;
+
+export type ConversationDecisionTaskContext = Readonly<{
+	sessionId: string;
+	triggerMessage: Readonly<{
+		messageId: string;
+		text: string;
+		createdAt: string;
+	}>;
+}>;
+
 export interface Conversation {
 	execute(command: CreateSessionCommand): Promise<ConversationSession>;
-	execute(command: AppendUserTurnCommand): Promise<ConversationSession>;
+	execute(command: AppendUserTurnCommand): Promise<ConversationTurnResult>;
 	execute(command: LinkDecisionTaskCommand): Promise<ConversationSession>;
 	read(query: GetSessionQuery): Promise<ConversationSession | undefined>;
 	read(
@@ -104,6 +143,17 @@ export interface Conversation {
 	read(
 		query: ListRequirementRevisionsQuery,
 	): Promise<readonly RequirementRevision[]>;
+	read(
+		query: GetDecisionTaskContextQuery,
+	): Promise<ConversationDecisionTaskContext | undefined>;
+	beginPrivateDataDeletionForSession(
+		ownerUserId: string,
+		sessionId: string,
+	): Promise<boolean>;
+	completePrivateDataDeletionForSession(
+		ownerUserId: string,
+		sessionId: string,
+	): Promise<boolean>;
 	purgePrivateDataForOwner(
 		ownerUserId: string,
 	): Promise<Readonly<{ deletedSessions: number }>>;
@@ -113,6 +163,7 @@ export interface Conversation {
 type OpenPostgresConversationOptions = Readonly<{
 	databaseUrl: string;
 	now?: () => Date;
+	requirementInterpreter?: RequirementInterpreter;
 }>;
 
 type SessionRow = Readonly<{
@@ -151,6 +202,7 @@ type SessionSummaryRow = Readonly<{
 
 type DecisionTaskLinkRow = Readonly<{
 	decision_task_id: string;
+	requirement_revision_id: string | null;
 	linked_at: Date;
 }>;
 
@@ -171,7 +223,7 @@ export async function openPostgresConversation(
 	): Promise<ConversationSession>;
 	async function execute(
 		command: AppendUserTurnCommand,
-	): Promise<ConversationSession>;
+	): Promise<ConversationTurnResult>;
 	async function execute(
 		command: LinkDecisionTaskCommand,
 	): Promise<ConversationSession>;
@@ -185,7 +237,14 @@ export async function openPostgresConversation(
 			case "CREATE_SESSION":
 				return createSession(pool, command, now());
 			case "APPEND_USER_TURN":
-				return appendUserTurn(pool, command, now());
+				return command.requirementUpdate === undefined
+					? appendInterpretedUserTurn(
+							pool,
+							command,
+							options.requirementInterpreter,
+							now(),
+						)
+					: appendUserTurn(pool, command, now());
 			case "LINK_DECISION_TASK":
 				return linkDecisionTask(pool, command, now());
 		}
@@ -200,9 +259,17 @@ export async function openPostgresConversation(
 		query: ListRequirementRevisionsQuery,
 	): Promise<readonly RequirementRevision[]>;
 	async function read(
-		query: GetSessionQuery | ListSessionsQuery | ListRequirementRevisionsQuery,
+		query: GetDecisionTaskContextQuery,
+	): Promise<ConversationDecisionTaskContext | undefined>;
+	async function read(
+		query:
+			| GetSessionQuery
+			| ListSessionsQuery
+			| ListRequirementRevisionsQuery
+			| GetDecisionTaskContextQuery,
 	): Promise<
 		| ConversationSession
+		| ConversationDecisionTaskContext
 		| undefined
 		| readonly ConversationSessionSummary[]
 		| readonly RequirementRevision[]
@@ -218,12 +285,36 @@ export async function openPostgresConversation(
 					query.ownerUserId,
 					query.sessionId,
 				);
+			case "GET_DECISION_TASK_CONTEXT":
+				return loadDecisionTaskContext(pool, query);
 		}
 	}
 
 	return {
 		execute,
 		read,
+		async beginPrivateDataDeletionForSession(ownerUserId, sessionId) {
+			assertOpaqueId(ownerUserId, "ownerUserId");
+			assertOpaqueId(sessionId, "sessionId");
+			const result = await pool.query(
+				`UPDATE conversation_sessions
+				 SET private_data_deletion_status = 'DELETING_PRIVATE_DATA'
+				 WHERE session_id = $1 AND owner_user_id = $2`,
+				[sessionId, ownerUserId],
+			);
+			return result.rowCount === 1;
+		},
+		async completePrivateDataDeletionForSession(ownerUserId, sessionId) {
+			assertOpaqueId(ownerUserId, "ownerUserId");
+			assertOpaqueId(sessionId, "sessionId");
+			const result = await pool.query(
+				`DELETE FROM conversation_sessions
+				 WHERE session_id = $1 AND owner_user_id = $2
+				   AND private_data_deletion_status = 'DELETING_PRIVATE_DATA'`,
+				[sessionId, ownerUserId],
+			);
+			return result.rowCount === 1;
+		},
 		async purgePrivateDataForOwner(ownerUserId) {
 			assertOpaqueId(ownerUserId, "ownerUserId");
 			const result = await pool.query(
@@ -247,8 +338,13 @@ async function migrateConversation(pool: Pool): Promise<void> {
 			title text NOT NULL,
 			created_at timestamptz NOT NULL,
 			updated_at timestamptz NOT NULL,
+			private_data_deletion_status text NOT NULL DEFAULT 'ACTIVE'
+				CHECK (private_data_deletion_status IN ('ACTIVE', 'DELETING_PRIVATE_DATA')),
 			UNIQUE (owner_user_id, client_request_id)
 		);
+		ALTER TABLE conversation_sessions
+			ADD COLUMN IF NOT EXISTS private_data_deletion_status text NOT NULL DEFAULT 'ACTIVE'
+				CHECK (private_data_deletion_status IN ('ACTIVE', 'DELETING_PRIVATE_DATA'));
 		CREATE INDEX IF NOT EXISTS conversation_sessions_owner_updated_idx
 			ON conversation_sessions (owner_user_id, updated_at DESC, session_id);
 
@@ -261,12 +357,34 @@ async function migrateConversation(pool: Pool): Promise<void> {
 			ordinal bigint NOT NULL CHECK (ordinal > 0),
 			role text NOT NULL CHECK (role IN ('ASSISTANT', 'USER')),
 			text text NOT NULL CHECK (char_length(text) > 0),
+			interpretation_status text CHECK (
+				interpretation_status IN ('PROCESSING', 'FAILED', 'SUCCEEDED')
+			),
+			interpretation_attempt_id uuid,
+			interpretation_started_at timestamptz,
+			interpretation_update jsonb,
 			created_at timestamptz NOT NULL,
 			UNIQUE (session_id, ordinal),
 			UNIQUE (session_id, client_turn_id)
 		);
 		ALTER TABLE conversation_messages
 			ADD COLUMN IF NOT EXISTS command_fingerprint text;
+		ALTER TABLE conversation_messages
+			ADD COLUMN IF NOT EXISTS interpretation_status text;
+		ALTER TABLE conversation_messages
+			ADD COLUMN IF NOT EXISTS interpretation_attempt_id uuid;
+		ALTER TABLE conversation_messages
+			ADD COLUMN IF NOT EXISTS interpretation_started_at timestamptz;
+		ALTER TABLE conversation_messages
+			ADD COLUMN IF NOT EXISTS interpretation_update jsonb;
+		ALTER TABLE conversation_messages
+			ADD COLUMN IF NOT EXISTS reply_to_message_id uuid;
+		UPDATE conversation_messages
+		SET interpretation_status = 'SUCCEEDED'
+		WHERE role = 'USER' AND interpretation_status IS NULL;
+		CREATE UNIQUE INDEX IF NOT EXISTS conversation_messages_reply_idx
+			ON conversation_messages (session_id, reply_to_message_id)
+			WHERE reply_to_message_id IS NOT NULL;
 
 		CREATE TABLE IF NOT EXISTS conversation_requirement_revisions (
 			revision_id uuid PRIMARY KEY,
@@ -290,9 +408,14 @@ async function migrateConversation(pool: Pool): Promise<void> {
 			session_id uuid NOT NULL REFERENCES conversation_sessions(session_id) ON DELETE CASCADE,
 			owner_user_id text NOT NULL,
 			decision_task_id text NOT NULL UNIQUE,
+			requirement_revision_id text,
 			linked_at timestamptz NOT NULL,
 			PRIMARY KEY (session_id, decision_task_id)
 		);
+	`);
+	await pool.query(`
+		ALTER TABLE conversation_decision_task_links
+		ADD COLUMN IF NOT EXISTS requirement_revision_id text
 	`);
 }
 
@@ -381,15 +504,310 @@ async function createSession(
 	}
 }
 
-async function appendUserTurn(
+type PreparedInterpretedTurn =
+	| Readonly<{ completed: true; messageId: string }>
+	| Readonly<{
+			attemptId: string;
+			completed: false;
+			currentRequirement: RequirementRevision | null;
+			messageId: string;
+			text: string;
+	  }>;
+
+async function appendInterpretedUserTurn(
 	pool: Pool,
 	command: AppendUserTurnCommand,
+	requirementInterpreter: RequirementInterpreter | undefined,
 	createdAt: Date,
-): Promise<ConversationSession> {
+): Promise<ConversationTurnResult> {
 	assertOpaqueId(command.ownerUserId, "ownerUserId");
 	assertOpaqueId(command.clientTurnId, "clientTurnId");
 	assertOpaqueId(command.sessionId, "sessionId");
 	const text = normalizeText(command.text, "text");
+	const prepared = await prepareInterpretedUserTurn(
+		pool,
+		command,
+		text,
+		createdAt,
+	);
+	if (prepared.completed) {
+		const current = await loadSession(
+			pool,
+			command.ownerUserId,
+			command.sessionId,
+		);
+		if (current === undefined) throw new Error("幂等消息无法读取");
+		return toConversationTurnResult(
+			pool,
+			current,
+			command.ownerUserId,
+			command.clientTurnId,
+			prepared.messageId,
+		);
+	}
+
+	try {
+		if (requirementInterpreter === undefined) {
+			throw new ConversationRequirementInterpreterUnavailableError();
+		}
+		const requirementUpdate = await requirementInterpreter.interpret({
+			clientTurnId: command.clientTurnId,
+			currentRequirement: prepared.currentRequirement,
+			ownerUserId: command.ownerUserId,
+			sessionId: command.sessionId,
+			text: prepared.text,
+		});
+		return await completeInterpretedUserTurn(
+			pool,
+			command,
+			prepared.attemptId,
+			prepared.messageId,
+			requirementUpdate,
+			createdAt,
+		);
+	} catch (error) {
+		await markInterpretedUserTurnFailed(
+			pool,
+			command.ownerUserId,
+			command.sessionId,
+			command.clientTurnId,
+			prepared.attemptId,
+		);
+		throw error;
+	}
+}
+
+async function prepareInterpretedUserTurn(
+	pool: Pool,
+	command: AppendUserTurnCommand,
+	text: string,
+	createdAt: Date,
+): Promise<PreparedInterpretedTurn> {
+	const client = await pool.connect();
+	try {
+		await client.query("BEGIN");
+		const session = await client.query<SessionRow>(
+			`SELECT session_id, title, created_at, updated_at
+			 FROM conversation_sessions
+			 WHERE session_id = $1 AND owner_user_id = $2
+			   AND private_data_deletion_status = 'ACTIVE'
+			 FOR UPDATE`,
+			[command.sessionId, command.ownerUserId],
+		);
+		if (session.rows[0] === undefined) throw new ConversationNotFoundError();
+
+		const existing = await client.query<{
+			interpretation_attempt_id: string | null;
+			interpretation_started_at: Date | null;
+			interpretation_status: string | null;
+			message_id: string;
+			text: string;
+		}>(
+			`SELECT message_id, text, interpretation_status,
+			        interpretation_attempt_id, interpretation_started_at
+			 FROM conversation_messages
+			 WHERE session_id = $1 AND client_turn_id = $2
+			 FOR UPDATE`,
+			[command.sessionId, command.clientTurnId],
+		);
+		const existingTurn = existing.rows[0];
+		if (existingTurn !== undefined) {
+			if (existingTurn.text !== text) {
+				throw new ConversationIdempotencyConflictError(command.clientTurnId);
+			}
+			if (
+				existingTurn.interpretation_status === null ||
+				existingTurn.interpretation_status === "SUCCEEDED"
+			) {
+				await client.query("COMMIT");
+				return { completed: true, messageId: existingTurn.message_id };
+			}
+			if (
+				existingTurn.interpretation_status === "PROCESSING" &&
+				!interpretationLeaseExpired(
+					existingTurn.interpretation_started_at,
+					createdAt,
+				)
+			) {
+				throw new ConversationTurnInProgressError(command.clientTurnId);
+			}
+			const attemptId = randomUUID();
+			await client.query(
+				`UPDATE conversation_messages
+				 SET interpretation_status = 'PROCESSING',
+				     interpretation_attempt_id = $2,
+				     interpretation_started_at = $3,
+				     interpretation_update = NULL
+				 WHERE message_id = $1`,
+				[existingTurn.message_id, attemptId, createdAt],
+			);
+			const currentRequirement = await loadLatestRequirement(
+				client,
+				command.sessionId,
+			);
+			await client.query("COMMIT");
+			return {
+				attemptId,
+				completed: false,
+				currentRequirement,
+				messageId: existingTurn.message_id,
+				text,
+			};
+		}
+
+		const latestMessage = await client.query<{ ordinal: string }>(
+			`SELECT ordinal
+			 FROM conversation_messages
+			 WHERE session_id = $1
+			 ORDER BY ordinal DESC
+			 LIMIT 1`,
+			[command.sessionId],
+		);
+		const userMessageId = randomUUID();
+		const attemptId = randomUUID();
+		await insertMessage(client, {
+			interpretationAttemptId: attemptId,
+			interpretationStartedAt: createdAt,
+			clientTurnId: command.clientTurnId,
+			commandFingerprint: fingerprintUserText(text),
+			createdAt,
+			interpretationStatus: "PROCESSING",
+			messageId: userMessageId,
+			ordinal: Number(latestMessage.rows[0]?.ordinal ?? "0") + 1,
+			ownerUserId: command.ownerUserId,
+			role: "USER",
+			sessionId: command.sessionId,
+			text,
+		});
+		await client.query(
+			`UPDATE conversation_sessions
+			 SET updated_at = $3
+			 WHERE session_id = $1 AND owner_user_id = $2`,
+			[command.sessionId, command.ownerUserId, createdAt],
+		);
+		const currentRequirement = await loadLatestRequirement(
+			client,
+			command.sessionId,
+		);
+		await client.query("COMMIT");
+		return {
+			attemptId,
+			completed: false,
+			currentRequirement,
+			messageId: userMessageId,
+			text,
+		};
+	} catch (error) {
+		await client.query("ROLLBACK");
+		throw error;
+	} finally {
+		client.release();
+	}
+}
+
+async function completeInterpretedUserTurn(
+	pool: Pool,
+	command: AppendUserTurnCommand,
+	attemptId: string,
+	messageId: string,
+	requirementUpdate: RequirementUpdate,
+	createdAt: Date,
+): Promise<ConversationTurnResult> {
+	const normalizedUpdate = normalizeRequirementUpdate(requirementUpdate);
+	const client = await pool.connect();
+	try {
+		await client.query("BEGIN");
+		const session = await client.query<SessionRow>(
+			`SELECT session_id, title, created_at, updated_at
+			 FROM conversation_sessions
+			 WHERE session_id = $1 AND owner_user_id = $2
+			   AND private_data_deletion_status = 'ACTIVE'
+			 FOR UPDATE`,
+			[command.sessionId, command.ownerUserId],
+		);
+		if (session.rows[0] === undefined) throw new ConversationNotFoundError();
+		const turn = await client.query<{
+			interpretation_attempt_id: string | null;
+			interpretation_status: string | null;
+		}>(
+			`SELECT interpretation_status, interpretation_attempt_id
+			 FROM conversation_messages
+			 WHERE message_id = $1 AND session_id = $2 AND owner_user_id = $3
+			 FOR UPDATE`,
+			[messageId, command.sessionId, command.ownerUserId],
+		);
+		const status = turn.rows[0]?.interpretation_status;
+		if (status === undefined) throw new ConversationNotFoundError();
+		if (
+			status !== "PROCESSING" ||
+			turn.rows[0]?.interpretation_attempt_id !== attemptId
+		) {
+			throw new ConversationTurnInProgressError(command.clientTurnId);
+		}
+		await applyRequirementUpdateForUserMessage(client, {
+			createdAt,
+			ownerUserId: command.ownerUserId,
+			requirementUpdate: normalizedUpdate,
+			sessionId: command.sessionId,
+			userMessageId: messageId,
+		});
+		await client.query(
+			`UPDATE conversation_messages
+			 SET interpretation_status = 'SUCCEEDED', interpretation_update = $2::jsonb
+			 WHERE message_id = $1 AND interpretation_attempt_id = $3`,
+			[messageId, JSON.stringify(normalizedUpdate), attemptId],
+		);
+		await client.query("COMMIT");
+		const current = await loadSession(
+			pool,
+			command.ownerUserId,
+			command.sessionId,
+		);
+		if (current === undefined) throw new Error("更新后的 Session 无法读取");
+		return toConversationTurnResult(
+			pool,
+			current,
+			command.ownerUserId,
+			command.clientTurnId,
+			messageId,
+		);
+	} catch (error) {
+		await client.query("ROLLBACK");
+		throw error;
+	} finally {
+		client.release();
+	}
+}
+
+async function markInterpretedUserTurnFailed(
+	pool: Pool,
+	ownerUserId: string,
+	sessionId: string,
+	clientTurnId: string,
+	attemptId: string,
+): Promise<void> {
+	await pool.query(
+		`UPDATE conversation_messages
+		 SET interpretation_status = 'FAILED'
+		 WHERE owner_user_id = $1 AND session_id = $2 AND client_turn_id = $3
+		   AND interpretation_status = 'PROCESSING'
+		   AND interpretation_attempt_id = $4`,
+		[ownerUserId, sessionId, clientTurnId, attemptId],
+	);
+}
+
+async function appendUserTurn(
+	pool: Pool,
+	command: AppendUserTurnCommand,
+	createdAt: Date,
+): Promise<ConversationTurnResult> {
+	assertOpaqueId(command.ownerUserId, "ownerUserId");
+	assertOpaqueId(command.clientTurnId, "clientTurnId");
+	assertOpaqueId(command.sessionId, "sessionId");
+	const text = normalizeText(command.text, "text");
+	if (command.requirementUpdate === undefined) {
+		throw new ConversationValidationError("requirementUpdate 无效");
+	}
 	const normalizedUpdate = normalizeRequirementUpdate(
 		command.requirementUpdate,
 	);
@@ -401,6 +819,7 @@ async function appendUserTurn(
 			`SELECT session_id, title, created_at, updated_at
 			 FROM conversation_sessions
 			 WHERE session_id = $1 AND owner_user_id = $2
+			   AND private_data_deletion_status = 'ACTIVE'
 			 FOR UPDATE`,
 			[command.sessionId, command.ownerUserId],
 		);
@@ -428,7 +847,13 @@ async function appendUserTurn(
 				command.sessionId,
 			);
 			if (current === undefined) throw new Error("幂等消息无法读取");
-			return current;
+			return toConversationTurnResult(
+				pool,
+				current,
+				command.ownerUserId,
+				command.clientTurnId,
+				existingTurn.rows[0].message_id,
+			);
 		}
 
 		const latestMessage = await client.query<{ ordinal: string }>(
@@ -453,60 +878,13 @@ async function appendUserTurn(
 			text,
 		});
 
-		const previous = await loadLatestRequirement(client, command.sessionId);
-		const nextRequirement = mergeRequirement(previous, normalizedUpdate);
-		if (
-			Object.keys(normalizedUpdate).length > 0 &&
-			requirementChanged(previous, nextRequirement)
-		) {
-			const revisionId = randomUUID();
-			const revisionNumber = (previous?.revisionNumber ?? 0) + 1;
-			await client.query(
-				`INSERT INTO conversation_requirement_revisions (
-					revision_id, session_id, owner_user_id, source_message_id,
-					previous_revision_id, revision_number, consumption_goal,
-					primary_scenario, hard_constraints, missing_keys, readiness, created_at
-				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb, $11, $12)`,
-				[
-					revisionId,
-					command.sessionId,
-					command.ownerUserId,
-					userMessageId,
-					previous?.revisionId ?? null,
-					revisionNumber,
-					nextRequirement.consumptionGoal,
-					nextRequirement.primaryScenario,
-					nextRequirement.hardConstraints === null
-						? null
-						: JSON.stringify(nextRequirement.hardConstraints),
-					JSON.stringify(nextRequirement.missingKeys),
-					nextRequirement.readiness,
-					createdAt,
-				],
-			);
-		}
-
-		await insertMessage(client, {
+		await applyRequirementUpdateForUserMessage(client, {
 			createdAt,
-			messageId: randomUUID(),
-			ordinal: userOrdinal + 1,
 			ownerUserId: command.ownerUserId,
-			role: "ASSISTANT",
+			requirementUpdate: normalizedUpdate,
 			sessionId: command.sessionId,
-			text: clarificationMessage(nextRequirement.missingKeys),
+			userMessageId,
 		});
-		await client.query(
-			`UPDATE conversation_sessions
-			 SET title = CASE WHEN $3::text IS NOT NULL THEN $3::text ELSE title END,
-			     updated_at = $4
-			 WHERE session_id = $1 AND owner_user_id = $2`,
-			[
-				command.sessionId,
-				command.ownerUserId,
-				normalizedUpdate.consumptionGoal ?? null,
-				createdAt,
-			],
-		);
 		await client.query("COMMIT");
 		const current = await loadSession(
 			pool,
@@ -514,13 +892,134 @@ async function appendUserTurn(
 			command.sessionId,
 		);
 		if (current === undefined) throw new Error("更新后的 Session 无法读取");
-		return current;
+		return toConversationTurnResult(
+			pool,
+			current,
+			command.ownerUserId,
+			command.clientTurnId,
+			userMessageId,
+		);
 	} catch (error) {
 		await client.query("ROLLBACK");
 		throw error;
 	} finally {
 		client.release();
 	}
+}
+
+async function toConversationTurnResult(
+	pool: Pool,
+	session: ConversationSession,
+	ownerUserId: string,
+	clientTurnId: string,
+	userMessageId: string,
+): Promise<ConversationTurnResult> {
+	const userMessage = session.messages.find(
+		(message) => message.messageId === userMessageId && message.role === "USER",
+	);
+	const reply = await pool.query<{ message_id: string }>(
+		`SELECT message_id
+		 FROM conversation_messages
+		 WHERE session_id = $1 AND owner_user_id = $2
+		   AND role = 'ASSISTANT' AND reply_to_message_id = $3
+		 LIMIT 1`,
+		[session.sessionId, ownerUserId, userMessageId],
+	);
+	const replyMessageId = reply.rows[0]?.message_id;
+	const assistantMessage =
+		replyMessageId === undefined
+			? session.messages.find(
+					(message) =>
+						message.role === "ASSISTANT" &&
+						message.ordinal === (userMessage?.ordinal ?? -1) + 1,
+				)
+			: session.messages.find(
+					(message) => message.messageId === replyMessageId,
+				);
+	if (userMessage === undefined || assistantMessage === undefined) {
+		throw new Error("本轮消息身份无法读取");
+	}
+	return {
+		...session,
+		turn: {
+			assistantMessageId: assistantMessage.messageId,
+			clientTurnId,
+			userMessageId,
+		},
+	};
+}
+
+async function applyRequirementUpdateForUserMessage(
+	client: PoolClient,
+	input: Readonly<{
+		createdAt: Date;
+		ownerUserId: string;
+		requirementUpdate: RequirementUpdate;
+		sessionId: string;
+		userMessageId: string;
+	}>,
+): Promise<void> {
+	const previous = await loadLatestRequirement(client, input.sessionId);
+	const nextRequirement = mergeRequirement(previous, input.requirementUpdate);
+	if (
+		Object.keys(input.requirementUpdate).length > 0 &&
+		requirementChanged(previous, nextRequirement)
+	) {
+		await client.query(
+			`INSERT INTO conversation_requirement_revisions (
+				revision_id, session_id, owner_user_id, source_message_id,
+				previous_revision_id, revision_number, consumption_goal,
+				primary_scenario, hard_constraints, missing_keys, readiness, created_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb, $11, $12)`,
+			[
+				randomUUID(),
+				input.sessionId,
+				input.ownerUserId,
+				input.userMessageId,
+				previous?.revisionId ?? null,
+				(previous?.revisionNumber ?? 0) + 1,
+				nextRequirement.consumptionGoal,
+				nextRequirement.primaryScenario,
+				nextRequirement.hardConstraints === null
+					? null
+					: JSON.stringify(nextRequirement.hardConstraints),
+				JSON.stringify(nextRequirement.missingKeys),
+				nextRequirement.readiness,
+				input.createdAt,
+			],
+		);
+	}
+
+	const latestMessage = await client.query<{ ordinal: string }>(
+		`SELECT ordinal
+		 FROM conversation_messages
+		 WHERE session_id = $1
+		 ORDER BY ordinal DESC
+		 LIMIT 1`,
+		[input.sessionId],
+	);
+	await insertMessage(client, {
+		createdAt: input.createdAt,
+		messageId: randomUUID(),
+		ordinal: Number(latestMessage.rows[0]?.ordinal ?? "0") + 1,
+		ownerUserId: input.ownerUserId,
+		replyToMessageId: input.userMessageId,
+		role: "ASSISTANT",
+		sessionId: input.sessionId,
+		text: clarificationMessage(nextRequirement.missingKeys),
+	});
+	await client.query(
+		`UPDATE conversation_sessions
+		 SET title = CASE WHEN $3::text IS NOT NULL THEN $3::text ELSE title END,
+		     updated_at = $4
+		 WHERE session_id = $1 AND owner_user_id = $2`,
+		[
+			input.sessionId,
+			input.ownerUserId,
+			input.requirementUpdate.consumptionGoal ?? null,
+			input.createdAt,
+		],
+	);
 }
 
 async function linkDecisionTask(
@@ -531,24 +1030,42 @@ async function linkDecisionTask(
 	assertOpaqueId(command.ownerUserId, "ownerUserId");
 	assertOpaqueId(command.sessionId, "sessionId");
 	assertOpaqueId(command.decisionTaskId, "decisionTaskId");
+	assertOpaqueId(command.requirementRevisionId, "requirementRevisionId");
 	const result = await pool.query(
 		`INSERT INTO conversation_decision_task_links (
-			session_id, owner_user_id, decision_task_id, linked_at
+			session_id, owner_user_id, decision_task_id, requirement_revision_id, linked_at
 		)
-		SELECT session_id, owner_user_id, $3, $4
-		FROM conversation_sessions
-		WHERE session_id = $1 AND owner_user_id = $2
-		ON CONFLICT (session_id, decision_task_id) DO NOTHING`,
-		[command.sessionId, command.ownerUserId, command.decisionTaskId, linkedAt],
+		SELECT session.session_id, session.owner_user_id, $3, revision.revision_id::text, $5
+		FROM conversation_sessions session
+		JOIN conversation_requirement_revisions revision
+		  ON revision.session_id = session.session_id
+		 AND revision.owner_user_id = session.owner_user_id
+		 AND revision.revision_id::text = $4
+		WHERE session.session_id = $1 AND session.owner_user_id = $2
+		  AND session.private_data_deletion_status = 'ACTIVE'
+		ON CONFLICT DO NOTHING`,
+		[
+			command.sessionId,
+			command.ownerUserId,
+			command.decisionTaskId,
+			command.requirementRevisionId,
+			linkedAt,
+		],
 	);
 	if (result.rowCount === 0) {
-		const existing = await pool.query(
-			`SELECT 1
+		const existing = await pool.query<{ requirement_revision_id: string }>(
+			`SELECT requirement_revision_id
 			 FROM conversation_decision_task_links
 			 WHERE session_id = $1 AND owner_user_id = $2 AND decision_task_id = $3`,
 			[command.sessionId, command.ownerUserId, command.decisionTaskId],
 		);
 		if (existing.rowCount !== 1) throw new ConversationNotFoundError();
+		if (
+			existing.rows[0]?.requirement_revision_id !==
+			command.requirementRevisionId
+		) {
+			throw new ConversationIdempotencyConflictError(command.decisionTaskId);
+		}
 	}
 	const session = await loadSession(
 		pool,
@@ -567,7 +1084,8 @@ async function loadSession(
 	const sessionResult = await queryable.query<SessionRow>(
 		`SELECT session_id, title, created_at, updated_at
 		 FROM conversation_sessions
-		 WHERE session_id = $1 AND owner_user_id = $2`,
+		 WHERE session_id = $1 AND owner_user_id = $2
+		   AND private_data_deletion_status = 'ACTIVE'`,
 		[sessionId, ownerUserId],
 	);
 	const session = sessionResult.rows[0];
@@ -583,7 +1101,7 @@ async function loadSession(
 		),
 		loadLatestRequirement(queryable, sessionId),
 		queryable.query<DecisionTaskLinkRow>(
-			`SELECT decision_task_id, linked_at
+			`SELECT decision_task_id, requirement_revision_id, linked_at
 			 FROM conversation_decision_task_links
 			 WHERE session_id = $1 AND owner_user_id = $2
 			 ORDER BY linked_at, decision_task_id`,
@@ -595,6 +1113,9 @@ async function loadSession(
 		currentRequirement: requirement,
 		decisionTasks: taskLinks.rows.map((link) => ({
 			decisionTaskId: link.decision_task_id,
+			...(link.requirement_revision_id === null
+				? {}
+				: { requirementRevisionId: link.requirement_revision_id }),
 			linkedAt: link.linked_at.toISOString(),
 		})),
 		messages: messageResult.rows.map((message) => ({
@@ -655,6 +1176,7 @@ async function listSessions(
 			 LIMIT 1
 		 ) latest_requirement ON true
 		 WHERE session.owner_user_id = $1
+		   AND session.private_data_deletion_status = 'ACTIVE'
 		 ORDER BY session.updated_at DESC, session.session_id
 		 LIMIT 50`,
 		[ownerUserId],
@@ -687,10 +1209,56 @@ async function listRequirementRevisions(
 		 FROM conversation_requirement_revisions revision
 		 JOIN conversation_sessions session ON session.session_id = revision.session_id
 		 WHERE revision.session_id = $1 AND session.owner_user_id = $2
+		   AND session.private_data_deletion_status = 'ACTIVE'
 		 ORDER BY revision.revision_number`,
 		[sessionId, ownerUserId],
 	);
 	return result.rows.map(decodeRequirementRow);
+}
+
+async function loadDecisionTaskContext(
+	pool: Pool,
+	query: GetDecisionTaskContextQuery,
+): Promise<ConversationDecisionTaskContext | undefined> {
+	assertOpaqueId(query.ownerUserId, "ownerUserId");
+	assertOpaqueId(query.decisionTaskId, "decisionTaskId");
+	assertOpaqueId(query.requirementRevisionId, "requirementRevisionId");
+	const result = await pool.query<{
+		created_at: Date;
+		message_id: string;
+		session_id: string;
+		text: string;
+	}>(
+		`SELECT session.session_id, message.message_id, message.text, message.created_at
+		 FROM conversation_decision_task_links task_link
+		 JOIN conversation_sessions session
+		   ON session.session_id = task_link.session_id
+		  AND session.owner_user_id = task_link.owner_user_id
+		 JOIN conversation_requirement_revisions revision
+		   ON revision.session_id = task_link.session_id
+		  AND revision.owner_user_id = task_link.owner_user_id
+		  AND revision.revision_id::text = task_link.requirement_revision_id
+		 JOIN conversation_messages message
+		   ON message.message_id = revision.source_message_id
+		  AND message.owner_user_id = task_link.owner_user_id
+		 WHERE task_link.owner_user_id = $1
+		   AND task_link.decision_task_id = $2
+		   AND revision.revision_id = $3
+		   AND session.private_data_deletion_status = 'ACTIVE'
+		 LIMIT 1`,
+		[query.ownerUserId, query.decisionTaskId, query.requirementRevisionId],
+	);
+	const row = result.rows[0];
+	return row === undefined
+		? undefined
+		: {
+				sessionId: row.session_id,
+				triggerMessage: {
+					createdAt: row.created_at.toISOString(),
+					messageId: row.message_id,
+					text: row.text,
+				},
+			};
 }
 
 function decodeRequirementRow(row: RequirementRow): RequirementRevision {
@@ -749,6 +1317,17 @@ function fingerprintUserTurn(text: string, update: RequirementUpdate): string {
 			}),
 		)
 		.digest("hex");
+}
+
+function fingerprintUserText(text: string): string {
+	return createHash("sha256").update(text).digest("hex");
+}
+
+function interpretationLeaseExpired(
+	startedAt: Date | null,
+	now: Date,
+): boolean {
+	return startedAt === null || now.getTime() - startedAt.getTime() >= 120_000;
 }
 
 function mergeRequirement(
@@ -835,9 +1414,13 @@ async function insertMessage(
 		clientTurnId?: string;
 		commandFingerprint?: string;
 		createdAt: Date;
+		interpretationAttemptId?: string;
+		interpretationStartedAt?: Date;
+		interpretationStatus?: "PROCESSING" | "FAILED" | "SUCCEEDED";
 		messageId: string;
 		ordinal: number;
 		ownerUserId: string;
+		replyToMessageId?: string;
 		role: "ASSISTANT" | "USER";
 		sessionId: string;
 		text: string;
@@ -846,8 +1429,9 @@ async function insertMessage(
 	await client.query(
 		`INSERT INTO conversation_messages (
 			message_id, session_id, owner_user_id, client_turn_id, command_fingerprint,
-			ordinal, role, text, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+			ordinal, role, text, interpretation_status, interpretation_attempt_id,
+			interpretation_started_at, reply_to_message_id, created_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
 		[
 			input.messageId,
 			input.sessionId,
@@ -857,6 +1441,10 @@ async function insertMessage(
 			input.ordinal,
 			input.role,
 			input.text,
+			input.interpretationStatus ?? null,
+			input.interpretationAttemptId ?? null,
+			input.interpretationStartedAt ?? null,
+			input.replyToMessageId ?? null,
 			input.createdAt,
 		],
 	);
@@ -931,5 +1519,23 @@ export class ConversationIdempotencyConflictError extends Error {
 	constructor(readonly clientTurnId: string) {
 		super("同一 clientTurnId 不能提交不同内容");
 		this.name = "ConversationIdempotencyConflictError";
+	}
+}
+
+export class ConversationTurnInProgressError extends Error {
+	readonly code = "CONVERSATION_TURN_IN_PROGRESS";
+
+	constructor(readonly clientTurnId: string) {
+		super("该轮消息正在处理中");
+		this.name = "ConversationTurnInProgressError";
+	}
+}
+
+export class ConversationRequirementInterpreterUnavailableError extends Error {
+	readonly code = "CONVERSATION_INTERPRETER_UNAVAILABLE";
+
+	constructor() {
+		super("需求理解模型暂时不可用");
+		this.name = "ConversationRequirementInterpreterUnavailableError";
 	}
 }
